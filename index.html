@@ -181,7 +181,7 @@ function fmtWeekLabel(ws) {
 // ---------------------------------------------------------------
 const SUPABASE_URL = 'https://kgxeiqotycraltrpyhii.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtneGVpcW90eWNyYWx0cnB5aGlpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc1OTE4OTAsImV4cCI6MjEwMzE2Nzg5MH0.sU3WU10mPi1ebQgEhbB5lDjFsqVENSyfdyuXttcNR-k';
-const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // mapping tussen DB-kolomnamen (snake_case) en de vorm die de frontend
 // gebruikt, zodat de rest van de app ongewijzigd kan blijven werken.
@@ -251,21 +251,21 @@ function App() {
 
   // --- inloggen met Google (Supabase Auth) ---
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => setSession(data.session));
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, sess) => setSession(sess));
+    sb.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: listener } = sb.auth.onAuthStateChange((_event, sess) => setSession(sess));
     return () => listener.subscription.unsubscribe();
   }, []);
 
   async function signInWithGoogle() {
     setAuthError('');
-    const { error } = await supabase.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: window.location.origin } });
+    const { error } = await sb.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: window.location.origin + window.location.pathname } });
     if (error) setAuthError(error.message);
   }
-  function signOut() { supabase.auth.signOut(); }
+  function signOut() { sb.auth.signOut(); }
 
   const loadWeek = useCallback(async (ws) => {
     try {
-      const rows = throwIfError(await supabase.from('weekmenu_entries').select('*').eq('week_start', ws));
+      const rows = throwIfError(await sb.from('weekmenu_entries').select('*').eq('week_start', ws));
       setWeekEntries((rows || []).map(weekmenuOut));
     } catch (e) { console.error(e); }
   }, []);
@@ -273,10 +273,10 @@ function App() {
   const loadAll = useCallback(async () => {
     try {
       const [recipeRows, settingsRows, pantryRows, suggestionRows] = await Promise.all([
-        supabase.from('recipes').select('*').order('title'),
-        supabase.from('app_settings').select('key,value').in('key', ['stores', 'checked_items', 'item_store_map', 'extra_items']),
-        supabase.from('pantry_stock').select('*').order('ingredient_name'),
-        supabase.from('ai_recipe_suggestions').select('*').eq('status', 'pending').order('created_at', { ascending: false }),
+        sb.from('recipes').select('*').order('title'),
+        sb.from('app_settings').select('key,value').in('key', ['stores', 'checked_items', 'item_store_map', 'extra_items']),
+        sb.from('pantry_stock').select('*').order('ingredient_name'),
+        sb.from('ai_recipe_suggestions').select('*').eq('status', 'pending').order('created_at', { ascending: false }),
       ].map(p => p.then(throwIfError)));
 
       setRecipes((recipeRows || []).map(recipeOut));
@@ -330,7 +330,7 @@ function App() {
       const recentTitles = weekEntries
         .map(e => recipesById[e.recipeId] && recipesById[e.recipeId].title)
         .filter(Boolean);
-      const { data, error } = await supabase.functions.invoke('ai-assist', {
+      const { data, error } = await sb.functions.invoke('ai-assist', {
         body: {
           task: 'plan_week',
           slots,
@@ -359,7 +359,7 @@ function App() {
     if (!pantryItems.length) { setAiSuggestError('Voeg eerst wat items toe aan "In de kast".'); return; }
     setAiSuggesting(true);
     try {
-      const { data, error } = await supabase.functions.invoke('ai-assist', {
+      const { data, error } = await sb.functions.invoke('ai-assist', {
         body: { task: 'suggest_recipes', pantryItems, count: 2 },
       });
       if (error) throw new Error(error.message || 'AI-aanroep mislukt');
@@ -369,7 +369,7 @@ function App() {
         title: s.title, category: s.category || '', portions_base: s.basePortions || 1,
         ingredients: s.ingredients || [], steps: s.steps || [], based_on_ingredients: pantryItems, status: 'pending',
       }));
-      const created = throwIfError(await supabase.from('ai_recipe_suggestions').insert(rows).select());
+      const created = throwIfError(await sb.from('ai_recipe_suggestions').insert(rows).select());
       setAiSuggestions(prev => [...(created || []).map(suggestionOut), ...prev]);
       showToast(`${suggestions.length} nieuw(e) voorstel(len) in de wachtlijst`);
     } catch (e) {
@@ -383,7 +383,7 @@ function App() {
   // --- recepten ---
   async function addRecipe(recipe) {
     try {
-      const created = recipeOut(throwIfError(await supabase.from('recipes').insert(recipeIn(recipe)).select().single()));
+      const created = recipeOut(throwIfError(await sb.from('recipes').insert(recipeIn(recipe)).select().single()));
       setRecipes(prev => [...prev, created]);
       showToast(`"${recipe.title}" toegevoegd aan je recepten`);
       return created;
@@ -391,12 +391,12 @@ function App() {
   }
   async function updateRecipe(id, patch) {
     setRecipes(prev => prev.map(r => r.id === id ? { ...r, ...patch } : r));
-    try { throwIfError(await supabase.from('recipes').update(recipeIn(patch)).eq('id', id)); }
+    try { throwIfError(await sb.from('recipes').update(recipeIn(patch)).eq('id', id)); }
     catch (e) { showToast('Opslaan mislukt — probeer opnieuw'); }
   }
   async function deleteRecipe(id) {
     setRecipes(prev => prev.filter(r => r.id !== id));
-    try { throwIfError(await supabase.from('recipes').delete().eq('id', id)); showToast('Recept verwijderd'); }
+    try { throwIfError(await sb.from('recipes').delete().eq('id', id)); showToast('Recept verwijderd'); }
     catch (e) { showToast('Verwijderen mislukt — probeer opnieuw'); }
   }
 
@@ -409,7 +409,7 @@ function App() {
       return [...filtered, { day, meal: mealKey, persons: next.persons, type: next.category, recipeId: next.recipeId, locked: next.locked, feedback: next.feedback }];
     });
     try {
-      throwIfError(await supabase.from('weekmenu_entries').upsert({
+      throwIfError(await sb.from('weekmenu_entries').upsert({
         week_start: weekStart, day, meal: mealKey, persons: next.persons,
         type: next.category || null, recipe_id: next.recipeId || null, locked: !!next.locked,
       }, { onConflict: 'week_start,day,meal' }));
@@ -423,7 +423,7 @@ function App() {
     if (!recipe) return;
     setWeekEntries(prev => prev.map(e => (e.day === day && e.meal === mealKey) ? { ...e, feedback: direction } : e));
     try {
-      throwIfError(await supabase.from('weekmenu_entries').upsert({
+      throwIfError(await sb.from('weekmenu_entries').upsert({
         week_start: weekStart, day, meal: mealKey, persons: slot.persons,
         type: slot.category || null, recipe_id: slot.recipeId || null, locked: !!slot.locked, feedback: direction,
       }, { onConflict: 'week_start,day,meal' }));
@@ -439,7 +439,7 @@ function App() {
   const SETTINGS_DB_KEYS = { stores: 'stores', checkedItems: 'checked_items', itemStoreMap: 'item_store_map', extraItems: 'extra_items' };
   async function persistSetting(key, setter, value) {
     setter(value);
-    try { throwIfError(await supabase.from('app_settings').upsert({ key: SETTINGS_DB_KEYS[key], value }, { onConflict: 'key' })); }
+    try { throwIfError(await sb.from('app_settings').upsert({ key: SETTINGS_DB_KEYS[key], value }, { onConflict: 'key' })); }
     catch (e) { showToast('Opslaan mislukt — probeer opnieuw'); }
   }
 
@@ -448,7 +448,7 @@ function App() {
     name = (name || '').trim();
     if (!name || pantryStock.some(p => normalize(p.name) === normalize(name))) return;
     try {
-      const created = pantryOut(throwIfError(await supabase.from('pantry_stock')
+      const created = pantryOut(throwIfError(await sb.from('pantry_stock')
         .upsert({ ingredient_name: name, in_stock: true }, { onConflict: 'ingredient_name' }).select().single()));
       setPantryStock(prev => [...prev, created]);
     } catch (e) { showToast('Opslaan mislukt — probeer opnieuw'); }
@@ -456,12 +456,12 @@ function App() {
   async function togglePantryStockItem(id) {
     const item = pantryStock.find(p => p.id === id);
     setPantryStock(prev => prev.map(p => p.id === id ? { ...p, inStock: !p.inStock } : p));
-    try { throwIfError(await supabase.from('pantry_stock').update({ in_stock: item ? !item.inStock : true }).eq('id', id)); }
+    try { throwIfError(await sb.from('pantry_stock').update({ in_stock: item ? !item.inStock : true }).eq('id', id)); }
     catch (e) { showToast('Opslaan mislukt — probeer opnieuw'); }
   }
   async function removePantryStockItem(id) {
     setPantryStock(prev => prev.filter(p => p.id !== id));
-    try { throwIfError(await supabase.from('pantry_stock').delete().eq('id', id)); }
+    try { throwIfError(await sb.from('pantry_stock').delete().eq('id', id)); }
     catch (e) { showToast('Verwijderen mislukt — probeer opnieuw'); }
   }
 
@@ -470,11 +470,11 @@ function App() {
     try {
       const s = aiSuggestions.find(x => x.id === id);
       if (!s) return;
-      const created = recipeOut(throwIfError(await supabase.from('recipes').insert({
+      const created = recipeOut(throwIfError(await sb.from('recipes').insert({
         title: s.title, category: s.category, portions_base: s.basePortions || 1,
         ingredients: s.ingredients || [], steps: s.steps || [], source: 'ai-ingredients',
       }).select().single()));
-      throwIfError(await supabase.from('ai_recipe_suggestions').delete().eq('id', id));
+      throwIfError(await sb.from('ai_recipe_suggestions').delete().eq('id', id));
       setRecipes(prev => [...prev, created]);
       setAiSuggestions(prev => prev.filter(x => x.id !== id));
       showToast(`"${created.title}" toegevoegd aan je recepten`);
@@ -482,7 +482,7 @@ function App() {
   }
   async function rejectSuggestion(id) {
     setAiSuggestions(prev => prev.filter(s => s.id !== id));
-    try { throwIfError(await supabase.from('ai_recipe_suggestions').delete().eq('id', id)); }
+    try { throwIfError(await sb.from('ai_recipe_suggestions').delete().eq('id', id)); }
     catch (e) { showToast('Verwijderen mislukt — probeer opnieuw'); }
   }
 
