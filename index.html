@@ -1,0 +1,1489 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Mealio — Eet… geregeld</title>
+<meta name="description" content="Eet… geregeld — weekmenu, boodschappen en recepten, samen gepland." />
+<link rel="manifest" href="./manifest.json" />
+<link rel="icon" type="image/png" href="./icon-192.png" />
+<link rel="apple-touch-icon" href="./icon-192.png" />
+<meta name="theme-color" content="#173425" />
+<meta name="apple-mobile-web-app-title" content="Mealio" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+<style>
+  body { -webkit-tap-highlight-color: transparent; }
+  ::-webkit-scrollbar { display: none; }
+</style>
+</head>
+<body class="bg-[#faf7ef]">
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useCallback } = React;
+
+const CATEGORIES = ['Hoofdmaaltijd', 'Salade', 'Ontbijt', 'Snack', 'Dessert', 'Extra'];
+const CAT_COLORS = {
+  Hoofdmaaltijd: 'bg-[#e6edd9] text-[#1f4430] border-[#b3cf98]',
+  Salade:        'bg-lime-100 text-lime-800 border-lime-300',
+  Ontbijt:       'bg-amber-100 text-amber-800 border-amber-300',
+  Snack:         'bg-sky-100 text-sky-800 border-sky-300',
+  Dessert:       'bg-pink-100 text-pink-800 border-pink-300',
+  Extra:         'bg-stone-200 text-stone-700 border-stone-300',
+};
+const DAYS = ['Maandag','Dinsdag','Woensdag','Donderdag','Vrijdag','Zaterdag','Zondag'];
+const MEALS = [
+  { key: 'Ontbijt', label: 'Ontbijt', defaultPersons: 2 },
+  { key: 'Middag', label: 'Middag', defaultPersons: 2 },
+  { key: 'Avond', label: 'Avond', defaultPersons: 5 },
+];
+// Type-lijst voor het weekmenu: de gewone receptcategorieën, plus twee
+// speciale opties zonder recept — "Overslaan" (geen maaltijd, bv. een
+// broodje onderweg) en "Restjes" (geen nieuwe boodschappen nodig).
+const MEAL_TYPES = [...CATEGORIES, 'Overslaan', 'Restjes'];
+const NO_RECIPE_TYPES = ['Overslaan', 'Restjes'];
+const STAR_LABELS = {
+  1: '1 ster — ± 1x per maand',
+  2: '2 sterren — af en toe',
+  3: '3 sterren — regelmatig',
+  4: '4 sterren — graag vaak',
+  5: '5 sterren — mag elke week',
+};
+
+function slugify(s) {
+  return (s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'recept';
+}
+function emptyWeekmenu() {
+  const wm = {};
+  DAYS.forEach(day => {
+    wm[day] = {};
+    MEALS.forEach(m => { wm[day][m.key] = { persons: m.defaultPersons, category: '', recipeId: '', locked: false, feedback: null }; });
+  });
+  return wm;
+}
+function fmtAmount(n) {
+  if (n === null || n === undefined || n === '') return '';
+  const r = Math.round(n * 100) / 100;
+  return String(r);
+}
+function normalize(s) {
+  return (s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+}
+function matchRecipesToPantry(recipes, pantryList) {
+  const pantryNorm = pantryList.map(normalize).filter(Boolean);
+  if (pantryNorm.length === 0) return [];
+  return recipes.map(r => {
+    const ings = (r.ingredients || []).filter(i => i.name);
+    const total = ings.length;
+    const missing = [];
+    let matched = 0;
+    ings.forEach(ing => {
+      const n = normalize(ing.name);
+      const hit = pantryNorm.some(p => n.includes(p) || p.includes(n));
+      if (hit) matched++; else missing.push(ing.name);
+    });
+    return { recipe: r, matched, total, missing, pct: total ? matched / total : 0 };
+  }).filter(x => x.matched > 0)
+    .sort((a, b) => b.pct - a.pct || b.matched - a.matched || a.recipe.title.localeCompare(b.recipe.title));
+}
+
+// ---------------------------------------------------------------
+// Ingrediënt-/stappenregels herkennen uit geplakte tekst (of, op de
+// Synology-versie, uit een geïmporteerde URL) — voor sneller invoeren.
+// ---------------------------------------------------------------
+const UNIT_ALIASES = {
+  g: 'g', gram: 'g', gr: 'g', kg: 'kg', kilogram: 'kg',
+  ml: 'ml', cl: 'cl', l: 'l', liter: 'l', litre: 'l',
+  el: 'el', eetlepel: 'el', eetlepels: 'el', tbsp: 'el', tablespoon: 'el', tablespoons: 'el',
+  tl: 'tl', theelepel: 'tl', theelepels: 'tl', tsp: 'tl', teaspoon: 'tl', teaspoons: 'tl',
+  stuk: 'stuks', stuks: 'stuks', piece: 'stuks', pieces: 'stuks',
+  teentje: 'teentje', teentjes: 'teentje', clove: 'teentje', cloves: 'teentje',
+  snufje: 'snufje', snuifje: 'snufje', pinch: 'snufje',
+  kopje: 'kopje', kop: 'kopje', cup: 'kopje', cups: 'kopje',
+  blik: 'blik', blikje: 'blikje', can: 'blik',
+  oz: 'oz', ounce: 'oz', ounces: 'oz',
+  lb: 'lb', pound: 'lb', pounds: 'lb',
+  bosje: 'bosje', bosjes: 'bosje', bunch: 'bosje',
+  plakje: 'plakje', plakjes: 'plakje', slice: 'plakje', slices: 'plakje',
+  handje: 'handje', handful: 'handje',
+};
+const UNICODE_FRACTIONS = { '½': 0.5, '⅓': 0.333, '⅔': 0.667, '¼': 0.25, '¾': 0.75, '⅛': 0.125, '⅕': 0.2 };
+
+function parseIngredientLine(raw) {
+  let line = (raw || '').trim();
+  if (!line) return null;
+  line = line.replace(/^[-•*]\s*/, '');
+  Object.entries(UNICODE_FRACTIONS).forEach(([ch, val]) => {
+    line = line.split(ch).join(` ${val} `);
+  });
+  line = line.replace(/\s+/g, ' ').trim();
+  const m = line.match(/^(\d+\/\d+|\d+[.,]?\d*)\s*([a-zA-Zà-ÿ]*)\s+(.+)$/);
+  if (m) {
+    let [, amtRaw, unitRaw, name] = m;
+    let amt;
+    if (amtRaw.includes('/')) {
+      const [a, b] = amtRaw.split('/').map(Number);
+      amt = b ? a / b : null;
+    } else {
+      amt = parseFloat(amtRaw.replace(',', '.'));
+    }
+    const unitKey = unitRaw.toLowerCase();
+    let unit;
+    if (UNIT_ALIASES[unitKey]) { unit = UNIT_ALIASES[unitKey]; }
+    else if (unitKey) { name = `${unitRaw} ${name}`; unit = 'stuks'; }
+    else { unit = 'stuks'; }
+    return { name: name.trim(), amount: isNaN(amt) ? null : amt, unit };
+  }
+  return { name: line, amount: null, unit: '' };
+}
+function parseStepsBlock(text) {
+  return (text || '').split('\n')
+    .map(s => s.replace(/^\s*(\d+[\.\)]|[-•*])\s*/, '').trim())
+    .filter(Boolean);
+}
+function scaleIngredient(ing, ratio) {
+  return { ...ing, amount: ing.amount != null ? Math.round(ing.amount * ratio * 100) / 100 : null };
+}
+
+// ---------------------------------------------------------------
+// datumhelpers voor het per-week weekmenu
+// ---------------------------------------------------------------
+function mondayOf(d) {
+  const dt = new Date(d);
+  const day = dt.getDay(); // 0=zondag..6=zaterdag
+  const diff = (day === 0 ? -6 : 1) - day;
+  dt.setDate(dt.getDate() + diff);
+  return dt.toISOString().slice(0, 10);
+}
+function addDays(ws, n) {
+  const dt = new Date(ws + 'T00:00:00');
+  dt.setDate(dt.getDate() + n);
+  return dt.toISOString().slice(0, 10);
+}
+function fmtWeekLabel(ws) {
+  const start = new Date(ws + 'T00:00:00');
+  const end = new Date(addDays(ws, 6) + 'T00:00:00');
+  const opts = { day: 'numeric', month: 'short' };
+  return `${start.toLocaleDateString('nl-BE', opts)} – ${end.toLocaleDateString('nl-BE', opts)}`;
+}
+
+// ---------------------------------------------------------------
+// Supabase — rechtstreeks vanuit de browser. De "anon"-sleutel hieronder
+// is bedoeld om publiek te zijn (net als een API-key voor een kaart-widget):
+// de echte beveiliging zit in de Row Level Security-regels in Supabase,
+// die alleen de twee toegelaten Google-accounts toegang geven.
+// ---------------------------------------------------------------
+const SUPABASE_URL = 'https://kgxeiqotycraltrpyhii.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtneGVpcW90eWNyYWx0cnB5aGlpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc1OTE4OTAsImV4cCI6MjEwMzE2Nzg5MH0.sU3WU10mPi1ebQgEhbB5lDjFsqVENSyfdyuXttcNR-k';
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// mapping tussen DB-kolomnamen (snake_case) en de vorm die de frontend
+// gebruikt, zodat de rest van de app ongewijzigd kan blijven werken.
+function recipeOut(row) {
+  return { id: row.id, title: row.title, category: row.category || '', basePortions: row.portions_base,
+    carbsPerPortion: row.carbs_per_portion === null || row.carbs_per_portion === undefined ? null : Number(row.carbs_per_portion),
+    ingredients: row.ingredients || [], steps: row.steps || [], stars: row.stars || null, source: row.source };
+}
+function recipeIn(body) {
+  const row = {};
+  if (body.title !== undefined) row.title = body.title;
+  if (body.category !== undefined) row.category = body.category;
+  if (body.basePortions !== undefined) row.portions_base = Number(body.basePortions) || 1;
+  if (body.carbsPerPortion !== undefined) row.carbs_per_portion = body.carbsPerPortion === '' || body.carbsPerPortion === null ? null : Number(body.carbsPerPortion);
+  if (body.ingredients !== undefined) row.ingredients = body.ingredients;
+  if (body.steps !== undefined) row.steps = body.steps;
+  if (body.stars !== undefined) row.stars = body.stars;
+  if (body.source !== undefined) row.source = body.source;
+  return row;
+}
+function weekmenuOut(row) {
+  return { id: row.id, weekStart: row.week_start, day: row.day, meal: row.meal, persons: row.persons,
+    type: row.type || '', recipeId: row.recipe_id || '', locked: !!row.locked, feedback: row.feedback || null };
+}
+function pantryOut(row) { return { id: row.id, name: row.ingredient_name, inStock: !!row.in_stock }; }
+function suggestionOut(row) {
+  return { id: row.id, title: row.title, category: row.category || '', basePortions: row.portions_base || 1,
+    ingredients: row.ingredients || [], steps: row.steps || [], basedOn: row.based_on_ingredients || [], createdAt: row.created_at };
+}
+function throwIfError({ data, error }) { if (error) throw new Error(error.message); return data; }
+
+// simpele icoontjes zonder externe iconbibliotheek
+const Icon = ({ children, size = 18, className = '' }) => (
+  <span className={`inline-flex items-center justify-center leading-none ${className}`} style={{ fontSize: size }}>{children}</span>
+);
+
+function App() {
+  const [session, setSession] = useState(undefined); // undefined = nog aan het laden, null = niet ingelogd
+  const [authError, setAuthError] = useState('');
+
+  const [recipes, setRecipes] = useState([]);
+  const [weekStart, setWeekStart] = useState(mondayOf(new Date()));
+  const [weekEntries, setWeekEntries] = useState([]); // ruwe rijen uit weekmenu_entries voor weekStart
+  const [stores, setStores] = useState(['Colruyt', 'Okay', 'Slager', 'Bakker']);
+  const [itemStoreMap, setItemStoreMap] = useState({});
+  const [checkedItems, setCheckedItems] = useState({});
+  const [extraItems, setExtraItems] = useState([]);
+  const [pantryStock, setPantryStock] = useState([]); // [{ id, name, inStock }] — "In de kast"
+  const [aiSuggestions, setAiSuggestions] = useState([]); // wachtlijst met AI-receptvoorstellen
+  const [loaded, setLoaded] = useState(false);
+  const [tab, setTab] = useState('weekmenu');
+  const [toast, setToast] = useState('');
+  const [aiFilling, setAiFilling] = useState(false);
+  const [aiFillError, setAiFillError] = useState('');
+  const [aiSuggesting, setAiSuggesting] = useState(false);
+  const [aiSuggestError, setAiSuggestError] = useState('');
+
+  const weekmenu = useMemo(() => {
+    const wm = emptyWeekmenu();
+    weekEntries.forEach(e => {
+      if (wm[e.day] && wm[e.day][e.meal]) {
+        wm[e.day][e.meal] = { persons: e.persons, category: e.type || '', recipeId: e.recipeId || '', locked: !!e.locked, feedback: e.feedback || null };
+      }
+    });
+    return wm;
+  }, [weekEntries]);
+
+  // --- inloggen met Google (Supabase Auth) ---
+  useEffect(() => {
+    sb.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: listener } = sb.auth.onAuthStateChange((_event, sess) => setSession(sess));
+    return () => listener.subscription.unsubscribe();
+  }, []);
+
+  async function signInWithGoogle() {
+    setAuthError('');
+    const { error } = await sb.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: window.location.origin + window.location.pathname } });
+    if (error) setAuthError(error.message);
+  }
+  function signOut() { sb.auth.signOut(); }
+
+  const loadWeek = useCallback(async (ws) => {
+    try {
+      const rows = throwIfError(await sb.from('weekmenu_entries').select('*').eq('week_start', ws));
+      setWeekEntries((rows || []).map(weekmenuOut));
+    } catch (e) { console.error(e); }
+  }, []);
+
+  const loadAll = useCallback(async () => {
+    try {
+      const [recipeRows, settingsRows, pantryRows, suggestionRows] = await Promise.all([
+        sb.from('recipes').select('*').order('title'),
+        sb.from('app_settings').select('key,value').in('key', ['stores', 'checked_items', 'item_store_map', 'extra_items']),
+        sb.from('pantry_stock').select('*').order('ingredient_name'),
+        sb.from('ai_recipe_suggestions').select('*').eq('status', 'pending').order('created_at', { ascending: false }),
+      ].map(p => p.then(throwIfError)));
+
+      setRecipes((recipeRows || []).map(recipeOut));
+      const byKey = {}; (settingsRows || []).forEach(r => { byKey[r.key] = r.value; });
+      setStores(byKey.stores && byKey.stores.length ? byKey.stores : ['Colruyt', 'Okay', 'Slager', 'Bakker']);
+      setItemStoreMap(byKey.item_store_map || {});
+      setCheckedItems(byKey.checked_items || {});
+      setExtraItems(byKey.extra_items || []);
+      setPantryStock((pantryRows || []).map(pantryOut));
+      setAiSuggestions((suggestionRows || []).map(suggestionOut));
+      await loadWeek(weekStart);
+    } catch (e) {
+      console.error(e);
+      showToast('Laden mislukt — controleer je verbinding');
+    }
+  }, [weekStart, loadWeek]);
+
+  useEffect(() => {
+    if (session) loadAll().then(() => setLoaded(true));
+  }, [session]); // eslint-disable-line
+  useEffect(() => { if (loaded) loadWeek(weekStart); }, [weekStart, loaded, loadWeek]);
+
+  useEffect(() => {
+    if (!session) return;
+    const id = setInterval(() => {
+      const el = document.activeElement;
+      const typing = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA');
+      if (!typing) loadAll();
+    }, 10000);
+    return () => clearInterval(id);
+  }, [loadAll, session]);
+
+  function showToast(msg) { setToast(msg); setTimeout(() => setToast(''), 2200); }
+
+  // --- AI: week automatisch invullen ---
+  async function aiFillWeek() {
+    setAiFillError('');
+    const slots = [];
+    DAYS.forEach(day => MEALS.forEach(({ key }) => {
+      const slot = weekmenu[day][key];
+      if (slot.category && !NO_RECIPE_TYPES.includes(slot.category) && !slot.locked && !slot.recipeId) {
+        slots.push({ day, meal: key, type: slot.category });
+      }
+    }));
+    if (!slots.length) {
+      setAiFillError('Geen open maaltijden om in te vullen — kies eerst een type bij de maaltijden die je wil laten invullen, en zorg dat ze niet "vast" staan.');
+      return;
+    }
+    setAiFilling(true);
+    try {
+      const recentTitles = weekEntries
+        .map(e => recipesById[e.recipeId] && recipesById[e.recipeId].title)
+        .filter(Boolean);
+      const { data, error } = await sb.functions.invoke('ai-assist', {
+        body: {
+          task: 'plan_week',
+          slots,
+          recipes: recipes.map(r => ({ id: r.id, title: r.title, category: r.category, stars: r.stars })),
+          recentTitles,
+        },
+      });
+      if (error) throw new Error(error.message || 'AI-aanroep mislukt');
+      const assignments = (data && data.assignments) || [];
+      if (!assignments.length) { setAiFillError('AI kon geen passende recepten vinden voor deze slots.'); return; }
+      for (const a of assignments) {
+        if (recipesById[a.recipeId]) await updateMealSlot(a.day, a.meal, { recipeId: a.recipeId });
+      }
+      showToast(`${assignments.length} maaltijd(en) ingevuld door AI`);
+    } catch (e) {
+      setAiFillError(e.message || 'Er ging iets mis bij het aanroepen van de AI');
+    } finally {
+      setAiFilling(false);
+    }
+  }
+
+  // --- AI: receptvoorstellen op basis van kastvoorraad ---
+  async function aiSuggestFromPantry() {
+    setAiSuggestError('');
+    const pantryItems = pantryStock.filter(p => p.inStock).map(p => p.name);
+    if (!pantryItems.length) { setAiSuggestError('Voeg eerst wat items toe aan "In de kast".'); return; }
+    setAiSuggesting(true);
+    try {
+      const { data, error } = await sb.functions.invoke('ai-assist', {
+        body: { task: 'suggest_recipes', pantryItems, count: 2 },
+      });
+      if (error) throw new Error(error.message || 'AI-aanroep mislukt');
+      const suggestions = (data && data.suggestions) || [];
+      if (!suggestions.length) { setAiSuggestError('AI kon geen voorstellen bedenken op basis van deze voorraad.'); return; }
+      const rows = suggestions.map(s => ({
+        title: s.title, category: s.category || '', portions_base: s.basePortions || 1,
+        ingredients: s.ingredients || [], steps: s.steps || [], based_on_ingredients: pantryItems, status: 'pending',
+      }));
+      const created = throwIfError(await sb.from('ai_recipe_suggestions').insert(rows).select());
+      setAiSuggestions(prev => [...(created || []).map(suggestionOut), ...prev]);
+      showToast(`${suggestions.length} nieuw(e) voorstel(len) in de wachtlijst`);
+    } catch (e) {
+      setAiSuggestError(e.message || 'Er ging iets mis bij het aanroepen van de AI');
+    } finally {
+      setAiSuggesting(false);
+    }
+  }
+
+
+  // --- recepten ---
+  async function addRecipe(recipe) {
+    try {
+      const created = recipeOut(throwIfError(await sb.from('recipes').insert(recipeIn(recipe)).select().single()));
+      setRecipes(prev => [...prev, created]);
+      showToast(`"${recipe.title}" toegevoegd aan je recepten`);
+      return created;
+    } catch (e) { showToast('Opslaan mislukt — probeer opnieuw'); return null; }
+  }
+  async function updateRecipe(id, patch) {
+    setRecipes(prev => prev.map(r => r.id === id ? { ...r, ...patch } : r));
+    try { throwIfError(await sb.from('recipes').update(recipeIn(patch)).eq('id', id)); }
+    catch (e) { showToast('Opslaan mislukt — probeer opnieuw'); }
+  }
+  async function deleteRecipe(id) {
+    setRecipes(prev => prev.filter(r => r.id !== id));
+    try { throwIfError(await sb.from('recipes').delete().eq('id', id)); showToast('Recept verwijderd'); }
+    catch (e) { showToast('Verwijderen mislukt — probeer opnieuw'); }
+  }
+
+  // --- weekmenu ---
+  async function updateMealSlot(day, mealKey, patch) {
+    const current = weekmenu[day][mealKey];
+    const next = { ...current, ...patch };
+    setWeekEntries(prev => {
+      const filtered = prev.filter(e => !(e.day === day && e.meal === mealKey));
+      return [...filtered, { day, meal: mealKey, persons: next.persons, type: next.category, recipeId: next.recipeId, locked: next.locked, feedback: next.feedback }];
+    });
+    try {
+      throwIfError(await sb.from('weekmenu_entries').upsert({
+        week_start: weekStart, day, meal: mealKey, persons: next.persons,
+        type: next.category || null, recipe_id: next.recipeId || null, locked: !!next.locked,
+      }, { onConflict: 'week_start,day,meal' }));
+    } catch (e) { showToast('Opslaan mislukt — probeer opnieuw'); }
+  }
+
+  // --- kook-feedback: stuurt meteen de sterren van het recept bij ---
+  async function giveMealFeedback(day, mealKey, direction) {
+    const slot = weekmenu[day][mealKey];
+    const recipe = recipesById[slot.recipeId];
+    if (!recipe) return;
+    setWeekEntries(prev => prev.map(e => (e.day === day && e.meal === mealKey) ? { ...e, feedback: direction } : e));
+    try {
+      throwIfError(await sb.from('weekmenu_entries').upsert({
+        week_start: weekStart, day, meal: mealKey, persons: slot.persons,
+        type: slot.category || null, recipe_id: slot.recipeId || null, locked: !!slot.locked, feedback: direction,
+      }, { onConflict: 'week_start,day,meal' }));
+      if (direction) {
+        const current = recipe.stars || 3;
+        const newStars = Math.max(1, Math.min(5, current + (direction === 'up' ? 1 : -1)));
+        if (newStars !== recipe.stars) await updateRecipe(recipe.id, { stars: newStars });
+      }
+    } catch (e) { showToast('Opslaan mislukt — probeer opnieuw'); }
+  }
+
+  // --- instellingen (winkels, boodschappenlijst-status) ---
+  const SETTINGS_DB_KEYS = { stores: 'stores', checkedItems: 'checked_items', itemStoreMap: 'item_store_map', extraItems: 'extra_items' };
+  async function persistSetting(key, setter, value) {
+    setter(value);
+    try { throwIfError(await sb.from('app_settings').upsert({ key: SETTINGS_DB_KEYS[key], value }, { onConflict: 'key' })); }
+    catch (e) { showToast('Opslaan mislukt — probeer opnieuw'); }
+  }
+
+  // --- "In de kast" — persistente voorraad ---
+  async function addPantryStockItem(name) {
+    name = (name || '').trim();
+    if (!name || pantryStock.some(p => normalize(p.name) === normalize(name))) return;
+    try {
+      const created = pantryOut(throwIfError(await sb.from('pantry_stock')
+        .upsert({ ingredient_name: name, in_stock: true }, { onConflict: 'ingredient_name' }).select().single()));
+      setPantryStock(prev => [...prev, created]);
+    } catch (e) { showToast('Opslaan mislukt — probeer opnieuw'); }
+  }
+  async function togglePantryStockItem(id) {
+    const item = pantryStock.find(p => p.id === id);
+    setPantryStock(prev => prev.map(p => p.id === id ? { ...p, inStock: !p.inStock } : p));
+    try { throwIfError(await sb.from('pantry_stock').update({ in_stock: item ? !item.inStock : true }).eq('id', id)); }
+    catch (e) { showToast('Opslaan mislukt — probeer opnieuw'); }
+  }
+  async function removePantryStockItem(id) {
+    setPantryStock(prev => prev.filter(p => p.id !== id));
+    try { throwIfError(await sb.from('pantry_stock').delete().eq('id', id)); }
+    catch (e) { showToast('Verwijderen mislukt — probeer opnieuw'); }
+  }
+
+  // --- Wachtlijst — AI-receptvoorstellen goedkeuren/afwijzen ---
+  async function approveSuggestion(id) {
+    try {
+      const s = aiSuggestions.find(x => x.id === id);
+      if (!s) return;
+      const created = recipeOut(throwIfError(await sb.from('recipes').insert({
+        title: s.title, category: s.category, portions_base: s.basePortions || 1,
+        ingredients: s.ingredients || [], steps: s.steps || [], source: 'ai-ingredients',
+      }).select().single()));
+      throwIfError(await sb.from('ai_recipe_suggestions').delete().eq('id', id));
+      setRecipes(prev => [...prev, created]);
+      setAiSuggestions(prev => prev.filter(x => x.id !== id));
+      showToast(`"${created.title}" toegevoegd aan je recepten`);
+    } catch (e) { showToast('Goedkeuren mislukt — probeer opnieuw'); }
+  }
+  async function rejectSuggestion(id) {
+    setAiSuggestions(prev => prev.filter(s => s.id !== id));
+    try { throwIfError(await sb.from('ai_recipe_suggestions').delete().eq('id', id)); }
+    catch (e) { showToast('Verwijderen mislukt — probeer opnieuw'); }
+  }
+
+  function renameStore(oldName, newName) {
+    newName = newName.trim();
+    if (!newName || newName === oldName) return;
+    if (stores.includes(newName)) { showToast('Die winkelnaam bestaat al'); return; }
+    const nextStores = stores.map(s => s === oldName ? newName : s);
+    const nextMap = {};
+    Object.entries(itemStoreMap).forEach(([k, v]) => { nextMap[k] = v === oldName ? newName : v; });
+    const nextExtra = extraItems.map(it => it.store === oldName ? { ...it, store: newName } : it);
+    persistSetting('stores', setStores, nextStores);
+    persistSetting('itemStoreMap', setItemStoreMap, nextMap);
+    persistSetting('extraItems', setExtraItems, nextExtra);
+  }
+  function removeStore(name) {
+    const nextStores = stores.filter(s => s !== name);
+    const nextMap = { ...itemStoreMap };
+    Object.keys(nextMap).forEach(k => { if (nextMap[k] === name) delete nextMap[k]; });
+    const nextExtra = extraItems.map(it => it.store === name ? { ...it, store: undefined } : it);
+    persistSetting('stores', setStores, nextStores);
+    persistSetting('itemStoreMap', setItemStoreMap, nextMap);
+    persistSetting('extraItems', setExtraItems, nextExtra);
+  }
+  function addExtraItem(name, store) {
+    const item = { id: `x${Date.now()}${Math.floor(Math.random() * 1000)}`, name: name.trim(), store: store || undefined, checked: false };
+    if (!item.name) return;
+    persistSetting('extraItems', setExtraItems, [...extraItems, item]);
+  }
+  function toggleExtraItem(id) {
+    persistSetting('extraItems', setExtraItems, extraItems.map(it => it.id === id ? { ...it, checked: !it.checked } : it));
+  }
+  function removeExtraItem(id) {
+    persistSetting('extraItems', setExtraItems, extraItems.filter(it => it.id !== id));
+  }
+  function assignExtraStore(id, store) {
+    persistSetting('extraItems', setExtraItems, extraItems.map(it => it.id === id ? { ...it, store: store || undefined } : it));
+  }
+
+  const recipesById = useMemo(() => {
+    const m = {}; recipes.forEach(r => { m[r.id] = r; }); return m;
+  }, [recipes]);
+
+  const shoppingList = useMemo(() => {
+    const map = {};
+    DAYS.forEach(day => {
+      MEALS.forEach(({ key }) => {
+        const slot = weekmenu[day] && weekmenu[day][key];
+        if (!slot || !slot.recipeId) return;
+        const recipe = recipesById[slot.recipeId];
+        if (!recipe) return;
+        const ratio = recipe.basePortions ? (slot.persons || 1) / recipe.basePortions : 1;
+        (recipe.ingredients || []).forEach(ing => {
+          if (!ing.name) return;
+          const unit = ing.unit || (ing.amount == null ? 'naar smaak' : '');
+          const mapKey = `${ing.name.trim().toLowerCase()}|${unit}`;
+          if (!map[mapKey]) map[mapKey] = { name: ing.name.trim(), unit, amount: 0, hasAmount: ing.amount != null };
+          if (ing.amount != null) map[mapKey].amount += ing.amount * ratio;
+        });
+      });
+    });
+    return Object.values(map).sort((a, b) => a.name.localeCompare(b.name));
+  }, [weekmenu, recipesById]);
+
+  const groupedShopping = useMemo(() => {
+    const groups = {};
+    stores.forEach(s => { groups[s] = []; });
+    groups['__none__'] = [];
+    shoppingList.forEach(item => {
+      const key = `${item.name.toLowerCase()}|${item.unit}`;
+      const store = itemStoreMap[key];
+      const checked = !!checkedItems[key];
+      const entry = { ...item, key, checked, isExtra: false };
+      if (store && groups[store]) groups[store].push(entry); else groups['__none__'].push(entry);
+    });
+    extraItems.forEach(item => {
+      const entry = { name: item.name, unit: '', hasAmount: false, key: `extra:${item.id}`,
+        checked: !!item.checked, isExtra: true, extraId: item.id };
+      if (item.store && groups[item.store]) groups[item.store].push(entry); else groups['__none__'].push(entry);
+    });
+    Object.keys(groups).forEach(k => {
+      groups[k].sort((a, b) => (a.checked === b.checked) ? a.name.localeCompare(b.name) : (a.checked ? 1 : -1));
+    });
+    return groups;
+  }, [shoppingList, stores, itemStoreMap, checkedItems, extraItems]);
+
+  function toggleChecked(key) { persistSetting('checkedItems', setCheckedItems, { ...checkedItems, [key]: !checkedItems[key] }); }
+  function assignStore(key, store) { persistSetting('itemStoreMap', setItemStoreMap, { ...itemStoreMap, [key]: store || undefined }); }
+
+  if (session === undefined) {
+    return <div className="min-h-screen flex items-center justify-center bg-[#faf7ef]"><div className="text-[#1f4430] font-medium">Laden…</div></div>;
+  }
+
+  if (!session) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#faf7ef] px-6">
+        <div className="bg-white rounded-2xl shadow-md p-6 w-full max-w-xs space-y-4 text-center">
+          <img src="./icon-192.png" alt="" className="w-14 h-14 rounded-2xl mx-auto" />
+          <div>
+            <div className="text-lg font-bold text-[#173425]">Mealio</div>
+            <div className="text-xs text-[#6f8f49] font-medium">Eet… geregeld</div>
+          </div>
+          <p className="text-sm text-stone-500">Log in met Google om verder te gaan.</p>
+          <button onClick={signInWithGoogle}
+            className="w-full bg-[#1f4430] text-white rounded-lg py-2.5 text-sm font-semibold flex items-center justify-center gap-2">
+            <span>🔐</span> Inloggen met Google
+          </button>
+          {authError && <div className="text-xs text-red-600">{authError}</div>}
+        </div>
+      </div>
+    );
+  }
+
+  if (!loaded) {
+    return <div className="min-h-screen flex items-center justify-center bg-[#faf7ef]"><div className="text-[#1f4430] font-medium">Laden…</div></div>;
+  }
+
+  return (
+    <div className="min-h-screen bg-[#faf7ef] pb-20 font-sans text-stone-800">
+      <header className="sticky top-0 z-20 bg-[#173425] text-white px-4 pt-4 pb-3 shadow-md flex items-center gap-2.5">
+        <img src="./icon-192.png" alt="" className="w-8 h-8 rounded-lg shrink-0" />
+        <div className="flex-1">
+          <h1 className="text-lg font-bold tracking-tight">Mealio</h1>
+          <p className="text-[#b3cf98] text-xs mt-0.5">Eet… geregeld</p>
+        </div>
+        <button onClick={signOut} className="text-[#b3cf98] text-xs underline shrink-0">Uitloggen</button>
+      </header>
+
+      {toast && (
+        <div className="fixed top-16 left-1/2 -translate-x-1/2 z-30 bg-stone-900 text-white text-sm px-4 py-2 rounded-full shadow-lg">{toast}</div>
+      )}
+
+      <main className="px-3 pt-3 max-w-lg mx-auto">
+        {tab === 'weekmenu' && (
+          <WeekmenuTab weekmenu={weekmenu} recipes={recipes} recipesById={recipesById} updateMealSlot={updateMealSlot}
+            weekLabel={fmtWeekLabel(weekStart)}
+            isCurrentWeek={weekStart === mondayOf(new Date())}
+            onPrevWeek={() => setWeekStart(addDays(weekStart, -7))}
+            onNextWeek={() => setWeekStart(addDays(weekStart, 7))}
+            onThisWeek={() => setWeekStart(mondayOf(new Date()))}
+            onAiFillWeek={aiFillWeek} aiFilling={aiFilling} aiError={aiFillError} giveMealFeedback={giveMealFeedback} />
+        )}
+        {tab === 'shopping' && (
+          <ShoppingTab grouped={groupedShopping} stores={stores}
+            addStore={(name) => persistSetting('stores', setStores, [...stores, name])}
+            renameStore={renameStore} removeStore={removeStore}
+            toggleChecked={toggleChecked} assignStore={assignStore}
+            addExtraItem={addExtraItem} toggleExtraItem={toggleExtraItem}
+            removeExtraItem={removeExtraItem} assignExtraStore={assignExtraStore} />
+        )}
+        {tab === 'recipes' && (
+          <RecipesTab recipes={recipes} updateRecipe={updateRecipe} deleteRecipe={deleteRecipe} />
+        )}
+        {tab === 'add' && (
+          <AddRecipeTab onSave={(r) => { addRecipe(r); setTab('recipes'); }} />
+        )}
+        {tab === 'pantry' && (
+          <PantryTab recipes={recipes} pantryStock={pantryStock} />
+        )}
+        {tab === 'kast' && (
+          <KastTab pantryStock={pantryStock} addItem={addPantryStockItem}
+            toggleItem={togglePantryStockItem} removeItem={removePantryStockItem}
+            onAiSuggest={aiSuggestFromPantry} aiSuggesting={aiSuggesting} aiError={aiSuggestError} />
+        )}
+        {tab === 'wachtlijst' && (
+          <WachtlijstTab suggestions={aiSuggestions} onApprove={approveSuggestion} onReject={rejectSuggestion} />
+        )}
+      </main>
+
+      <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-stone-200 flex justify-around py-1.5 z-20 overflow-x-auto">
+        {[
+          { id: 'weekmenu', label: 'Weekmenu', icon: '📅' },
+          { id: 'shopping', label: 'Boodschappen', icon: '🛒' },
+          { id: 'recipes', label: 'Recepten', icon: '📖' },
+          { id: 'pantry', label: 'Voorraad', icon: '🧊' },
+          { id: 'kast', label: 'In de kast', icon: '🥫' },
+          { id: 'wachtlijst', label: 'Wachtlijst', icon: '🗳️', badge: aiSuggestions.length || null },
+          { id: 'add', label: 'Nieuw recept', icon: '➕' },
+        ].map(({ id, label, icon, badge }) => (
+          <button key={id} onClick={() => setTab(id)}
+            className={`relative flex flex-col items-center gap-0.5 px-1.5 py-1 rounded-lg text-[10px] font-medium shrink-0 ${tab === id ? 'text-[#1f4430]' : 'text-stone-400'}`}>
+            <span className="relative">
+              <Icon size={18}>{icon}</Icon>
+              {badge ? <span className="absolute -top-1 -right-2 bg-red-600 text-white rounded-full text-[9px] leading-none px-1 py-0.5">{badge}</span> : null}
+            </span>
+            {label}
+          </button>
+        ))}
+      </nav>
+    </div>
+  );
+}
+
+function RecipeSelect({ value, onChange, recipes, category, placeholder }) {
+  const filtered = category ? recipes.filter(r => r.category === category) : recipes;
+  return (
+    <select value={value} onChange={(e) => onChange(e.target.value)}
+      className="w-full bg-white border border-stone-300 rounded-lg px-2 py-2 text-sm text-stone-800 disabled:bg-stone-100 disabled:text-stone-400"
+      disabled={!category}>
+      <option value="">{category ? placeholder : 'Kies eerst een type…'}</option>
+      {filtered.map(r => <option key={r.id} value={r.id}>{r.title}</option>)}
+    </select>
+  );
+}
+
+function WeekmenuTab({ weekmenu, recipes, recipesById, updateMealSlot, weekLabel, isCurrentWeek, onPrevWeek, onNextWeek, onThisWeek, onAiFillWeek, aiFilling, aiError, giveMealFeedback }) {
+  const [openDay, setOpenDay] = useState(DAYS[0]);
+  return (
+    <div className="space-y-2">
+      <div className="bg-white rounded-xl border border-stone-200 shadow-sm px-3 py-2 flex items-center justify-between">
+        <button onClick={onPrevWeek} className="w-8 h-8 rounded-full bg-stone-100 flex items-center justify-center text-stone-600">‹</button>
+        <div className="text-center">
+          <div className="text-sm font-semibold text-stone-800">Week van {weekLabel}</div>
+          {!isCurrentWeek && <button onClick={onThisWeek} className="text-[11px] text-[#3d5c34] underline">terug naar deze week</button>}
+          {isCurrentWeek && <div className="text-[11px] text-stone-400">huidige week</div>}
+        </div>
+        <button onClick={onNextWeek} className="w-8 h-8 rounded-full bg-stone-100 flex items-center justify-center text-stone-600">›</button>
+      </div>
+      <button onClick={onAiFillWeek} disabled={aiFilling}
+        className="w-full bg-[#1f4430] text-white rounded-xl py-2.5 text-sm font-semibold flex items-center justify-center gap-2 disabled:opacity-60">
+        {aiFilling ? '✨ AI is aan het invullen…' : '✨ Laat AI de open maaltijden invullen'}
+      </button>
+      {aiError && <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{aiError}</div>}
+      <div className="text-[11px] text-stone-400 px-1">Zet een maaltijd op "vast" 🔒 zodat de AI die niet aanpast. Kies eerst een type per open maaltijd die je wil laten invullen.</div>
+      {DAYS.map(day => {
+        const isOpen = openDay === day;
+        const filled = MEALS.filter(m => weekmenu[day][m.key].recipeId || NO_RECIPE_TYPES.includes(weekmenu[day][m.key].category)).length;
+        const dayCarbs = MEALS.reduce((sum, m) => {
+          const slot = weekmenu[day][m.key];
+          const recipe = recipesById[slot.recipeId];
+          if (recipe && recipe.carbsPerPortion != null) return sum + recipe.carbsPerPortion * slot.persons;
+          return sum;
+        }, 0);
+        return (
+          <div key={day} className="bg-white rounded-xl border border-stone-200 overflow-hidden shadow-sm">
+            <button onClick={() => setOpenDay(isOpen ? null : day)} className="w-full flex items-center justify-between px-4 py-3 text-left">
+              <div>
+                <div className="font-semibold text-stone-800">{day}</div>
+                <div className="text-xs text-stone-400">{filled}/3 maaltijden gekozen{dayCarbs > 0 ? ` · ~${Math.round(dayCarbs)} g koolhydraten` : ''}</div>
+              </div>
+              <Icon className="text-stone-400">{isOpen ? '▲' : '▼'}</Icon>
+            </button>
+            {isOpen && (
+              <div className="px-4 pb-4 space-y-3 border-t border-stone-100 pt-3">
+                {MEALS.map(({ key, label }) => {
+                  const slot = weekmenu[day][key];
+                  const recipe = recipesById[slot.recipeId];
+                  return (
+                    <div key={key} className="bg-stone-50 rounded-lg p-3 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-semibold text-[#1f4430]">{key === 'Ontbijt' ? '☕ ' : ''}{label}</span>
+                        <div className="flex items-center gap-2">
+                          <button onClick={() => updateMealSlot(day, key, { locked: !slot.locked })}
+                            title={slot.locked ? 'Vast — AI laat dit met rust' : 'Niet vast — AI mag dit invullen'}
+                            className={`w-6 h-6 rounded-full flex items-center justify-center text-xs ${slot.locked ? 'bg-[#cfe0bd] text-[#173425]' : 'bg-white border border-stone-300 text-stone-300'}`}>
+                            🔒
+                          </button>
+                          <div className="flex items-center gap-1">
+                            <button onClick={() => updateMealSlot(day, key, { persons: Math.max(1, slot.persons - 1) })}
+                              className="w-6 h-6 rounded-full bg-white border border-stone-300 flex items-center justify-center text-stone-500">−</button>
+                            <span className="text-sm w-5 text-center font-medium">{slot.persons}</span>
+                            <button onClick={() => updateMealSlot(day, key, { persons: slot.persons + 1 })}
+                              className="w-6 h-6 rounded-full bg-white border border-stone-300 flex items-center justify-center text-stone-500">+</button>
+                            <span className="text-[10px] text-stone-400 ml-0.5">pers.</span>
+                          </div>
+                        </div>
+                      </div>
+                      <select value={slot.category} onChange={(e) => updateMealSlot(day, key, { category: e.target.value, recipeId: '' })}
+                        className="w-full bg-white border border-stone-300 rounded-lg px-2 py-2 text-sm">
+                        <option value="">Kies type…</option>
+                        {MEAL_TYPES.map(c => <option key={c} value={c}>{c === 'Overslaan' ? '⏭ Overslaan' : c === 'Restjes' ? '🍱 Restjes' : c}</option>)}
+                      </select>
+                      {slot.category === 'Overslaan' ? (
+                        <div className="text-xs text-stone-400 italic px-1">Geen maaltijd gepland — hiervoor wordt niets ingekocht.</div>
+                      ) : slot.category === 'Restjes' ? (
+                        <div className="text-xs text-stone-400 italic px-1">Restjes van eerder — geen nieuwe boodschappen nodig.</div>
+                      ) : (
+                        <RecipeSelect value={slot.recipeId} category={slot.category} recipes={recipes}
+                          placeholder="Kies recept…" onChange={(id) => updateMealSlot(day, key, { recipeId: id })} />
+                      )}
+                      {recipe && (
+                        <div className="flex items-center justify-between pt-0.5">
+                          <div className="text-xs text-stone-500">
+                            {(recipe.ingredients || []).length} ingrediënten · basis {recipe.basePortions} pers.
+                            {recipe.carbsPerPortion != null && ` · ~${Math.round(recipe.carbsPerPortion * slot.persons)} g koolh.`}
+                          </div>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <button onClick={() => giveMealFeedback(day, key, slot.feedback === 'up' ? null : 'up')}
+                              title="Lekker — sterren gaan omhoog" className={`text-sm ${slot.feedback === 'up' ? 'opacity-100' : 'opacity-30'}`}>👍</button>
+                            <button onClick={() => giveMealFeedback(day, key, slot.feedback === 'down' ? null : 'down')}
+                              title="Minder — sterren gaan omlaag" className={`text-sm ${slot.feedback === 'down' ? 'opacity-100' : 'opacity-30'}`}>👎</button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ShoppingTab({ grouped, stores, addStore, renameStore, removeStore, toggleChecked, assignStore,
+  addExtraItem, toggleExtraItem, removeExtraItem, assignExtraStore }) {
+  const [showStores, setShowStores] = useState(false);
+  const [newStore, setNewStore] = useState('');
+  const [editNames, setEditNames] = useState({});
+  const [extraName, setExtraName] = useState('');
+  const [extraStore, setExtraStore] = useState('');
+
+  function handleAddStore() {
+    const name = newStore.trim();
+    if (!name || stores.includes(name)) return;
+    addStore(name); setNewStore('');
+  }
+  function commitRename(oldName) {
+    const val = editNames[oldName];
+    if (val !== undefined && val.trim() && val.trim() !== oldName) renameStore(oldName, val.trim());
+  }
+  function handleAddExtra() {
+    if (!extraName.trim()) return;
+    addExtraItem(extraName, extraStore); setExtraName('');
+  }
+
+  const order = [...stores, '__none__'];
+  const hasAny = Object.values(grouped).some(list => list.length > 0);
+
+  return (
+    <div className="space-y-3">
+      <div className="bg-white rounded-xl border border-stone-200 shadow-sm">
+        <button onClick={() => setShowStores(!showStores)} className="w-full flex items-center justify-between px-4 py-3">
+          <span className="text-sm font-semibold text-stone-700">🏪 Winkels beheren</span>
+          <Icon className="text-stone-400">{showStores ? '▲' : '▼'}</Icon>
+        </button>
+        {showStores && (
+          <div className="px-4 pb-3 space-y-2 border-t border-stone-100 pt-3">
+            {stores.map(s => (
+              <div key={s} className="flex items-center gap-2">
+                <input value={editNames[s] !== undefined ? editNames[s] : s}
+                  onChange={(e) => setEditNames({ ...editNames, [s]: e.target.value })}
+                  onBlur={() => commitRename(s)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') { commitRename(s); e.target.blur(); } }}
+                  className="flex-1 bg-stone-50 border border-stone-200 rounded-lg px-2 py-1.5 text-sm" />
+                <button onClick={() => removeStore(s)} className="text-stone-400 shrink-0">🗑</button>
+              </div>
+            ))}
+            <div className="flex gap-2 pt-1">
+              <input value={newStore} onChange={(e) => setNewStore(e.target.value)} placeholder="Nieuwe winkel…"
+                className="flex-1 border border-stone-300 rounded-lg px-3 py-1.5 text-sm" />
+              <button onClick={handleAddStore} className="bg-[#1f4430] text-white rounded-lg px-3 py-1.5 text-sm font-medium">Voeg toe</button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="bg-white rounded-xl border border-stone-200 shadow-sm p-3">
+        <div className="text-xs font-semibold text-stone-500 mb-2">Los item toevoegen (bv. wc-papier)</div>
+        <div className="flex gap-2">
+          <input value={extraName} onChange={(e) => setExtraName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') handleAddExtra(); }}
+            placeholder="Wat moet erbij?" className="flex-1 min-w-0 border border-stone-300 rounded-lg px-3 py-1.5 text-sm" />
+          <select value={extraStore} onChange={(e) => setExtraStore(e.target.value)}
+            className="border border-stone-300 rounded-lg px-1.5 py-1.5 text-xs w-24 shrink-0">
+            <option value="">Winkel…</option>
+            {stores.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+          <button onClick={handleAddExtra} className="bg-[#1f4430] text-white rounded-lg px-3 py-1.5 shrink-0">+</button>
+        </div>
+      </div>
+
+      {!hasAny && <div className="text-center text-stone-400 text-sm py-10">Nog geen items — kies recepten in je weekmenu of voeg hierboven een los item toe.</div>}
+
+      {order.map(storeKey => {
+        const items = grouped[storeKey] || [];
+        if (items.length === 0) return null;
+        const label = storeKey === '__none__' ? 'Nog geen winkel toegewezen' : storeKey;
+        const todo = items.filter(i => !i.checked);
+        const done = items.filter(i => i.checked);
+        return (
+          <div key={storeKey} className="bg-white rounded-xl border border-stone-200 shadow-sm overflow-hidden">
+            <div className="px-4 py-2 bg-[#173425] text-white text-sm font-semibold flex items-center justify-between">
+              <span>{label}</span><span className="text-[#cfe0bd] text-xs font-normal">{todo.length} te kopen</span>
+            </div>
+            <div className="divide-y divide-stone-100">
+              {todo.map(item => (
+                <ShoppingRow key={item.key} item={item} storeKey={storeKey} stores={stores}
+                  toggleChecked={toggleChecked} assignStore={assignStore}
+                  toggleExtraItem={toggleExtraItem} removeExtraItem={removeExtraItem} assignExtraStore={assignExtraStore} />
+              ))}
+            </div>
+            {done.length > 0 && (
+              <div className="border-t border-stone-200">
+                <div className="px-4 py-1.5 bg-stone-50 text-[11px] font-medium text-stone-400">In winkelmandje — tik om terug in de lijst te zetten</div>
+                <div className="divide-y divide-stone-100">
+                  {done.map(item => (
+                    <ShoppingRow key={item.key} item={item} storeKey={storeKey} stores={stores}
+                      toggleChecked={toggleChecked} assignStore={assignStore}
+                      toggleExtraItem={toggleExtraItem} removeExtraItem={removeExtraItem} assignExtraStore={assignExtraStore} />
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ShoppingRow({ item, storeKey, stores, toggleChecked, assignStore, toggleExtraItem, removeExtraItem, assignExtraStore }) {
+  const onToggle = () => item.isExtra ? toggleExtraItem(item.extraId) : toggleChecked(item.key);
+  const onAssign = (val) => item.isExtra ? assignExtraStore(item.extraId, val) : assignStore(item.key, val);
+  return (
+    <div className="px-4 py-2.5 flex items-center gap-3">
+      <button onClick={onToggle} className={`w-5 h-5 shrink-0 rounded-full border-2 flex items-center justify-center text-[10px] ${item.checked ? 'bg-[#3d5c34] border-[#3d5c34] text-white' : 'border-stone-300'}`}>
+        {item.checked ? '✓' : ''}
+      </button>
+      <div className={`flex-1 text-sm ${item.checked ? 'line-through text-stone-400' : 'text-stone-800'}`}>
+        {item.name}
+        {!item.isExtra && <span className="text-stone-400"> — {item.hasAmount ? `${fmtAmount(item.amount)} ${item.unit}` : (item.unit || 'naar smaak')}</span>}
+        {item.isExtra && <span className="text-stone-300 text-xs"> (los item)</span>}
+      </div>
+      {storeKey === '__none__' && (
+        <select onChange={(e) => onAssign(e.target.value)} defaultValue="" className="text-xs border border-stone-300 rounded-md px-1 py-1 shrink-0">
+          <option value="" disabled>Winkel…</option>
+          {stores.map(s => <option key={s} value={s}>{s}</option>)}
+        </select>
+      )}
+      {item.isExtra && <button onClick={() => removeExtraItem(item.extraId)} className="text-stone-300 shrink-0">✕</button>}
+    </div>
+  );
+}
+
+function RecipesTab({ recipes, updateRecipe, deleteRecipe }) {
+  const [query, setQuery] = useState('');
+  const [catFilter, setCatFilter] = useState('');
+  const [openId, setOpenId] = useState(null);
+
+  const filtered = recipes.filter(r => (!catFilter || r.category === catFilter) && (!query || r.title.toLowerCase().includes(query.toLowerCase())))
+    .sort((a, b) => a.title.localeCompare(b.title));
+
+  return (
+    <div className="space-y-3">
+      <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="🔍 Zoek een recept…"
+        className="w-full bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm" />
+      <div className="flex gap-1.5 overflow-x-auto pb-1 -mx-1 px-1">
+        <button onClick={() => setCatFilter('')} className={`shrink-0 text-xs px-3 py-1.5 rounded-full border font-medium ${!catFilter ? 'bg-[#1f4430] text-white border-[#1f4430]' : 'bg-white border-stone-300 text-stone-500'}`}>Alles ({recipes.length})</button>
+        {CATEGORIES.map(c => {
+          const n = recipes.filter(r => r.category === c).length;
+          return <button key={c} onClick={() => setCatFilter(c)} className={`shrink-0 text-xs px-3 py-1.5 rounded-full border font-medium ${catFilter === c ? 'bg-[#1f4430] text-white border-[#1f4430]' : 'bg-white border-stone-300 text-stone-500'}`}>{c} ({n})</button>;
+        })}
+      </div>
+      <div className="space-y-2">
+        {filtered.length === 0 && <div className="text-center text-stone-400 text-sm py-10">Geen recepten gevonden.</div>}
+        {filtered.map(r => (
+          <RecipeCard key={r.id} recipe={r} open={openId === r.id} onToggle={() => setOpenId(openId === r.id ? null : r.id)}
+            onUpdate={(patch) => updateRecipe(r.id, patch)}
+            onDelete={() => { if (window.confirm(`"${r.title}" verwijderen?`)) deleteRecipe(r.id); }} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function StarPicker({ value, onChange, size = 20 }) {
+  return (
+    <div className="flex items-center gap-0.5">
+      {[1, 2, 3, 4, 5].map(n => (
+        <button key={n} type="button" onClick={() => onChange(value === n ? null : n)}
+          className="leading-none" style={{ fontSize: size }}>
+          <span className={n <= (value || 0) ? 'text-amber-500' : 'text-stone-300'}>★</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function RecipeCard({ recipe, open, onToggle, onUpdate, onDelete }) {
+  const [portions, setPortions] = useState(recipe.basePortions || 1);
+  const ratio = recipe.basePortions ? portions / recipe.basePortions : 1;
+  return (
+    <div className="bg-white rounded-xl border border-stone-200 shadow-sm overflow-hidden">
+      <button onClick={onToggle} className="w-full flex items-center justify-between px-4 py-3 text-left">
+        <div>
+          <div className="font-medium text-stone-800 text-sm">{recipe.title}</div>
+          <div className="flex items-center gap-1.5 mt-1">
+            <span className={`inline-block text-[10px] px-2 py-0.5 rounded-full border ${CAT_COLORS[recipe.category] || 'bg-stone-100 text-stone-500 border-stone-300'}`}>{recipe.category || 'geen categorie'}</span>
+            {recipe.stars ? <span className="text-[11px] text-amber-500">{'★'.repeat(recipe.stars)}<span className="text-stone-300">{'★'.repeat(5 - recipe.stars)}</span></span> : null}
+          </div>
+        </div>
+        <Icon className="text-stone-400">{open ? '▲' : '▼'}</Icon>
+      </button>
+      {open && (
+        <div className="px-4 pb-4 border-t border-stone-100 pt-3 space-y-3">
+          <div>
+            <label className="text-xs text-stone-500">Categorie</label>
+            <select value={recipe.category || ''} onChange={(e) => onUpdate({ category: e.target.value })}
+              className="w-full bg-white border border-stone-300 rounded-lg px-2 py-1.5 text-sm mt-0.5">
+              <option value="">Geen</option>
+              {CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="text-xs text-stone-500">Koolhydraten per persoon (optioneel, in gram)</label>
+            <input type="number" min="0" step="1" value={recipe.carbsPerPortion === null || recipe.carbsPerPortion === undefined ? '' : recipe.carbsPerPortion}
+              onChange={(e) => onUpdate({ carbsPerPortion: e.target.value === '' ? null : Number(e.target.value) })}
+              placeholder="bv. 25" className="w-24 border border-stone-300 rounded-lg px-2 py-1.5 text-sm mt-0.5" />
+            <span className="text-[11px] text-stone-400 ml-2">gebruikt voor de dagtotalen in het weekmenu</span>
+          </div>
+          <div>
+            <label className="text-xs text-stone-500">Hoe graag eten jullie dit? (voor de AI-planner)</label>
+            <div className="flex items-center gap-2 mt-1">
+              <StarPicker value={recipe.stars || null} onChange={(n) => onUpdate({ stars: n })} />
+              <span className="text-[11px] text-stone-400">{recipe.stars ? STAR_LABELS[recipe.stars] : 'nog niet beoordeeld'}</span>
+            </div>
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-stone-500">Aantal personen (voor deze weergave)</span>
+            <div className="flex items-center gap-1">
+              <button onClick={() => setPortions(Math.max(1, portions - 1))} className="w-6 h-6 rounded-full bg-stone-100 flex items-center justify-center">−</button>
+              <span className="w-5 text-center text-sm">{portions}</span>
+              <button onClick={() => setPortions(portions + 1)} className="w-6 h-6 rounded-full bg-stone-100 flex items-center justify-center">+</button>
+            </div>
+          </div>
+          <div>
+            <div className="text-xs font-semibold text-stone-500 mb-1">Ingrediënten</div>
+            <ul className="text-sm space-y-0.5">
+              {(recipe.ingredients || []).map((ing, i) => (
+                <li key={i} className="flex justify-between text-stone-700">
+                  <span>{ing.name}</span>
+                  <span className="text-stone-400">{ing.amount != null ? `${fmtAmount(ing.amount * ratio)} ${ing.unit || ''}` : (ing.unit || 'naar smaak')}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+          {recipe.steps && recipe.steps.length > 0 && (
+            <div>
+              <div className="text-xs font-semibold text-stone-500 mb-1">Bereidingswijze</div>
+              <ol className="text-sm space-y-1 text-stone-700 list-decimal list-inside">
+                {recipe.steps.map((s, i) => <li key={i}>{s.replace(/^\d+[\.\)]\s*/, '')}</li>)}
+              </ol>
+            </div>
+          )}
+          <button onClick={onDelete} className="flex items-center gap-1 text-xs text-red-600 pt-1">🗑 Recept verwijderen</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AddRecipeTab({ onSave }) {
+  const [title, setTitle] = useState('');
+  const [category, setCategory] = useState('');
+  const [basePortions, setBasePortions] = useState(2);
+  const [carbsPerPortion, setCarbsPerPortion] = useState('');
+  const [ingredients, setIngredients] = useState([{ name: '', amount: '', unit: '' }]);
+  const [steps, setSteps] = useState(['']);
+
+  const [importMode, setImportMode] = useState('url'); // 'url' | 'paste' | 'manual'
+  const [importUrl, setImportUrl] = useState('');
+  const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState('');
+  const [pasteIngredients, setPasteIngredients] = useState('');
+  const [pasteSteps, setPasteSteps] = useState('');
+  const [originalPortions, setOriginalPortions] = useState(2);
+
+  function updateIng(i, patch) { setIngredients(ingredients.map((ing, idx) => idx === i ? { ...ing, ...patch } : ing)); }
+  function removeIng(i) { setIngredients(ingredients.filter((_, idx) => idx !== i)); }
+  function updateStep(i, val) { setSteps(steps.map((s, idx) => idx === i ? val : s)); }
+  function removeStep(i) { setSteps(steps.filter((_, idx) => idx !== i)); }
+
+  function applyParsed(ingredientLines, stepLines, portionsOverride) {
+    const portions = Number(portionsOverride !== undefined ? portionsOverride : originalPortions) || 1;
+    const ratio = 1 / portions;
+    const parsedIngredients = ingredientLines.map(l => parseIngredientLine(l)).filter(Boolean).map(i => scaleIngredient(i, ratio));
+    if (parsedIngredients.length) setIngredients(parsedIngredients.map(i => ({ name: i.name, amount: i.amount === null ? '' : i.amount, unit: i.unit })));
+    const parsedSteps = stepLines.map(s => s.replace(/^\s*(\d+[\.\)]|[-•*])\s*/, '').trim()).filter(Boolean);
+    if (parsedSteps.length) setSteps(parsedSteps);
+    setBasePortions(1);
+  }
+
+  // Structurele ingrediënten (al {name, amount, unit}) rechtstreeks toepassen,
+  // omgerekend naar 1 persoon — gebruikt door de URL-import (Edge Function
+  // levert al gesplitste ingrediënten, geen regel-parser nodig).
+  function applyStructured(title, category, structuredIngredients, stepLines, portions) {
+    if (title) setTitle(title);
+    if (category) setCategory(category);
+    const ratio = 1 / (Number(portions) || 1);
+    const scaled = (structuredIngredients || []).map(i => scaleIngredient(i, ratio));
+    if (scaled.length) setIngredients(scaled.map(i => ({ name: i.name, amount: i.amount === null ? '' : i.amount, unit: i.unit })));
+    if (stepLines && stepLines.length) setSteps(stepLines);
+    setBasePortions(1);
+  }
+
+  async function handleUrlImport() {
+    if (!importUrl.trim()) return;
+    setImporting(true); setImportError('');
+    try {
+      const { data, error } = await sb.functions.invoke('ai-assist', { body: { task: 'import_url', url: importUrl.trim() } });
+      if (error) throw new Error(error.message || 'Kon het recept niet ophalen');
+      if (data.error) throw new Error(data.error);
+      applyStructured(data.title, data.category, data.ingredients, data.steps, data.basePortions || 2);
+    } catch (e) {
+      setImportError(e.message || 'Er ging iets mis bij het ophalen — plak de ingrediënten/bereiding hieronder zelf.');
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  function handleApplyPaste() {
+    applyParsed(parseStepsBlock(pasteIngredients), parseStepsBlock(pasteSteps));
+  }
+
+  function save() {
+    if (!title.trim()) { window.alert('Geef het recept een titel.'); return; }
+    const cleanIngredients = ingredients.filter(i => i.name.trim())
+      .map(i => ({ name: i.name.trim(), amount: i.amount === '' ? null : Number(i.amount), unit: i.unit.trim() }));
+    const cleanSteps = steps.map(s => s.trim()).filter(Boolean);
+    onSave({ title: title.trim(), category, basePortions: Number(basePortions) || 1,
+      carbsPerPortion: carbsPerPortion === '' ? null : Number(carbsPerPortion),
+      ingredients: cleanIngredients, steps: cleanSteps });
+    setTitle(''); setCategory(''); setBasePortions(2); setCarbsPerPortion('');
+    setIngredients([{ name: '', amount: '', unit: '' }]); setSteps(['']);
+    setImportUrl(''); setImportError(''); setPasteIngredients(''); setPasteSteps(''); setOriginalPortions(2);
+    setImportMode('url');
+  }
+
+  return (
+    <div className="space-y-4 pb-2">
+      <div className="bg-white rounded-xl border border-[#cfe0bd] shadow-sm overflow-hidden">
+        <div className="grid grid-cols-3 bg-[#f2f6ec]">
+          {[
+            { id: 'url', label: '🔗 Van URL' },
+            { id: 'paste', label: '📋 Plak tekst' },
+            { id: 'manual', label: '✏️ Handmatig' },
+          ].map(({ id, label }) => (
+            <button key={id} onClick={() => setImportMode(id)}
+              className={`px-2 py-3 text-xs font-semibold text-center ${importMode === id ? 'bg-white text-[#1f4430] border-b-2 border-[#1f4430]' : 'text-[#3d5c34]/70'}`}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {importMode === 'url' && (
+          <div className="p-4 space-y-2">
+            <label className="text-xs font-semibold text-stone-500">Link naar een recept online</label>
+            <div className="flex gap-2 mt-1">
+              <input value={importUrl} onChange={(e) => setImportUrl(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleUrlImport(); }}
+                placeholder="https://…" className="flex-1 min-w-0 border border-stone-300 rounded-lg px-3 py-2 text-sm" />
+              <button onClick={handleUrlImport} disabled={importing}
+                className="bg-[#1f4430] text-white rounded-lg px-3 py-2 text-sm font-medium shrink-0 disabled:opacity-50">
+                {importing ? '…' : 'Ophalen'}
+              </button>
+            </div>
+            <p className="text-[11px] text-stone-400 mt-1">Werkt bij de meeste receptensites; AI vult aan waar nodig. Lukt het niet, gebruik dan "Plak tekst" hierboven.</p>
+            {importError && <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1.5 mt-2">{importError}</p>}
+          </div>
+        )}
+
+        {importMode === 'paste' && (
+          <div className="p-4 space-y-2">
+            <label className="text-xs font-semibold text-stone-500">Ingrediënten (één per regel)</label>
+            <textarea value={pasteIngredients} onChange={(e) => setPasteIngredients(e.target.value)} rows={4}
+              placeholder={"500 g kipfilet\n1 courgette\n2 el olijfolie"} className="w-full border border-stone-300 rounded-lg px-2 py-1.5 text-sm" />
+            <label className="text-xs font-semibold text-stone-500">Bereidingswijze (één stap per regel)</label>
+            <textarea value={pasteSteps} onChange={(e) => setPasteSteps(e.target.value)} rows={4}
+              placeholder={"1. Snijd de courgette in blokjes\n2. Bak de kip…"} className="w-full border border-stone-300 rounded-lg px-2 py-1.5 text-sm" />
+            <div className="flex items-center gap-2">
+              <label className="text-xs font-semibold text-stone-500 shrink-0">Oorspronkelijk aantal porties</label>
+              <input type="number" min="1" value={originalPortions} onChange={(e) => setOriginalPortions(e.target.value)}
+                className="w-16 border border-stone-300 rounded-lg px-2 py-1 text-sm" />
+            </div>
+            <button onClick={handleApplyPaste}
+              className="w-full bg-[#1f4430] text-white rounded-lg py-2 text-sm font-semibold">
+              Automatisch invullen &amp; omrekenen naar 1 persoon
+            </button>
+          </div>
+        )}
+
+        {importMode === 'manual' && (
+          <div className="p-4 text-xs text-stone-400">Vul de velden hieronder gewoon zelf in.</div>
+        )}
+      </div>
+
+      <div className="bg-white rounded-xl border border-stone-200 shadow-sm p-4 space-y-3">
+        <div>
+          <label className="text-xs font-semibold text-stone-500">Titel</label>
+          <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="bv. Courgette lasagne"
+            className="w-full mt-1 border border-stone-300 rounded-lg px-3 py-2 text-sm" />
+        </div>
+        <div className="flex gap-3">
+          <div className="flex-1">
+            <label className="text-xs font-semibold text-stone-500">Categorie</label>
+            <select value={category} onChange={(e) => setCategory(e.target.value)} className="w-full mt-1 border border-stone-300 rounded-lg px-2 py-2 text-sm">
+              <option value="">Kies…</option>
+              {CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </div>
+          <div className="w-24">
+            <label className="text-xs font-semibold text-stone-500">Porties</label>
+            <input type="number" min="1" value={basePortions} onChange={(e) => setBasePortions(e.target.value)}
+              className="w-full mt-1 border border-stone-300 rounded-lg px-2 py-2 text-sm" />
+          </div>
+          <div className="w-28">
+            <label className="text-xs font-semibold text-stone-500">Koolh./pers. (g)</label>
+            <input type="number" min="0" value={carbsPerPortion} onChange={(e) => setCarbsPerPortion(e.target.value)}
+              placeholder="optioneel" className="w-full mt-1 border border-stone-300 rounded-lg px-2 py-2 text-sm" />
+          </div>
+        </div>
+      </div>
+
+      <div className="bg-white rounded-xl border border-stone-200 shadow-sm p-4 space-y-2">
+        <div className="text-xs font-semibold text-stone-500 mb-1">Ingrediënten {basePortions === 1 && <span className="text-[#6f8f49] font-normal">(al herberekend naar 1 persoon)</span>}</div>
+        {ingredients.map((ing, i) => (
+          <div key={i} className="flex gap-1.5 items-center">
+            <input value={ing.name} onChange={(e) => updateIng(i, { name: e.target.value })} placeholder="Ingrediënt"
+              className="flex-[2] border border-stone-300 rounded-lg px-2 py-1.5 text-sm min-w-0" />
+            <input value={ing.amount} onChange={(e) => updateIng(i, { amount: e.target.value })} placeholder="#" type="number"
+              className="w-14 border border-stone-300 rounded-lg px-2 py-1.5 text-sm" />
+            <input value={ing.unit} onChange={(e) => updateIng(i, { unit: e.target.value })} placeholder="eenh."
+              className="w-16 border border-stone-300 rounded-lg px-2 py-1.5 text-sm" />
+            <button onClick={() => removeIng(i)} className="text-stone-400 p-1">✕</button>
+          </div>
+        ))}
+        <button onClick={() => setIngredients([...ingredients, { name: '', amount: '', unit: '' }])}
+          className="flex items-center gap-1 text-[#1f4430] text-sm font-medium pt-1">+ Ingrediënt toevoegen</button>
+      </div>
+
+      <div className="bg-white rounded-xl border border-stone-200 shadow-sm p-4 space-y-2">
+        <div className="text-xs font-semibold text-stone-500 mb-1">Bereidingswijze</div>
+        {steps.map((s, i) => (
+          <div key={i} className="flex gap-1.5 items-start">
+            <span className="text-xs text-stone-400 pt-2 w-4 shrink-0">{i + 1}.</span>
+            <textarea value={s} onChange={(e) => updateStep(i, e.target.value)} placeholder="Beschrijf deze stap…" rows={2}
+              className="flex-1 border border-stone-300 rounded-lg px-2 py-1.5 text-sm" />
+            <button onClick={() => removeStep(i)} className="text-stone-400 p-1 mt-1">✕</button>
+          </div>
+        ))}
+        <button onClick={() => setSteps([...steps, ''])} className="flex items-center gap-1 text-[#1f4430] text-sm font-medium pt-1">+ Stap toevoegen</button>
+      </div>
+
+      <button onClick={save} className="w-full bg-[#1f4430] text-white rounded-xl py-3 font-semibold text-sm">✓ Recept opslaan</button>
+    </div>
+  );
+}
+
+function PantryTab({ recipes, pantryStock }) {
+  const [pantry, setPantry] = useState([]);
+  const [input, setInput] = useState('');
+  const [openId, setOpenId] = useState(null);
+
+  const stockNames = (pantryStock || []).filter(p => p.inStock).map(p => p.name);
+
+  function addFromInput() {
+    const parts = input.split(',').map(s => s.trim()).filter(Boolean);
+    if (parts.length === 0) return;
+    const merged = [...pantry];
+    parts.forEach(p => { if (!merged.some(m => normalize(m) === normalize(p))) merged.push(p); });
+    setPantry(merged);
+    setInput('');
+  }
+  function useKastVoorraad() {
+    const merged = [...pantry];
+    stockNames.forEach(p => { if (!merged.some(m => normalize(m) === normalize(p))) merged.push(p); });
+    setPantry(merged);
+  }
+  function removeItem(item) { setPantry(pantry.filter(p => p !== item)); }
+
+  const results = useMemo(() => matchRecipesToPantry(recipes, pantry), [recipes, pantry]);
+
+  return (
+    <div className="space-y-3">
+      <div className="bg-white rounded-xl border border-stone-200 shadow-sm p-4 space-y-3">
+        <div>
+          <div className="text-sm font-semibold text-stone-700">Wat heb je in huis?</div>
+          <div className="text-xs text-stone-400 mt-0.5">Typ ingrediënten (komma-gescheiden mag ook) en zie welke recepten je al kan maken.</div>
+        </div>
+        {stockNames.length > 0 && (
+          <button onClick={useKastVoorraad} className="text-xs font-medium text-[#1f4430] bg-[#f2f6ec] border border-[#cfe0bd] rounded-lg px-3 py-1.5 self-start">
+            🥫 Gebruik je voorraad uit "In de kast" ({stockNames.length})
+          </button>
+        )}
+        <div className="flex gap-2">
+          <input value={input} onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') addFromInput(); }}
+            placeholder="bv. kip, broccoli, ei" className="flex-1 border border-stone-300 rounded-lg px-3 py-2 text-sm" />
+          <button onClick={addFromInput} className="bg-[#1f4430] text-white rounded-lg px-3 py-2">+</button>
+        </div>
+        {pantry.length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
+            {pantry.map(item => (
+              <span key={item} className="flex items-center gap-1 bg-[#f2f6ec] text-[#1f4430] border border-[#cfe0bd] rounded-full px-2.5 py-1 text-xs">
+                {item}
+                <button onClick={() => removeItem(item)}>✕</button>
+              </span>
+            ))}
+            <button onClick={() => setPantry([])} className="text-xs text-stone-400 underline px-1">alles wissen</button>
+          </div>
+        )}
+      </div>
+
+      {pantry.length === 0 && (
+        <div className="text-center text-stone-400 text-sm py-10">Voeg hierboven een paar ingrediënten toe om te zien wat je ermee kan maken.</div>
+      )}
+      {pantry.length > 0 && results.length === 0 && (
+        <div className="text-center text-stone-400 text-sm py-10">Geen enkel recept bevat (nog) een van deze ingrediënten.</div>
+      )}
+
+      <div className="space-y-2">
+        {results.map(({ recipe, matched, total, missing }) => {
+          const open = openId === recipe.id;
+          const full = missing.length === 0;
+          return (
+            <div key={recipe.id} className="bg-white rounded-xl border border-stone-200 shadow-sm overflow-hidden">
+              <button onClick={() => setOpenId(open ? null : recipe.id)} className="w-full flex items-center justify-between px-4 py-3 text-left">
+                <div className="min-w-0">
+                  <div className="font-medium text-stone-800 text-sm truncate">{recipe.title}</div>
+                  <div className="flex items-center gap-1.5 mt-1">
+                    <span className={`inline-block text-[10px] px-2 py-0.5 rounded-full border ${CAT_COLORS[recipe.category] || 'bg-stone-100 text-stone-500 border-stone-300'}`}>
+                      {recipe.category || 'geen categorie'}
+                    </span>
+                    <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${full ? 'bg-[#3d5c34] text-white' : 'bg-amber-100 text-amber-800'}`}>
+                      {full ? 'Alles in huis ✓' : `${matched}/${total} in huis`}
+                    </span>
+                  </div>
+                </div>
+                <Icon className="text-stone-400 shrink-0">{open ? '▲' : '▼'}</Icon>
+              </button>
+              {open && (
+                <div className="px-4 pb-4 border-t border-stone-100 pt-3 space-y-2">
+                  <div>
+                    <div className="text-xs font-semibold text-stone-500 mb-1">Ingrediënten</div>
+                    <ul className="text-sm space-y-0.5">
+                      {(recipe.ingredients || []).map((ing, i) => {
+                        const isMissing = missing.includes(ing.name);
+                        return (
+                          <li key={i} className={`flex justify-between ${isMissing ? 'text-stone-400' : 'text-stone-700'}`}>
+                            <span>{isMissing ? '' : '✓ '}{ing.name}</span>
+                            <span className="text-stone-400">{ing.amount != null ? `${fmtAmount(ing.amount)} ${ing.unit || ''}` : (ing.unit || 'naar smaak')}</span>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </div>
+                  {recipe.steps && recipe.steps.length > 0 && (
+                    <div>
+                      <div className="text-xs font-semibold text-stone-500 mb-1">Bereidingswijze</div>
+                      <ol className="text-sm space-y-1 text-stone-700 list-decimal list-inside">
+                        {recipe.steps.map((s, i) => <li key={i}>{s.replace(/^\d+[\.\)]\s*/, '')}</li>)}
+                      </ol>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function KastTab({ pantryStock, addItem, toggleItem, removeItem, onAiSuggest, aiSuggesting, aiError }) {
+  const [input, setInput] = useState('');
+  function handleAdd() {
+    input.split(',').map(s => s.trim()).filter(Boolean).forEach(addItem);
+    setInput('');
+  }
+  const sorted = [...pantryStock].sort((a, b) => (a.inStock === b.inStock) ? a.name.localeCompare(b.name) : (a.inStock ? -1 : 1));
+  const inStockCount = pantryStock.filter(p => p.inStock).length;
+
+  return (
+    <div className="space-y-3">
+      <div className="bg-white rounded-xl border border-stone-200 shadow-sm p-4 space-y-3">
+        <div>
+          <div className="text-sm font-semibold text-stone-700">In de kast</div>
+          <div className="text-xs text-stone-400 mt-0.5">
+            Bijhouden wat je meestal in huis hebt. Vink af/aan als iets op is of aangevuld wordt — dit blijft
+            bewaard (in tegenstelling tot de eenmalige lijst bij "Wat kan ik maken?").
+          </div>
+        </div>
+        <div className="flex gap-2">
+          <input value={input} onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') handleAdd(); }}
+            placeholder="bv. rijst, blikjes tomaat, eieren" className="flex-1 border border-stone-300 rounded-lg px-3 py-2 text-sm" />
+          <button onClick={handleAdd} className="bg-[#1f4430] text-white rounded-lg px-3 py-2">+</button>
+        </div>
+        {inStockCount > 0 && (
+          <button onClick={onAiSuggest} disabled={aiSuggesting}
+            className="w-full bg-[#f2f6ec] border border-[#cfe0bd] text-[#173425] rounded-lg py-2 text-sm font-semibold disabled:opacity-60">
+            {aiSuggesting ? '✨ AI bedenkt recepten…' : '✨ Laat AI recepten bedenken op basis van je voorraad'}
+          </button>
+        )}
+        {aiError && <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{aiError}</div>}
+      </div>
+
+      {sorted.length === 0 && (
+        <div className="text-center text-stone-400 text-sm py-10">Nog niets toegevoegd — begin hierboven met wat je meestal in huis hebt.</div>
+      )}
+
+      {sorted.length > 0 && (
+        <div className="bg-white rounded-xl border border-stone-200 shadow-sm overflow-hidden">
+          <div className="px-4 py-2 bg-[#173425] text-white text-sm font-semibold flex items-center justify-between">
+            <span>Voorraad</span><span className="text-[#cfe0bd] text-xs font-normal">{inStockCount}/{sorted.length} in huis</span>
+          </div>
+          <div className="divide-y divide-stone-100">
+            {sorted.map(item => (
+              <div key={item.id} className="px-4 py-2.5 flex items-center gap-3">
+                <button onClick={() => toggleItem(item.id)}
+                  className={`w-5 h-5 shrink-0 rounded-full border-2 flex items-center justify-center text-[10px] ${item.inStock ? 'bg-[#3d5c34] border-[#3d5c34] text-white' : 'border-stone-300'}`}>
+                  {item.inStock ? '✓' : ''}
+                </button>
+                <div className={`flex-1 text-sm ${item.inStock ? 'text-stone-800' : 'text-stone-400 line-through'}`}>{item.name}</div>
+                <button onClick={() => removeItem(item.id)} className="text-stone-300 shrink-0">✕</button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function WachtlijstTab({ suggestions, onApprove, onReject }) {
+  const [openId, setOpenId] = useState(null);
+  return (
+    <div className="space-y-3">
+      <div className="bg-white rounded-xl border border-stone-200 shadow-sm p-4">
+        <div className="text-sm font-semibold text-stone-700">Wachtlijst</div>
+        <div className="text-xs text-stone-400 mt-0.5">
+          Hier komen recepten die de AI voorstelt (via de knop bij "In de kast") te staan, tot jullie ze
+          hebben klaargemaakt en goedkeuren. Goedkeuren voegt het recept toe aan je normale receptenlijst;
+          afwijzen verwijdert het voorstel.
+        </div>
+      </div>
+
+      {suggestions.length === 0 && (
+        <div className="text-center text-stone-400 text-sm py-10">Nog geen voorstellen — gebruik de AI-knop bij "In de kast" om er een te laten bedenken.</div>
+      )}
+
+      <div className="space-y-2">
+        {suggestions.map(s => {
+          const open = openId === s.id;
+          return (
+            <div key={s.id} className="bg-white rounded-xl border border-amber-200 shadow-sm overflow-hidden">
+              <button onClick={() => setOpenId(open ? null : s.id)} className="w-full flex items-center justify-between px-4 py-3 text-left">
+                <div className="min-w-0">
+                  <div className="font-medium text-stone-800 text-sm truncate">{s.title}</div>
+                  <div className="flex items-center gap-1.5 mt-1">
+                    <span className={`inline-block text-[10px] px-2 py-0.5 rounded-full border ${CAT_COLORS[s.category] || 'bg-stone-100 text-stone-500 border-stone-300'}`}>{s.category || 'geen categorie'}</span>
+                    {s.basedOn && s.basedOn.length > 0 && <span className="text-[10px] text-stone-400">op basis van: {s.basedOn.join(', ')}</span>}
+                  </div>
+                </div>
+                <Icon className="text-stone-400 shrink-0">{open ? '▲' : '▼'}</Icon>
+              </button>
+              {open && (
+                <div className="px-4 pb-4 border-t border-stone-100 pt-3 space-y-3">
+                  <div>
+                    <div className="text-xs font-semibold text-stone-500 mb-1">Ingrediënten</div>
+                    <ul className="text-sm space-y-0.5">
+                      {(s.ingredients || []).map((ing, i) => (
+                        <li key={i} className="flex justify-between text-stone-700">
+                          <span>{ing.name}</span>
+                          <span className="text-stone-400">{ing.amount != null ? `${fmtAmount(ing.amount)} ${ing.unit || ''}` : (ing.unit || 'naar smaak')}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                  {s.steps && s.steps.length > 0 && (
+                    <div>
+                      <div className="text-xs font-semibold text-stone-500 mb-1">Bereidingswijze</div>
+                      <ol className="text-sm space-y-1 text-stone-700 list-decimal list-inside">
+                        {s.steps.map((st, i) => <li key={i}>{st}</li>)}
+                      </ol>
+                    </div>
+                  )}
+                  <div className="flex gap-2 pt-1">
+                    <button onClick={() => onApprove(s.id)} className="flex-1 bg-[#1f4430] text-white rounded-lg py-2 text-sm font-semibold">✓ Goedkeuren</button>
+                    <button onClick={() => onReject(s.id)} className="flex-1 bg-white border border-red-200 text-red-600 rounded-lg py-2 text-sm font-semibold">✕ Afwijzen</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js'));
+  }
+</script>
+</body>
+</html>
