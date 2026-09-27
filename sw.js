@@ -6,7 +6,7 @@
 // Cache-versie ophogen (v1 -> v2 -> ...) forceert bij elke deploy een
 // schone cache; dat gebeurde niet vanzelf zolang dit bestand zelf niet
 // wijzigde, waardoor een oude/kapotte index.html kon "vastzitten".
-const CACHE_NAME = 'mealio-shell-v2';
+const CACHE_NAME = 'mealio-shell-v5';
 const SHELL_FILES = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (event) => {
@@ -28,13 +28,15 @@ self.addEventListener('fetch', (event) => {
   // Nooit cachen: Supabase (data moet altijd vers zijn) en niet-GET requests.
   if (event.request.method !== 'GET' || url.hostname.endsWith('supabase.co')) return;
 
-  // HTML/navigatie: NETWERK-EERST. Zo kan een nieuwe deploy nooit "vastzitten"
-  // achter een oude gecachete pagina — alleen zonder internet valt dit terug
-  // op de laatst gekende versie.
+  // HTML/navigatie: NETWERK-EERST, en cache: 'no-store' zodat ook de gewone
+  // browser-HTTP-cache (los van de Cache API hierboven) wordt overgeslagen —
+  // anders kan een gewone fetch() alsnog een lokaal bewaarde kopie teruggeven
+  // in plaats van echt naar GitHub Pages te gaan, óók ná deze "netwerk-eerst"-
+  // aanpak. Alleen zonder internet valt dit terug op de laatst gekende versie.
   const isHtml = event.request.mode === 'navigate' || url.pathname.endsWith('.html') || url.pathname.endsWith('/');
   if (isHtml) {
     event.respondWith(
-      fetch(event.request).then((res) => {
+      fetch(event.request, { cache: 'no-store' }).then((res) => {
         if (res && res.ok) caches.open(CACHE_NAME).then((cache) => cache.put(event.request, res.clone()));
         return res;
       }).catch(() => caches.match(event.request))
