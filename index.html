@@ -1096,19 +1096,15 @@ function PlannerPage({ nav, weekmenu, recipesById, weekLoading, selectedDay, set
       <div className="flex items-center gap-2 mb-4">
         <Segmented className="flex-1" value={view} onChange={setView}
           options={[{ value: 'day', label: 'Dag', icon: 'list' }, { value: 'week', label: 'Hele week', icon: 'grid' }]} />
-      </div>
-
-      <div className="rounded-2xl bg-gradient-to-br from-deep to-forest text-white p-3.5 mb-4 flex items-center gap-3 shadow-card">
-        <div className="w-10 h-10 rounded-xl bg-white/10 flex items-center justify-center"><Icon name="sparkles" size={20} /></div>
-        <div className="flex-1 min-w-0">
-          <div className="text-sm font-black">AI-planner</div>
-          <div className="text-[11px] text-white/70 leading-snug">
-            {aiTargetCount ? `${aiTargetCount} maaltijd(en) klaar om in te vullen — rekening houdend met sterren en de voorbije weken.`
-              : 'Kies bij een maaltijd wat je wil (bv. 🧩 Samenstellen) en laat het slotje open 🔓.'}
-          </div>
-        </div>
-        <button onClick={onAiFill} disabled={!aiTargetCount || aiBusy}
-          className="bg-white text-forest rounded-xl px-3.5 py-2 text-xs font-black disabled:opacity-40 shrink-0">{aiBusy ? 'Bezig…' : 'Invullen'}</button>
+        {aiTargetCount > 0 && (
+          <button onClick={onAiFill} disabled={aiBusy} title={`AI vult ${aiTargetCount} open maaltijd(en) in deze week`}
+            className="relative shrink-0 w-11 h-11 rounded-2xl bg-gradient-to-br from-deep to-forest text-white flex items-center justify-center shadow-card disabled:opacity-50 active:scale-95 transition">
+            <Icon name="sparkles" size={19} />
+            <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] px-1 rounded-full bg-amber-500 text-white text-[10px] font-black flex items-center justify-center border-2 border-cream">
+              {aiBusy ? '…' : aiTargetCount}
+            </span>
+          </button>
+        )}
       </div>
 
       {weekLoading && <div className="text-center text-xs font-bold text-sage mb-3">Week laden…</div>}

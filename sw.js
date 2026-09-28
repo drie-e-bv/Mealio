@@ -6,7 +6,7 @@
 // Cache-versie ophogen (v1 -> v2 -> ...) forceert bij elke deploy een
 // schone cache; dat gebeurde niet vanzelf zolang dit bestand zelf niet
 // wijzigde, waardoor een oude/kapotte index.html kon "vastzitten".
-const CACHE_NAME = 'mealio-shell-v5';
+const CACHE_NAME = 'mealio-shell-v6';
 const SHELL_FILES = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (event) => {
