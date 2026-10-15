@@ -122,9 +122,18 @@ function fmtAmount(n) {
   return String(Math.round(n * 100) / 100).replace('.', ',');
 }
 function normalize(s) { return (s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim(); }
+function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+// Een kastitem komt overeen met een ingrediënt als het aan het BEGIN van een woord
+// staat ("ui" ↔ "uien", "kip" ↔ "kipfilet") — niet midden in een woord ("ui" ↔ "kruiden").
 function ingredientMatches(ingName, pantryNorm) {
   const n = normalize(ingName);
-  return pantryNorm.some(p => p && (n.includes(p) || (n.length >= 4 && p.includes(n))));
+  return pantryNorm.some(p => {
+    if (!p) return false;
+    if (new RegExp(`(^|[^a-z0-9])${escapeRe(p)}`).test(n)) return true;
+    // omgekeerd ("verse spinazie" in de kast ↔ ingrediënt "spinazie"), ook enkel op woordbegin
+    // zodat "melk" niet matcht met "kokosmelk"
+    return n.length >= 4 && new RegExp(`(^|[^a-z0-9])${escapeRe(n)}`).test(p);
+  });
 }
 function matchRecipesToPantry(recipes, pantryList, mode) {
   const userNorm = pantryList.map(normalize).filter(Boolean);
@@ -150,6 +159,7 @@ const UNIT_ALIASES = {
   el: 'el', eetlepel: 'el', eetlepels: 'el', tbsp: 'el', tl: 'tl', theelepel: 'tl', theelepels: 'tl', tsp: 'tl',
   stuk: 'stuks', stuks: 'stuks', teentje: 'teentje', teentjes: 'teentje', snufje: 'snufje', snuifje: 'snufje',
   kopje: 'kopje', blik: 'blik', blikje: 'blikje', bosje: 'bosje', plakje: 'plakje', plakjes: 'plakje', handje: 'handje',
+  thl: 'tl', kl: 'tl', koffielepel: 'tl', blikken: 'blik', potten: 'pot', kilo: 'kg',
 };
 const UNICODE_FRACTIONS = { '½': 0.5, '⅓': 0.333, '⅔': 0.667, '¼': 0.25, '¾': 0.75, '⅛': 0.125 };
 function parseIngredientLine(raw) {
@@ -212,14 +222,23 @@ function isoWeekNumber(ws) {
 }
 
 // --- maaltijd-slots ---
+// Aantal personen in huis: standaard voor elke nieuwe maaltijd (instelbaar in het menu).
+let HOUSEHOLD_SIZE = 5;
+// Type dat de "Vul de week"-knop gebruikt voor lege slots.
+function defaultTypeFor(mealKey) { return mealKey === 'Ontbijt' ? 'Ontbijt' : 'Hoofdmaaltijd'; }
 function emptySlot(mealKey) {
-  const m = MEALS.find(x => x.key === mealKey);
-  return { persons: m ? m.defaultPersons : 2, category: '', recipeId: '', locked: false, feedback: null, notes: '', componentIds: [], aiGenerated: false };
+  return { persons: HOUSEHOLD_SIZE, category: '', recipeId: '', locked: false, feedback: null, notes: '', componentIds: [], aiGenerated: false,
+    doubleFor: null, leftoverFrom: null };
 }
 function entryToSlot(e) {
   return { persons: e.persons, category: e.type || '', recipeId: e.recipeId || '', locked: !!e.locked, feedback: e.feedback || null,
-    notes: e.notes || '', componentIds: e.componentIds || [], aiGenerated: !!e.aiGenerated };
+    notes: e.notes || '', componentIds: e.componentIds || [], aiGenerated: !!e.aiGenerated,
+    doubleFor: e.doubleFor || null, leftoverFrom: e.leftoverFrom || null };
 }
+// "Kook dubbel": sleutel van een slot, bv. "Woensdag|Avond"
+function slotKeyOf(day, meal) { return `${day}|${meal}`; }
+function parseSlotKey(k) { const [day, meal] = (k || '').split('|'); return DAYS.includes(day) && MEALS.some(m => m.key === meal) ? { day, meal } : null; }
+function slotLabel(k) { const p = parseSlotKey(k); if (!p) return ''; return `${DAY_SHORT[DAYS.indexOf(p.day)]} · ${MEALS.find(m => m.key === p.meal).label.toLowerCase()}`; }
 function buildWeekmenu(entries) {
   const wm = {};
   DAYS.forEach(d => { wm[d] = {}; MEALS.forEach(m => { wm[d][m.key] = emptySlot(m.key); }); });
@@ -259,6 +278,95 @@ function slotSummary(slot, byId) {
   return '';
 }
 
+// --- boodschappen: eenheden, hoeveelheden, afdelingen ---
+function normUnit(u) { const k = (u || '').trim().toLowerCase(); return UNIT_ALIASES[k] || k; }
+const FRACTION_CHARS = { 0.25: '¼', 0.5: '½', 0.75: '¾' };
+// Stuks rond je naar boven af op een kwart: "0,17 ui" wordt "¼ ui", "2,3 paprika" wordt "2½".
+function fmtShopAmount(item) {
+  if (!item.hasAmount) return item.unit || 'naar smaak';
+  const unit = item.unit || '';
+  if (unit === 'stuks' || unit === '') {
+    const q = Math.ceil(item.amount * 4 - 1e-9) / 4;
+    const whole = Math.floor(q), frac = Math.round((q - whole) * 100) / 100;
+    const txt = (whole ? String(whole) : '') + (frac ? FRACTION_CHARS[frac] : '') || '0';
+    return `${txt}${unit ? ' ' + unit : ''}`;
+  }
+  return `${fmtAmount(item.amount)} ${unit}`.trim();
+}
+const AISLES = ['Groenten & fruit', 'Brood', 'Vlees & vis', 'Zuivel & eieren', 'Kaas & charcuterie', 'Droge voeding',
+  'Conserven & sauzen', 'Diepvries', 'Dranken & wijn', 'Huishouden', 'Overig'];
+// Volgorde van controle telt: specifieke afdelingen eerst (kokosmelk = conserven, niet groenten).
+const AISLE_KEYWORDS = [
+  ['Huishouden', ['wc-papier', 'wc papier', 'toiletpapier', 'keukenrol', 'afwas', 'vaatwas', 'zeep', 'wasmiddel', 'wasverzachter', 'vuilniszak', 'aluminiumfolie', 'bakpapier', 'huishoudfolie', 'tandpasta', 'shampoo', 'douchegel', 'deodorant', 'luiers', 'batterij', 'schoonmaak', 'spons']],
+  ['Diepvries', ['diepvries', 'bevroren', 'ijs', 'ijsblokjes', 'frietjes', 'diepvriesgroenten']],
+  ['Dranken & wijn', ['wijn', 'rode wijn', 'witte wijn', 'cava', 'bier', 'frisdrank', 'cola', 'spuitwater', 'bruiswater', 'plat water', 'fruitsap', 'sinaasappelsap', 'appelsap', 'koffie', 'thee', 'siroop']],
+  ['Conserven & sauzen', ['passata', 'tomatensaus', 'tomatenpuree', 'tomatenblokjes', 'kokosmelk', 'kokosroom', 'mayonaise', 'ketchup', 'mosterd', 'azijn', 'balsamico', 'olijfolie', 'olie', 'kokosolie', 'sojasaus', 'tamari', 'pesto', 'kappertjes', 'olijven', 'bouillon', 'blik', 'kikkererwten', 'bonen in blik', 'kidneybonen', 'witte bonen', 'zwarte bonen', 'mais', 'augurk', 'tahin', 'tahini', 'currypasta', 'sambal', 'harissa', 'vissaus', 'worcester', 'tabasco', 'pindakaas', 'notenpasta', 'amandelpasta', 'sesampasta', 'confituur', 'tonijn']],
+  ['Kaas & charcuterie', ['kaas', 'mozzarella', 'mozarella', 'feta', 'parmezaan', 'parmezaanse', 'parmigiano', 'geitenkaas', 'halloumi', 'gruyere', 'cheddar', 'emmentaler', 'brie', 'ham', 'bacon', 'spek', 'spekjes', 'salami', 'chorizo', 'prosciutto', 'serrano', 'charcuterie', 'vegankaas']],
+  ['Zuivel & eieren', ['ei', 'eieren', 'eiwit', 'eigeel', 'melk', 'amandelmelk', 'sojamelk', 'yoghurt', 'griekse yoghurt', 'skyr', 'kwark', 'platte kaas', 'room', 'slagroom', 'zure room', 'creme fraiche', 'boter', 'roomboter', 'ghee', 'mascarpone', 'ricotta', 'cottage', 'cottagecheese', 'hüttenkäse', 'huttenkase', 'sojayoghurt', 'cocosyoghurt', 'kokosyoghurt']],
+  ['Vlees & vis', ['kip', 'kipfilet', 'kippengehakt', 'kalkoen', 'rund', 'rundvlees', 'rundergehakt', 'varken', 'varkenshaas', 'gehakt', 'americain', 'lam', 'lamsvlees', 'steak', 'biefstuk', 'entrecote', 'worst', 'worstjes', 'braadworst', 'zalm', 'makreel', 'kabeljauw', 'vis', 'witte vis', 'zeebaars', 'dorade', 'garnalen', 'gamba', 'scampi', 'mosselen', 'inktvis', 'tofu', 'tempe', 'tempeh', 'quorn', 'seitan', 'vleesvervanger', 'filet']],
+  ['Brood', ['brood', 'pistolet', 'baguette', 'stokbrood', 'ciabatta', 'croissant', 'wrap', 'wraps', 'tortilla', 'pita', 'naan', 'beschuit', 'toast', 'koffiekoek']],
+  ['Droge voeding', ['rijst', 'pasta', 'spaghetti', 'noedels', 'quinoa', 'couscous', 'bulgur', 'bloem', 'meel', 'amandelmeel', 'kokosmeel', 'havermout', 'granola', 'muesli', 'noten', 'amandel', 'amandelen', 'walnoten', 'cashew', 'pecan', 'hazelnoot', 'pinda', 'zaden', 'lijnzaad', 'chiazaad', 'sesam', 'pompoenpitten', 'zonnebloempitten', 'kruiden', 'italiaanse kruiden', 'provencaalse kruiden', 'komijn', 'paprikapoeder', 'kerrie', 'curry', 'kurkuma', 'kaneel', 'oregano', 'tijm', 'nootmuskaat', 'chilipoeder', 'cayenne', 'knoflookpoeder', 'uienpoeder', 'zout', 'zeezout', 'peper', 'suiker', 'honing', 'cacao', 'chocolade', 'bakpoeder', 'gist', 'vanille', 'rozijnen', 'kokosrasp', 'linzen', 'gedroogde', 'stevia', 'erythritol', 'psyllium']],
+  ['Groenten & fruit', ['ui', 'uien', 'rode ui', 'sjalot', 'look', 'knoflook', 'tomaat', 'tomaten', 'cherrytomaat', 'kerstomaat', 'courgette', 'paprika', 'wortel', 'wortelen', 'wortels', 'broccoli', 'bloemkool', 'spinazie', 'sla', 'kropsla', 'ijsbergsla', 'veldsla', 'rucola', 'komkommer', 'avocado', 'citroen', 'limoen', 'appel', 'peer', 'banaan', 'aardbei', 'aardbeien', 'bessen', 'blauwe bessen', 'frambozen', 'druiven', 'kiwi', 'mango', 'ananas', 'sinaasappel', 'champignon', 'champignons', 'portobello', 'shiitake', 'prei', 'selder', 'bleekselderij', 'venkel', 'kool', 'rode kool', 'witte kool', 'boerenkool', 'spruitjes', 'groene kool', 'aubergine', 'peterselie', 'basilicum', 'koriander', 'munt', 'dille', 'bieslook', 'rozemarijn', 'gember', 'chilipeper', 'pepers', 'aardappel', 'aardappelen', 'zoete aardappel', 'asperge', 'asperges', 'radijs', 'radijsjes', 'raap', 'raapjes', 'pompoen', 'biet', 'rode biet', 'bosui', 'lente-ui', 'postelein', 'kiemen', 'kiemscheuten', 'sperziebonen', 'boontjes', 'erwten', 'peultjes', 'papaya', 'vijgen', 'granaatappel', 'fruit', 'groenten', 'seizoensfruit']],
+];
+function guessAisle(name) {
+  const n = normalize(name);
+  for (const [aisle, words] of AISLE_KEYWORDS) {
+    for (const w of words) {
+      const k = normalize(w);
+      if (new RegExp(`(^|[^a-z0-9])${escapeRe(k)}`).test(n) || (k.length >= 6 && n.includes(k))) return aisle;
+    }
+  }
+  return 'Overig';
+}
+// Afdelingsvolgorde van een winkel: eigen volgorde eerst, nieuwe afdelingen achteraan.
+function aisleOrderFor(store, storeAisles) {
+  const saved = ((storeAisles && storeAisles[store]) || []).filter(a => AISLES.includes(a));
+  return [...saved, ...AISLES.filter(a => !saved.includes(a))];
+}
+function newId() {
+  try { if (crypto && crypto.randomUUID) return crypto.randomUUID(); } catch (e) {}
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16); });
+}
+
+// --- gezinsvoorkeuren ---
+// restrictions: [{ term, kind: 'allergie' | 'lust_niet' }]
+function recipeContains(recipe, termNorm) {
+  if (!termNorm) return false;
+  return ingredientMatches(recipe.title, [termNorm]) || (recipe.ingredients || []).some(i => i.name && ingredientMatches(i.name, [termNorm]));
+}
+function restrictionHits(recipes, members) {
+  const hits = [];
+  (members || []).forEach(m => (m.restrictions || []).forEach(r => {
+    const t = normalize(r.term);
+    if (t && recipes.some(rc => recipeContains(rc, t))) hits.push({ who: m.name, term: r.term, kind: r.kind });
+  }));
+  return hits;
+}
+
+// --- kookmodus: tijden in een bereidingsstap herkennen ("15 min", "1 uur", "20-25 minuten") ---
+const DURATION_RE = /(\d+(?:[.,]\d+)?)(?:\s*(?:-|–|à|tot)\s*(\d+(?:[.,]\d+)?))?\s*(uren|uur|u(?![a-z])|minuten|minuut|min(?![a-z])\.?|seconden|sec(?![a-z])\.?)/gi;
+function splitDurations(text) {
+  const parts = []; let last = 0, m;
+  DURATION_RE.lastIndex = 0;
+  while ((m = DURATION_RE.exec(text || '')) !== null) {
+    const n = parseFloat(m[1].replace(',', '.'));
+    const unit = m[3].toLowerCase();
+    const mult = unit.startsWith('u') ? 3600 : unit.startsWith('s') ? 1 : 60;
+    const seconds = Math.round(n * mult);
+    if (!seconds || seconds > 12 * 3600) continue;
+    if (m.index > last) parts.push({ text: text.slice(last, m.index) });
+    parts.push({ text: m[0], seconds });
+    last = m.index + m[0].length;
+  }
+  if (last < (text || '').length) parts.push({ text: text.slice(last) });
+  return parts;
+}
+function fmtClock(sec) {
+  sec = Math.max(0, Math.round(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return (h ? `${h}:${String(m).padStart(2, '0')}` : `${m}`) + `:${String(s).padStart(2, '0')}`;
+}
+
 // =================================================================
 // 3. Supabase
 // =================================================================
@@ -267,10 +375,11 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 function recipeOut(row) {
-  return { id: row.id, title: row.title, category: row.category || '', basePortions: row.portions_base || 1,
+  // Recepten zonder categorie (oude import) tonen we als "Extra", zodat ze in de kiezers verschijnen.
+  return { id: row.id, title: row.title, category: row.category || 'Extra', basePortions: row.portions_base || 1,
     carbsPerPortion: row.carbs_per_portion === null || row.carbs_per_portion === undefined ? null : Number(row.carbs_per_portion),
     ingredients: row.ingredients || [], steps: row.steps || [], stars: row.stars || null, source: row.source,
-    image: row.image_url || '' };
+    image: row.image_url || '', glutenFree: !!row.gluten_free };
 }
 function recipeIn(body) {
   const row = {};
@@ -283,6 +392,7 @@ function recipeIn(body) {
   if (body.stars !== undefined) row.stars = body.stars;
   if (body.source !== undefined) row.source = body.source;
   if (body.image !== undefined) row.image_url = body.image || null;
+  if (body.glutenFree !== undefined) row.gluten_free = !!body.glutenFree;
   return row;
 }
 // Foto van een recept opslaan in de 'recipe-photos' bucket; geeft de publieke URL terug.
@@ -320,7 +430,8 @@ function resizeImageFile(file, maxDim = 1600, quality = 0.82) {
 function weekmenuOut(row) {
   return { weekStart: row.week_start, day: row.day, meal: row.meal, persons: row.persons, type: row.type || '',
     recipeId: row.recipe_id || '', locked: !!row.locked, feedback: row.feedback || null, notes: row.notes || '',
-    componentIds: row.component_ids || [], aiGenerated: !!row.ai_generated };
+    componentIds: row.component_ids || [], aiGenerated: !!row.ai_generated,
+    doubleFor: row.double_for || null, leftoverFrom: row.leftover_from || null };
 }
 function pantryOut(row) { return { id: row.id, name: row.ingredient_name, inStock: !!row.in_stock }; }
 function suggestionOut(row) {
@@ -344,6 +455,62 @@ async function invokeAi(body) {
   if (data && data.error) throw new Error(data.error);
   return data;
 }
+
+// --- Offline-wachtrij voor boodschappen ---
+// Elke wijziging (afvinken, los item toevoegen, …) gaat eerst in deze wachtrij
+// (bewaard in localStorage), wordt meteen op het scherm getoond en daarna naar
+// Supabase gestuurd. Geen bereik in de winkel? Dan blijft ze staan tot er weer
+// netwerk is. QUEUE in het geheugen is de bron; localStorage is enkel de kopie.
+const QUEUE_KEY = 'mealio-queue-v1';
+let QUEUE = (() => { try { const q = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]'); return Array.isArray(q) ? q : []; } catch (e) { return []; } })();
+function persistQueue() { try { localStorage.setItem(QUEUE_KEY, JSON.stringify(QUEUE)); } catch (e) {} }
+function isNetworkError(e) { return !navigator.onLine || /failed to fetch|networkerror|network request failed|load failed|timeout|fetch/i.test((e && e.message) || ''); }
+async function runQueueOp(op) {
+  if (op.t === 'check') {
+    if (op.state) throwIfError(await sb.from('shopping_checks').upsert({ week_start: op.ws, item_key: op.key, state: op.state, updated_at: new Date(op.at || Date.now()).toISOString() }, { onConflict: 'week_start,item_key' }));
+    else throwIfError(await sb.from('shopping_checks').delete().eq('week_start', op.ws).eq('item_key', op.key));
+  } else if (op.t === 'checks_clear') {
+    throwIfError(await sb.from('shopping_checks').delete().eq('week_start', op.ws).eq('state', 'cart'));
+  } else if (op.t === 'extra_put') {
+    throwIfError(await sb.from('shopping_extra_items').upsert(op.row, { onConflict: 'id' }));
+  } else if (op.t === 'extra_del') {
+    throwIfError(await sb.from('shopping_extra_items').delete().eq('id', op.id));
+  }
+}
+// Nog niet verstuurde wijzigingen bovenop geladen data leggen (anders "springen" vinkjes terug).
+function applyQueueToChecks(checks, ws) {
+  const out = { ...checks };
+  QUEUE.forEach(op => {
+    if (op.t === 'check' && op.ws === ws) { if (op.state) out[op.key] = op.state; else delete out[op.key]; }
+    else if (op.t === 'checks_clear' && op.ws === ws) Object.keys(out).forEach(k => { if (out[k] === 'cart') delete out[k]; });
+  });
+  return out;
+}
+function applyQueueToExtras(rows) {
+  let out = [...rows];
+  QUEUE.forEach(op => {
+    if (op.t === 'extra_put') { out = out.filter(r => r.id !== op.row.id); out.push(op.row); }
+    else if (op.t === 'extra_del') out = out.filter(r => r.id !== op.id);
+  });
+  return out;
+}
+
+// Scherm aan houden (winkelmodus, kookmodus). Geeft terug of het toestel dit ondersteunt.
+function useWakeLock(active) {
+  const supported = typeof navigator !== 'undefined' && 'wakeLock' in navigator;
+  useEffect(() => {
+    if (!active || !supported) return;
+    let lock = null, stopped = false;
+    const request = async () => { try { lock = await navigator.wakeLock.request('screen'); } catch (e) { /* bv. batterijbesparing */ } };
+    request();
+    const onVis = () => { if (!stopped && document.visibilityState === 'visible') request(); };
+    document.addEventListener('visibilitychange', onVis);
+    return () => { stopped = true; document.removeEventListener('visibilitychange', onVis); try { if (lock) lock.release(); } catch (e) {} };
+  }, [active, supported]);
+  return supported;
+}
+// Volledig-scherm-overlays buiten de (getransformeerde) sheets renderen.
+function Portal({ children }) { return ReactDOM.createPortal(children, document.body); }
 
 // =================================================================
 // 4. UI-bouwstenen
@@ -376,6 +543,10 @@ const ICONS = {
   refresh: <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8M3 3v5h5M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16M16 16h5v5" />,
   list: <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />,
   grid: <><rect width="7" height="7" x="3" y="3" rx="1" /><rect width="7" height="7" x="14" y="3" rx="1" /><rect width="7" height="7" x="14" y="14" rx="1" /><rect width="7" height="7" x="3" y="14" rx="1" /></>,
+  more: <><circle cx="5" cy="12" r="1.3" /><circle cx="12" cy="12" r="1.3" /><circle cx="19" cy="12" r="1.3" /></>,
+  pin: <><path d="M12 17v5" /><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" /></>,
+  up2: <path d="m18 15-6-6-6 6" />,
+  timer: <><path d="M10 2h4M12 14l3-3" /><circle cx="12" cy="14" r="8" /></>,
   camera: <><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3Z" /><circle cx="12" cy="13" r="3.5" /></>,
 };
 function Icon({ name, size = 18, className = '', stroke = 2 }) {
@@ -520,6 +691,12 @@ function Sheet({ title, subtitle, onClose, children, footer, z = 40, full }) {
 // =================================================================
 // 5. App (data + navigatie)
 // =================================================================
+const DEFAULT_STORES = ['Colruyt', 'Okay', 'Slager', 'Bakker'];
+const SETTINGS_DB_KEYS = { stores: 'stores', itemStoreMap: 'item_store_map', householdSize: 'household_size', storeAisles: 'store_aisles', itemAisleMap: 'item_aisle_map' };
+// Als de database nog niet bijgewerkt is (migratie-mealio-v2.sql), werkt de planner
+// gewoon verder zonder de "kook dubbel"-kolommen.
+let HAS_V2_COLUMNS = true;
+
 function App() {
   const [session, setSession] = useState(undefined);
   const [authError, setAuthError] = useState('');
@@ -529,12 +706,20 @@ function App() {
   const [weekStart, setWeekStartState] = useState(mondayOf(new Date()));
   const [weekEntries, setWeekEntriesState] = useState([]);
   const [weekLoading, setWeekLoading] = useState(false);
-  const [stores, setStores] = useState(['Colruyt', 'Okay', 'Slager', 'Bakker']);
+  const [stores, setStores] = useState(DEFAULT_STORES);
   const [itemStoreMap, setItemStoreMap] = useState({});
-  const [checkedItems, setCheckedItems] = useState({});
-  const [extraItems, setExtraItems] = useState([]);
+  const [storeAisles, setStoreAisles] = useState({});
+  const [itemAisleMap, setItemAisleMap] = useState({});
+  const [checks, setChecks] = useState({});          // item_key -> 'cart' | 'have' (huidige week)
+  const [extraRows, setExtraRows] = useState([]);    // losse items
+  const [staples, setStaples] = useState([]);        // vaste items
+  const [members, setMembers] = useState([]);        // gezinsleden + voorkeuren
   const [pantryStock, setPantryStock] = useState([]);
   const [aiSuggestions, setAiSuggestions] = useState([]);
+  const [householdSize, setHouseholdSize] = useState(5);
+  const [migrationMissing, setMigrationMissing] = useState(false);
+  const [pendingOps, setPendingOps] = useState(QUEUE.length);
+  const [online, setOnline] = useState(typeof navigator === 'undefined' ? true : navigator.onLine);
 
   const [tab, setTab] = useState('planner');
   const [selectedDay, setSelectedDay] = useState(DAYS[dayIndexOf(todayISO())]);
@@ -543,14 +728,18 @@ function App() {
   const [recipeSheet, setRecipeSheet] = useState(null);    // { id, edit }
   const [addSheet, setAddSheet] = useState(null);          // { category, title, onCreated }
   const [planSheetId, setPlanSheetId] = useState(null);
+  const [storeMode, setStoreMode] = useState(null);        // winkelnaam of '__all__'
+  const [familyOpen, setFamilyOpen] = useState(false);
+  const [accessOpen, setAccessOpen] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
   const [aiSuggesting, setAiSuggesting] = useState(false);
 
   // refs om race-conditions te vermijden (snelle opeenvolgende wijzigingen,
-  // week wisselen terwijl er nog geladen wordt, polling tijdens het opslaan)
+  // week wisselen terwijl er nog geladen wordt, verversen tijdens het opslaan)
   const entriesRef = useRef([]);
   const weekStartRef = useRef(weekStart);
   const lastWriteRef = useRef(0);
+  const flushingRef = useRef(false);
   weekStartRef.current = weekStart;
   function setEntries(next) { entriesRef.current = next; setWeekEntriesState(next); }
 
@@ -560,7 +749,7 @@ function App() {
   function showToast(msg, action) {
     clearTimeout(toastTimer.current);
     setToast({ msg, action });
-    toastTimer.current = setTimeout(() => setToast(null), action ? 4500 : 2600);
+    toastTimer.current = setTimeout(() => setToast(null), action ? 5500 : 2600);
   }
 
   // ---------- auth ----------
@@ -582,55 +771,146 @@ function App() {
       if (ws === weekStartRef.current) setEntries((rows || []).map(weekmenuOut));
     } catch (e) { console.error(e); }
   }, []);
-  const loadAll = useCallback(async (isPoll) => {
+  const loadShopping = useCallback(async (ws) => {
+    try {
+      const [checkRows, extraDb, stapleRows] = await Promise.all([
+        sb.from('shopping_checks').select('item_key,state').eq('week_start', ws),
+        sb.from('shopping_extra_items').select('*').order('created_at'),
+        sb.from('staple_items').select('*').order('sort').order('name'),
+      ].map(p => p.then(throwIfError)));
+      if (ws !== weekStartRef.current) return;
+      const c = {}; (checkRows || []).forEach(r => { c[r.item_key] = r.state; });
+      setChecks(applyQueueToChecks(c, ws));
+      setExtraRows(applyQueueToExtras(extraDb || []));
+      setStaples(stapleRows || []);
+      setMigrationMissing(false);
+    } catch (e) {
+      console.error(e);
+      if (/does not exist|schema cache|relation/i.test(e.message || '')) setMigrationMissing(true);
+    }
+  }, []);
+  const loadMembers = useCallback(async () => {
+    try { setMembers(throwIfError(await sb.from('household_members').select('*').order('sort').order('created_at')) || []); }
+    catch (e) { console.error(e); }
+  }, []);
+  const applySettings = useCallback((rows) => {
+    const byKey = {}; (rows || []).forEach(r => { byKey[r.key] = r.value; });
+    setStores(byKey.stores && byKey.stores.length ? byKey.stores : DEFAULT_STORES);
+    setItemStoreMap(byKey.item_store_map || {});
+    setStoreAisles(byKey.store_aisles || {});
+    setItemAisleMap(byKey.item_aisle_map || {});
+    HOUSEHOLD_SIZE = Number(byKey.household_size) || 5;
+    setHouseholdSize(HOUSEHOLD_SIZE);
+  }, []);
+  const loadSettings = useCallback(async () => {
+    try { applySettings(throwIfError(await sb.from('app_settings').select('key,value').in('key', Object.values(SETTINGS_DB_KEYS)))); }
+    catch (e) { console.error(e); }
+  }, [applySettings]);
+  const loadRecipes = useCallback(async () => {
+    try { setRecipes((throwIfError(await sb.from('recipes').select('*').order('title')) || []).map(recipeOut)); }
+    catch (e) { console.error(e); }
+  }, []);
+  // includeRecipes = false bij het periodiek verversen: de receptenlijst is groot
+  // en verandert zelden; die laden we opnieuw bij het openen van het tabblad.
+  const loadAll = useCallback(async (isPoll, includeRecipes = true) => {
     try {
       const [recipeRows, settingsRows, pantryRows, suggestionRows] = await Promise.all([
-        sb.from('recipes').select('*').order('title'),
-        sb.from('app_settings').select('key,value').in('key', ['stores', 'checked_items', 'item_store_map', 'extra_items']),
+        includeRecipes ? sb.from('recipes').select('*').order('title') : Promise.resolve({ data: null, error: null }),
+        sb.from('app_settings').select('key,value').in('key', Object.values(SETTINGS_DB_KEYS)),
         sb.from('pantry_stock').select('*').order('ingredient_name'),
         sb.from('ai_recipe_suggestions').select('*').eq('status', 'pending').order('created_at', { ascending: false }),
       ].map(p => p.then(throwIfError)));
-      setRecipes((recipeRows || []).map(recipeOut));
-      const byKey = {}; (settingsRows || []).forEach(r => { byKey[r.key] = r.value; });
-      setStores(byKey.stores && byKey.stores.length ? byKey.stores : ['Colruyt', 'Okay', 'Slager', 'Bakker']);
-      setItemStoreMap(byKey.item_store_map || {});
-      setCheckedItems(byKey.checked_items || {});
-      setExtraItems(byKey.extra_items || []);
+      if (recipeRows) setRecipes(recipeRows.map(recipeOut));
+      applySettings(settingsRows);
       setPantryStock((pantryRows || []).map(pantryOut));
       setAiSuggestions((suggestionRows || []).map(suggestionOut));
-      await loadWeek(weekStartRef.current);
+      await Promise.all([loadWeek(weekStartRef.current), loadShopping(weekStartRef.current), loadMembers()]);
     } catch (e) {
       console.error(e);
       if (!isPoll) showToast('Laden mislukt — controleer je verbinding');
     }
-  }, [loadWeek]);
+  }, [loadWeek, loadShopping, loadMembers, applySettings]);
 
-  useEffect(() => { if (session) loadAll(false).then(() => setLoaded(true)); }, [session]); // eslint-disable-line
+  useEffect(() => { if (session) loadAll(false).then(() => { setLoaded(true); flushQueue(); }); }, [session]); // eslint-disable-line
 
-  // Automatisch verversen (zodat je elkaars wijzigingen ziet) — maar niet
-  // tijdens het typen of vlak na een eigen wijziging.
+  // Live: wijzigingen van de andere ouder verschijnen meteen (Supabase Realtime).
+  useEffect(() => {
+    if (!session) return;
+    const timers = {};
+    const later = (name, fn) => { clearTimeout(timers[name]); timers[name] = setTimeout(fn, 350); };
+    const channel = sb.channel('mealio-live')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'weekmenu_entries' }, (p) => {
+        const ws = (p.new && p.new.week_start) || (p.old && p.old.week_start);
+        if (ws && ws !== weekStartRef.current) return;
+        later('week', () => { if (Date.now() - lastWriteRef.current > 1500) loadWeek(weekStartRef.current); });
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'shopping_checks' }, () => later('shop', () => loadShopping(weekStartRef.current)))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'shopping_extra_items' }, () => later('shop', () => loadShopping(weekStartRef.current)))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'app_settings' }, () => later('settings', loadSettings))
+      .subscribe();
+    return () => { Object.values(timers).forEach(clearTimeout); sb.removeChannel(channel); };
+  }, [session, loadWeek, loadShopping, loadSettings]);
+
+  // Vangnet: elke minuut alles (behalve recepten) verversen, niet tijdens het typen.
   useEffect(() => {
     if (!session) return;
     const tick = () => {
       const el = document.activeElement;
       const typing = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA');
       if (document.hidden || typing || Date.now() - lastWriteRef.current < 5000) return;
-      loadAll(true);
+      loadAll(true, false);
     };
-    const id = setInterval(tick, 15000);
-    const onVis = () => { if (!document.hidden) tick(); };
+    const id = setInterval(tick, 60000);
+    const onVis = () => { if (!document.hidden) { tick(); flushQueue(); } };
     document.addEventListener('visibilitychange', onVis);
     return () => { clearInterval(id); document.removeEventListener('visibilitychange', onVis); };
-  }, [loadAll, session]);
+  }, [loadAll, session]); // eslint-disable-line
+
+  // Online/offline: bij terug-online de wachtrij versturen.
+  useEffect(() => {
+    const on = () => { setOnline(true); flushQueue().then(() => loadShopping(weekStartRef.current)); };
+    const off = () => setOnline(false);
+    window.addEventListener('online', on); window.addEventListener('offline', off);
+    return () => { window.removeEventListener('online', on); window.removeEventListener('offline', off); };
+  }, [loadShopping]); // eslint-disable-line
 
   async function setWeekStart(ws) {
     setWeekStartState(ws);
     weekStartRef.current = ws;
     setEntries([]);
+    setChecks(applyQueueToChecks({}, ws));
     setSelectedDay(ws === mondayOf(new Date()) ? DAYS[dayIndexOf(todayISO())] : DAYS[0]);
     setWeekLoading(true);
-    await loadWeek(ws);
+    await Promise.all([loadWeek(ws), loadShopping(ws)]);
     setWeekLoading(false);
+  }
+  function switchTab(id) {
+    setTab(id);
+    if (id === 'recipes') loadRecipes();
+  }
+
+  // ---------- offline-wachtrij ----------
+  async function flushQueue() {
+    if (flushingRef.current) return;
+    flushingRef.current = true;
+    try {
+      while (QUEUE.length) {
+        const op = QUEUE[0];
+        try { await runQueueOp(op); }
+        catch (e) {
+          if (isNetworkError(e)) break;   // geen bereik: later opnieuw
+          console.error('Wijziging kon niet opgeslagen worden', op, e);
+          if (/does not exist|schema cache|relation/i.test(e.message || '')) setMigrationMissing(true);
+          showToast('Opslaan mislukt: ' + (e.message || 'onbekende fout'));
+        }
+        QUEUE.shift(); persistQueue(); setPendingOps(QUEUE.length);
+      }
+    } finally { flushingRef.current = false; setPendingOps(QUEUE.length); }
+  }
+  function enqueue(op) {
+    QUEUE.push({ ...op, at: Date.now() }); persistQueue(); setPendingOps(QUEUE.length);
+    lastWriteRef.current = Date.now();
+    flushQueue();
   }
 
   // ---------- recepten ----------
@@ -660,20 +940,31 @@ function App() {
     setEntries([...entriesRef.current.filter(e => !(e.day === day && e.meal === meal)), {
       weekStart: ws, day, meal, persons: next.persons, type: next.category, recipeId: next.recipeId, locked: next.locked,
       feedback: next.feedback, notes: next.notes, componentIds: next.componentIds, aiGenerated: next.aiGenerated,
+      doubleFor: next.doubleFor || null, leftoverFrom: next.leftoverFrom || null,
     }]);
     lastWriteRef.current = Date.now();
+    const row = {
+      week_start: ws, day, meal, persons: next.persons, type: next.category || null, recipe_id: next.recipeId || null,
+      locked: !!next.locked, feedback: next.feedback || null, notes: next.notes || null,
+      component_ids: next.componentIds || [], ai_generated: !!next.aiGenerated,
+    };
+    if (HAS_V2_COLUMNS) { row.double_for = next.doubleFor || null; row.leftover_from = next.leftoverFrom || null; }
     try {
-      throwIfError(await sb.from('weekmenu_entries').upsert({
-        week_start: ws, day, meal, persons: next.persons, type: next.category || null, recipe_id: next.recipeId || null,
-        locked: !!next.locked, feedback: next.feedback || null, notes: next.notes || null,
-        component_ids: next.componentIds || [], ai_generated: !!next.aiGenerated,
-      }, { onConflict: 'week_start,day,meal' }));
-    } catch (e) { showToast('Opslaan mislukt — probeer opnieuw'); }
+      throwIfError(await sb.from('weekmenu_entries').upsert(row, { onConflict: 'week_start,day,meal' }));
+    } catch (e) {
+      if (HAS_V2_COLUMNS && /double_for|leftover_from|schema cache|column/i.test(e.message || '')) {
+        // database nog niet bijgewerkt: opnieuw proberen zonder de nieuwe kolommen
+        HAS_V2_COLUMNS = false; setMigrationMissing(true);
+        delete row.double_for; delete row.leftover_from;
+        try { throwIfError(await sb.from('weekmenu_entries').upsert(row, { onConflict: 'week_start,day,meal' })); }
+        catch (e2) { showToast('Opslaan mislukt — probeer opnieuw'); }
+      } else showToast('Opslaan mislukt — probeer opnieuw');
+    }
     lastWriteRef.current = Date.now();
   }
 
   // 👍/👎 past de sterren aan van álle recepten in die maaltijd; opnieuw
-  // tikken maakt het weer ongedaan (vroeger bleef de +1 dan staan).
+  // tikken maakt het weer ongedaan.
   async function giveMealFeedback(day, meal, nextFeedback) {
     const slot = buildWeekmenu(entriesRef.current)[day][meal];
     const score = v => v === 'up' ? 1 : v === 'down' ? -1 : 0;
@@ -704,6 +995,77 @@ function App() {
     showToast(`Ingepland: ${day} · ${meal}`, { label: 'Bekijk', onClick: () => { setRecipeSheet(null); setTab('planner'); setSelectedDay(day); } });
   }
 
+  // Leegmaken met "ongedaan maken"; ruimt ook een "kook dubbel"-koppeling op.
+  async function clearMealSlot(day, meal) {
+    const wm = buildWeekmenu(entriesRef.current);
+    const me = slotKeyOf(day, meal);
+    const before = { ...wm[day][meal] };
+    const linked = [];
+    [before.doubleFor, before.leftoverFrom].forEach(k => {
+      const p = parseSlotKey(k); if (!p) return;
+      const other = wm[p.day][p.meal];
+      if (other.leftoverFrom === me || other.doubleFor === me) linked.push({ ...p, slot: { ...other } });
+    });
+    const empty = { category: '', recipeId: '', componentIds: [], notes: '', locked: false, aiGenerated: false, feedback: null, doubleFor: null, leftoverFrom: null };
+    await updateMealSlot(day, meal, empty);
+    for (const l of linked) {
+      if (l.slot.leftoverFrom === me) await updateMealSlot(l.day, l.meal, empty);   // de restjes van deze maaltijd vervallen
+      else await updateMealSlot(l.day, l.meal, { doubleFor: null });                 // de bron kookt niet langer dubbel
+    }
+    showToast(`${meal} op ${day.toLowerCase()} leeggemaakt`, { label: 'Ongedaan maken', onClick: async () => {
+      await updateMealSlot(day, meal, before);
+      for (const l of linked) await updateMealSlot(l.day, l.meal, l.slot);
+      showToast('Teruggezet');
+    } });
+  }
+
+  // Kook dubbel: bron kookt voor 2 maaltijden, het doel wordt "Restjes van …".
+  async function cookDouble(day, meal, tDay, tMeal) {
+    const wm = buildWeekmenu(entriesRef.current);
+    const src = wm[day][meal];
+    const tgt = wm[tDay][tMeal];
+    if (slotIsPlanned(tgt) && tgt.leftoverFrom !== slotKeyOf(day, meal)
+      && !window.confirm(`${tDay} · ${tMeal} staat al gepland (${slotSummary(tgt, recipesById)}). Vervangen door restjes?`)) return false;
+    if (src.doubleFor && src.doubleFor !== slotKeyOf(tDay, tMeal)) await undoDouble(day, meal, true);
+    const title = slotRecipes(src, recipesById).map(r => r.title).join(' + ') || 'vorige maaltijd';
+    await updateMealSlot(tDay, tMeal, { category: TYPE_LEFTOVERS, recipeId: '', componentIds: [], locked: true, aiGenerated: false, feedback: null,
+      notes: `Restjes: ${title}`, leftoverFrom: slotKeyOf(day, meal), doubleFor: null });
+    await updateMealSlot(day, meal, { doubleFor: slotKeyOf(tDay, tMeal), locked: true });
+    showToast(`🍲 Dubbel koken — restjes op ${tDay.toLowerCase()} (${tMeal.toLowerCase()})`);
+    return true;
+  }
+  async function undoDouble(day, meal, silent) {
+    const wm = buildWeekmenu(entriesRef.current);
+    const src = wm[day][meal];
+    const p = parseSlotKey(src.doubleFor);
+    if (p) {
+      const t = wm[p.day][p.meal];
+      if (t.leftoverFrom === slotKeyOf(day, meal)) await updateMealSlot(p.day, p.meal, { category: '', recipeId: '', componentIds: [], notes: '', locked: false, leftoverFrom: null });
+    }
+    await updateMealSlot(day, meal, { doubleFor: null });
+    if (!silent) showToast('Dubbel koken opgeheven');
+  }
+
+  // Kopieer vorige week: neemt over wat vorige week gepland stond; vaste 🔒 maaltijden van deze week blijven.
+  async function copyPreviousWeek() {
+    const ws = weekStartRef.current;
+    let prev;
+    try { prev = (throwIfError(await sb.from('weekmenu_entries').select('*').eq('week_start', addDays(ws, -7))) || []).map(weekmenuOut); }
+    catch (e) { showToast('Vorige week laden mislukt'); return; }
+    prev = prev.filter(e => slotIsPlanned(entryToSlot(e)));
+    if (!prev.length) { showToast('Vorige week is leeg — niets om te kopiëren'); return; }
+    const wm = buildWeekmenu(entriesRef.current);
+    const todo = prev.filter(e => !wm[e.day][e.meal].locked);
+    const kept = prev.length - todo.length;
+    if (!todo.length) { showToast('Alles van deze week staat vast 🔒 — niets gekopieerd'); return; }
+    if (!window.confirm(`${todo.length} maaltijd(en) van vorige week overnemen?${kept ? `\n${kept} vaste maaltijd(en) van deze week blijven staan.` : ''}`)) return;
+    for (const e of todo) {
+      await updateMealSlot(e.day, e.meal, { persons: e.persons, category: e.type, recipeId: e.recipeId, componentIds: e.componentIds, notes: e.notes,
+        locked: true, aiGenerated: false, feedback: null, doubleFor: e.doubleFor || null, leftoverFrom: e.leftoverFrom || null });
+    }
+    showToast(`📋 ${todo.length} maaltijd(en) overgenomen van vorige week`);
+  }
+
   // ---------- AI-planner ----------
   // targets: [{ day, meal, type, keep: [ids] }]. 'keep' = onderdelen die de AI
   // moet laten staan en enkel aanvullen (per-maaltijd "Vul aan met AI").
@@ -724,23 +1086,31 @@ function App() {
       DAYS.forEach(d => MEALS.forEach(({ key }) => { const s = wm[d][key]; if (s.locked) slotRecipes(s, recipesById).forEach(r => note(r.id, 0)); }));
       const recentHistory = Object.entries(recent).map(([title, weeksAgo]) => ({ title, weeksAgo }));
 
+      // Gezinsvoorkeuren: allergieën gaan er hier al uit, "lust niet" krijgt een vlag.
+      const allergyTerms = members.flatMap(m => (m.restrictions || []).filter(r => r.kind === 'allergie').map(r => normalize(r.term))).filter(Boolean);
+      const dislikes = members.flatMap(m => (m.restrictions || []).filter(r => r.kind !== 'allergie' && r.term).map(r => ({ who: m.name, term: r.term })));
       const needed = new Set();
       targets.forEach(t => { if (t.type === TYPE_COMPOSE) COMPONENT_CATEGORIES.forEach(c => needed.add(c)); else needed.add(t.type); });
-      const pool = recipes.filter(r => needed.has(r.category)).map(r => ({ id: r.id, title: r.title, category: r.category, stars: r.stars }));
-      if (!pool.length) { showToast('Er zijn nog geen recepten in die categorie om uit te kiezen.'); return 0; }
+      const pool = recipes
+        .filter(r => needed.has(r.category) && !allergyTerms.some(t => recipeContains(r, t)))
+        .map(r => ({ id: r.id, title: r.title, category: r.category, stars: r.stars,
+          dislikedBy: dislikes.filter(d => recipeContains(r, normalize(d.term))).map(d => `${d.who}: ${d.term}`) }));
+      if (!pool.length) { showToast('Er zijn nog geen (toegelaten) recepten in die categorie om uit te kiezen.'); return 0; }
 
-      const data = await invokeAi({ task: 'plan_week', slots: targets, recipes: pool, recentHistory });
+      const data = await invokeAi({ task: 'plan_week', slots: targets, recipes: pool, recentHistory,
+        allergies: [...new Set(members.flatMap(m => (m.restrictions || []).filter(r => r.kind === 'allergie').map(r => r.term)))], avoid: dislikes });
+      const poolIds = new Set(pool.map(p => p.id));
       let applied = 0;
       for (const a of (data && data.assignments) || []) {
         const t = targets.find(x => x.day === a.day && x.meal === a.meal);
         if (!t) continue;
         if (t.type === TYPE_COMPOSE) {
-          const ids = [...new Set([...(t.keep || []), ...((a.componentIds || []).filter(id => recipesById[id]))])];
+          const ids = [...new Set([...(t.keep || []), ...((a.componentIds || []).filter(id => recipesById[id] && poolIds.has(id)))])];
           if (!ids.length) continue;
-          await updateMealSlot(a.day, a.meal, { componentIds: ids, recipeId: '', aiGenerated: true, feedback: null });
+          await updateMealSlot(a.day, a.meal, { category: TYPE_COMPOSE, componentIds: ids, recipeId: '', aiGenerated: true, feedback: null });
           applied++;
-        } else if (a.recipeId && recipesById[a.recipeId]) {
-          await updateMealSlot(a.day, a.meal, { recipeId: a.recipeId, aiGenerated: true, feedback: null });
+        } else if (a.recipeId && recipesById[a.recipeId] && poolIds.has(a.recipeId)) {
+          await updateMealSlot(a.day, a.meal, { category: t.type, recipeId: a.recipeId, aiGenerated: true, feedback: null });
           applied++;
         }
       }
@@ -752,13 +1122,15 @@ function App() {
     const t = [];
     DAYS.forEach(day => MEALS.forEach(({ key }) => {
       const s = wm[day][key];
-      if (s.category && !NO_RECIPE_TYPES.includes(s.category) && !s.locked) t.push({ day, meal: key, type: s.category, keep: [], filled: slotIsPlanned(s) });
+      if (NO_RECIPE_TYPES.includes(s.category) || s.locked) return;
+      // lege slots krijgen het standaardtype van die maaltijd, zodat "Vul de week" ze ook invult
+      t.push({ day, meal: key, type: s.category || defaultTypeFor(key), keep: [], filled: slotIsPlanned(s) });
     }));
     return t;
   }
   async function aiFillWeek() {
     const targets = aiWeekTargets(buildWeekmenu(entriesRef.current));
-    if (!targets.length) { showToast('Kies eerst bij een maaltijd wat je wil (bv. 🧩 Samenstellen) en laat het slotje open.'); return; }
+    if (!targets.length) { showToast('Alle maaltijden van deze week staan vast of zijn overgeslagen — niets om in te vullen.'); return; }
     const filled = targets.filter(t => t.filled).length;
     if (filled && !window.confirm(`${filled} ingevulde maaltijd(en) staan niet vast 🔒 en worden opnieuw gekozen. Doorgaan?`)) return;
     const n = await runAiPlan(targets.map(({ day, meal, type }) => ({ day, meal, type, keep: [] })));
@@ -772,13 +1144,141 @@ function App() {
     if (n) showToast('✨ Aangevuld door AI');
   }
 
-  // ---------- instellingen / boodschappen ----------
-  const SETTINGS_DB_KEYS = { stores: 'stores', checkedItems: 'checked_items', itemStoreMap: 'item_store_map', extraItems: 'extra_items' };
+  // ---------- instellingen ----------
   async function persistSetting(key, setter, value) {
     setter(value);
     lastWriteRef.current = Date.now();
     try { throwIfError(await sb.from('app_settings').upsert({ key: SETTINGS_DB_KEYS[key], value }, { onConflict: 'key' })); }
     catch (e) { showToast('Opslaan mislukt — probeer opnieuw'); }
+  }
+  function changeHousehold(n) {
+    const v = Math.max(1, Math.min(12, Number(n) || 1));
+    HOUSEHOLD_SIZE = v;
+    persistSetting('householdSize', setHouseholdSize, v);
+  }
+
+  // ---------- gezinsleden ----------
+  async function addMember(name) {
+    name = (name || '').trim(); if (!name) return;
+    try {
+      const created = throwIfError(await sb.from('household_members').insert({ name, sort: members.length, restrictions: [] }).select().single());
+      setMembers(prev => [...prev, created]);
+    } catch (e) { showToast('Opslaan mislukt: ' + e.message); }
+  }
+  async function updateMember(id, patch) {
+    setMembers(prev => prev.map(m => m.id === id ? { ...m, ...patch } : m));
+    try { throwIfError(await sb.from('household_members').update(patch).eq('id', id)); }
+    catch (e) { showToast('Opslaan mislukt: ' + e.message); }
+  }
+  async function deleteMember(id) {
+    setMembers(prev => prev.filter(m => m.id !== id));
+    try { throwIfError(await sb.from('household_members').delete().eq('id', id)); }
+    catch (e) { showToast('Verwijderen mislukt: ' + e.message); }
+  }
+
+  // ---------- boodschappen ----------
+  function setCheck(key, state) {
+    const ws = weekStartRef.current;
+    setChecks(prev => { const n = { ...prev }; if (state) n[key] = state; else delete n[key]; return n; });
+    enqueue({ t: 'check', ws, key, state: state || null });
+  }
+  function putExtra(row) {
+    setExtraRows(prev => [...prev.filter(r => r.id !== row.id), row]);
+    enqueue({ t: 'extra_put', row });
+  }
+  function delExtra(id) {
+    setExtraRows(prev => prev.filter(r => r.id !== id));
+    enqueue({ t: 'extra_del', id });
+  }
+  function addExtraItem(name, store, aisle) {
+    name = (name || '').trim();
+    if (!name) return false;
+    if (extraRows.some(it => !it.checked && normalize(it.name) === normalize(name))) { showToast(`"${name}" staat al op je lijst`); return false; }
+    putExtra({ id: newId(), name, store: store || null, aisle: aisle || itemAisleMap[normalize(name)] || guessAisle(name), checked: false, created_at: new Date().toISOString() });
+    return true;
+  }
+  async function addStaple(name, store) {
+    name = (name || '').trim(); if (!name) return;
+    try {
+      const created = throwIfError(await sb.from('staple_items').insert({ name, store: store || null, aisle: itemAisleMap[normalize(name)] || guessAisle(name), active: true, sort: staples.length }).select().single());
+      setStaples(prev => [...prev, created]);
+    } catch (e) { showToast('Opslaan mislukt: ' + e.message); }
+  }
+  async function updateStaple(id, patch) {
+    setStaples(prev => prev.map(s => s.id === id ? { ...s, ...patch } : s));
+    lastWriteRef.current = Date.now();
+    try { throwIfError(await sb.from('staple_items').update(patch).eq('id', id)); }
+    catch (e) { showToast('Opslaan mislukt: ' + e.message); }
+  }
+  async function deleteStaple(id) {
+    setStaples(prev => prev.filter(s => s.id !== id));
+    try { throwIfError(await sb.from('staple_items').delete().eq('id', id)); }
+    catch (e) { showToast('Verwijderen mislukt: ' + e.message); }
+  }
+
+  // Alle items van deze week: uit het weekmenu (incl. extra porties voor "kook dubbel"),
+  // vaste items en losse items — met winkel, afdeling en status.
+  const shoppingItems = useMemo(() => {
+    const map = {};
+    DAYS.forEach(day => MEALS.forEach(({ key }) => {
+      const slot = weekmenu[day][key];
+      let persons = slot.persons || 1;
+      const dbl = parseSlotKey(slot.doubleFor);
+      if (dbl) { const t = weekmenu[dbl.day][dbl.meal]; if (t.leftoverFrom === slotKeyOf(day, key)) persons += t.persons || 0; }
+      slotRecipes(slot, recipesById).forEach(recipe => {
+        const ratio = recipe.basePortions ? persons / recipe.basePortions : 1;
+        (recipe.ingredients || []).forEach(ing => {
+          if (!ing.name) return;
+          const name = ing.name.trim();
+          const unit = normUnit(ing.unit) || (ing.amount == null ? 'naar smaak' : '');
+          const k = `${name.toLowerCase()}|${unit}`;
+          if (!map[k]) map[k] = { key: k, kind: 'recipe', name, unit, amount: 0, hasAmount: ing.amount != null, uses: new Set() };
+          if (ing.amount != null) { map[k].amount += Number(ing.amount) * ratio; map[k].hasAmount = true; }
+          map[k].uses.add(recipe.title);
+        });
+      });
+    }));
+    const stockNorm = pantryStock.filter(p => p.inStock).map(p => normalize(p.name));
+    const validStore = (s) => (s && stores.includes(s) ? s : '');
+    const aisleOf = (name, own) => (own && AISLES.includes(own) ? own : null) || itemAisleMap[normalize(name)] || guessAisle(name);
+    const list = [
+      ...Object.values(map).map(i => ({ ...i, uses: [...i.uses], store: validStore(itemStoreMap[i.key]), aisle: aisleOf(i.name), state: checks[i.key] || null })),
+      ...staples.filter(s => s.active).map(s => ({ key: `staple:${s.id}`, kind: 'staple', stapleId: s.id, name: s.name, unit: '', amount: 0, hasAmount: false, uses: [],
+        store: validStore(s.store), aisle: aisleOf(s.name, s.aisle), state: checks[`staple:${s.id}`] || null })),
+      ...extraRows.map(r => ({ key: `extra:${r.id}`, kind: 'extra', extraId: r.id, name: r.name, unit: '', amount: 0, hasAmount: false, uses: [],
+        store: validStore(r.store), aisle: aisleOf(r.name, r.aisle), state: r.checked ? 'cart' : null })),
+    ];
+    return list.map(i => ({ ...i, inKast: i.kind !== 'extra' && stockNorm.length > 0 && ingredientMatches(i.name, stockNorm) }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [weekmenu, recipesById, staples, extraRows, checks, itemStoreMap, itemAisleMap, pantryStock, stores]);
+
+  function toggleCart(item) {
+    if (item.kind === 'extra') { const r = extraRows.find(x => x.id === item.extraId); if (r) putExtra({ ...r, checked: !r.checked }); return; }
+    setCheck(item.key, item.state === 'cart' ? null : 'cart');
+  }
+  function setHave(item, have) { if (item.kind !== 'extra') setCheck(item.key, have ? 'have' : null); }
+  function assignStore(item, store) {
+    if (item.kind === 'extra') { const r = extraRows.find(x => x.id === item.extraId); if (r) putExtra({ ...r, store: store || null }); }
+    else if (item.kind === 'staple') updateStaple(item.stapleId, { store: store || null });
+    else persistSetting('itemStoreMap', setItemStoreMap, { ...itemStoreMap, [item.key]: store || undefined });
+  }
+  function assignAisle(item, aisle) {
+    if (item.kind === 'extra') { const r = extraRows.find(x => x.id === item.extraId); if (r) putExtra({ ...r, aisle }); }
+    else if (item.kind === 'staple') updateStaple(item.stapleId, { aisle });
+    // altijd onthouden voor dit ingrediënt, ook voor volgende weken
+    persistSetting('itemAisleMap', setItemAisleMap, { ...itemAisleMap, [normalize(item.name)]: aisle });
+  }
+  function removeItem(item) {
+    if (item.kind === 'extra') delExtra(item.extraId);
+    else if (item.kind === 'staple') updateStaple(item.stapleId, { active: false });
+  }
+  function newShoppingRound() {
+    if (!window.confirm('Nieuwe ronde: alles uit "In de kar" van deze week terug op de lijst zetten en afgevinkte losse items verwijderen?')) return;
+    const ws = weekStartRef.current;
+    setChecks(prev => Object.fromEntries(Object.entries(prev).filter(([, v]) => v !== 'cart')));
+    enqueue({ t: 'checks_clear', ws });
+    extraRows.filter(r => r.checked).forEach(r => delExtra(r.id));
+    showToast('Klaar voor een nieuwe boodschappenronde');
   }
   function renameStore(oldName, newName) {
     newName = newName.trim();
@@ -787,44 +1287,17 @@ function App() {
     const nextMap = {}; Object.entries(itemStoreMap).forEach(([k, v]) => { nextMap[k] = v === oldName ? newName : v; });
     persistSetting('stores', setStores, stores.map(s => s === oldName ? newName : s));
     persistSetting('itemStoreMap', setItemStoreMap, nextMap);
-    persistSetting('extraItems', setExtraItems, extraItems.map(it => it.store === oldName ? { ...it, store: newName } : it));
+    if (storeAisles[oldName]) { const na = { ...storeAisles, [newName]: storeAisles[oldName] }; delete na[oldName]; persistSetting('storeAisles', setStoreAisles, na); }
+    extraRows.filter(r => r.store === oldName).forEach(r => putExtra({ ...r, store: newName }));
+    staples.filter(s => s.store === oldName).forEach(s => updateStaple(s.id, { store: newName }));
   }
   function removeStore(name) {
     const nextMap = { ...itemStoreMap }; Object.keys(nextMap).forEach(k => { if (nextMap[k] === name) delete nextMap[k]; });
     persistSetting('stores', setStores, stores.filter(s => s !== name));
     persistSetting('itemStoreMap', setItemStoreMap, nextMap);
-    persistSetting('extraItems', setExtraItems, extraItems.map(it => it.store === name ? { ...it, store: undefined } : it));
-  }
-  function addExtraItem(name, store) {
-    name = (name || '').trim();
-    if (!name) return;
-    if (extraItems.some(it => !it.checked && normalize(it.name) === normalize(name))) { showToast(`"${name}" staat al op je lijst`); return; }
-    persistSetting('extraItems', setExtraItems, [...extraItems, { id: `x${Date.now()}${Math.floor(Math.random() * 1000)}`, name, store: store || undefined, checked: false }]);
-  }
-  const shoppingList = useMemo(() => {
-    const map = {};
-    DAYS.forEach(day => MEALS.forEach(({ key }) => {
-      const slot = weekmenu[day][key];
-      slotRecipes(slot, recipesById).forEach(recipe => {
-        const ratio = recipe.basePortions ? (slot.persons || 1) / recipe.basePortions : 1;
-        (recipe.ingredients || []).forEach(ing => {
-          if (!ing.name) return;
-          const unit = ing.unit || (ing.amount == null ? 'naar smaak' : '');
-          const k = `${ing.name.trim().toLowerCase()}|${unit}`;
-          if (!map[k]) map[k] = { key: k, name: ing.name.trim(), unit, amount: 0, hasAmount: ing.amount != null, uses: new Set() };
-          if (ing.amount != null) map[k].amount += ing.amount * ratio;
-          map[k].uses.add(recipe.title);
-        });
-      });
-    }));
-    return Object.values(map).map(i => ({ ...i, uses: [...i.uses] })).sort((a, b) => a.name.localeCompare(b.name));
-  }, [weekmenu, recipesById]);
-
-  async function newShoppingRound() {
-    if (!window.confirm('Alle vinkjes wissen en afgevinkte losse items verwijderen?')) return;
-    await persistSetting('checkedItems', setCheckedItems, {});
-    await persistSetting('extraItems', setExtraItems, extraItems.filter(it => !it.checked));
-    showToast('Klaar voor een nieuwe boodschappenronde');
+    if (storeAisles[name]) { const na = { ...storeAisles }; delete na[name]; persistSetting('storeAisles', setStoreAisles, na); }
+    extraRows.filter(r => r.store === name).forEach(r => putExtra({ ...r, store: null }));
+    staples.filter(s => s.store === name).forEach(s => updateStaple(s.id, { store: null }));
   }
 
   // ---------- kast ----------
@@ -835,7 +1308,7 @@ function App() {
     if (existing) { if (!existing.inStock) togglePantryStockItem(existing.id); return; }
     try {
       const created = pantryOut(throwIfError(await sb.from('pantry_stock').upsert({ ingredient_name: name, in_stock: true }, { onConflict: 'ingredient_name' }).select().single()));
-      setPantryStock(prev => [...prev, created]);
+      setPantryStock(prev => [...prev.filter(p => p.id !== created.id), created]);
     } catch (e) { showToast('Opslaan mislukt — probeer opnieuw'); }
   }
   async function togglePantryStockItem(id) {
@@ -861,7 +1334,7 @@ function App() {
         ingredients: s.ingredients || [], steps: s.steps || [], based_on_ingredients: pantryItems, status: 'pending' }));
       const created = throwIfError(await sb.from('ai_recipe_suggestions').insert(rows).select());
       setAiSuggestions(prev => [...(created || []).map(suggestionOut), ...prev]);
-      showToast(`✨ ${suggestions.length} voorstel(len) klaar`, { label: 'Bekijk', onClick: () => setTab('recipes') });
+      showToast(`✨ ${suggestions.length} voorstel(len) klaar`, { label: 'Bekijk', onClick: () => switchTab('recipes') });
     } catch (e) { showToast(e.message); }
     finally { setAiSuggesting(false); }
   }
@@ -907,8 +1380,9 @@ function App() {
     );
   }
 
+  const myEmail = session.user && session.user.email;
   const aiTargetCount = aiWeekTargets(weekmenu).length;
-  const shoppingTodo = shoppingList.filter(i => !checkedItems[i.key]).length + extraItems.filter(i => !i.checked).length;
+  const shoppingTodo = shoppingItems.filter(i => !i.state).length;
   const openMealSlot = mealSheet ? weekmenu[mealSheet.day][mealSheet.meal] : null;
   const openRecipe = recipeSheet ? recipesById[recipeSheet.id] : null;
   const weekNav = {
@@ -927,29 +1401,38 @@ function App() {
             <div className="font-black text-deep text-lg tracking-tight">Mealio</div>
             <div className="text-[11px] font-bold text-sage -mt-0.5">Eet… geregeld</div>
           </div>
-          <UserMenu email={session.user && session.user.email} onSignOut={() => sb.auth.signOut()} />
+          {(!online || pendingOps > 0) && (
+            <span className="text-[10px] font-black rounded-full px-2 py-1 bg-amber-100 text-amber-800" title="Wijzigingen worden verstuurd zodra er weer bereik is">
+              {online ? `${pendingOps} te versturen` : 'offline'}
+            </span>
+          )}
+          <UserMenu email={myEmail} onSignOut={() => sb.auth.signOut()} household={householdSize} onHousehold={changeHousehold}
+            onOpenFamily={() => setFamilyOpen(true)} onOpenAccess={() => setAccessOpen(true)} />
         </div>
       </header>
 
       <main className="max-w-lg mx-auto px-4 pt-4 pb-32">
+        {migrationMissing && (
+          <div className="mb-3 text-xs font-bold text-amber-900 bg-amber-50 border border-amber-200 rounded-2xl px-3.5 py-2.5">
+            ⚠️ De database is nog niet bijgewerkt voor deze versie. Voer <b>migratie-mealio-v2.sql</b> uit in de Supabase SQL Editor — tot dan werken boodschappen, gezin en dubbel koken niet volledig.
+          </div>
+        )}
         {tab === 'planner' && (
-          <PlannerPage nav={weekNav} weekmenu={weekmenu} recipesById={recipesById} weekLoading={weekLoading}
+          <PlannerPage nav={weekNav} weekmenu={weekmenu} recipesById={recipesById} weekLoading={weekLoading} members={members}
             selectedDay={selectedDay} setSelectedDay={setSelectedDay}
             onOpenMeal={(day, meal) => setMealSheet({ day, meal })}
             onToggleLock={(day, meal) => updateMealSlot(day, meal, { locked: !weekmenu[day][meal].locked })}
-            onFeedback={giveMealFeedback} aiTargetCount={aiTargetCount} aiBusy={aiBusy} onAiFill={aiFillWeek} />
+            onFeedback={giveMealFeedback} aiTargetCount={aiTargetCount} aiBusy={aiBusy} onAiFill={aiFillWeek}
+            onCopyPrev={copyPreviousWeek} showToast={showToast} />
         )}
         {tab === 'shopping' && (
-          <ShoppingPage nav={weekNav} items={shoppingList} stores={stores} itemStoreMap={itemStoreMap}
-            checkedItems={checkedItems} extraItems={extraItems} pantryStock={pantryStock}
-            onToggle={(key) => persistSetting('checkedItems', setCheckedItems, { ...checkedItems, [key]: !checkedItems[key] })}
-            onAssign={(key, store) => persistSetting('itemStoreMap', setItemStoreMap, { ...itemStoreMap, [key]: store || undefined })}
-            onAddExtra={addExtraItem}
-            onToggleExtra={(id) => persistSetting('extraItems', setExtraItems, extraItems.map(it => it.id === id ? { ...it, checked: !it.checked } : it))}
-            onRemoveExtra={(id) => persistSetting('extraItems', setExtraItems, extraItems.filter(it => it.id !== id))}
-            onAssignExtra={(id, store) => persistSetting('extraItems', setExtraItems, extraItems.map(it => it.id === id ? { ...it, store: store || undefined } : it))}
-            onAddStore={(name) => persistSetting('stores', setStores, [...stores, name])}
-            onRenameStore={renameStore} onRemoveStore={removeStore} onNewRound={newShoppingRound} showToast={showToast} />
+          <ShoppingPage nav={weekNav} items={shoppingItems} stores={stores} storeAisles={storeAisles} staples={staples}
+            online={online} pendingOps={pendingOps}
+            onToggle={toggleCart} onSetHave={setHave} onAssignStore={assignStore} onAssignAisle={assignAisle} onRemoveItem={removeItem}
+            onAddExtra={addExtraItem} onStoreMode={(s) => setStoreMode(s)} onNewRound={newShoppingRound}
+            onAddStore={(name) => persistSetting('stores', setStores, [...stores, name])} onRenameStore={renameStore} onRemoveStore={removeStore}
+            onSetAisleOrder={(store, order) => persistSetting('storeAisles', setStoreAisles, { ...storeAisles, [store]: order })}
+            onAddStaple={addStaple} onUpdateStaple={updateStaple} onDeleteStaple={deleteStaple} showToast={showToast} />
         )}
         {tab === 'recipes' && (
           <RecipesPage recipes={recipes} suggestions={aiSuggestions} onApprove={approveSuggestion} onReject={rejectSuggestion}
@@ -957,8 +1440,8 @@ function App() {
         )}
         {tab === 'kast' && (
           <KastPage pantryStock={pantryStock} recipes={recipes} onAdd={addPantryStockItem} onToggle={togglePantryStockItem}
-            onRemove={removePantryStockItem} onAddToShopping={(name) => { addExtraItem(name); showToast(`🛒 "${name}" op je boodschappenlijst`); }}
-            onOpenRecipe={(id) => setRecipeSheet({ id })} onAiSuggest={aiSuggestFromPantry} aiSuggesting={aiSuggesting} />
+            onRemove={removePantryStockItem} onAddToShopping={(name) => { if (addExtraItem(name)) showToast(`🛒 "${name}" op je boodschappenlijst`); }}
+            onOpenRecipe={(id) => setRecipeSheet({ id })} onAiSuggest={aiSuggestFromPantry} aiSuggesting={aiSuggesting} showToast={showToast} />
         )}
       </main>
 
@@ -972,7 +1455,7 @@ function App() {
           ].map(t => {
             const active = tab === t.id;
             return (
-              <button key={t.id} onClick={() => setTab(t.id)} className="flex flex-col items-center gap-0.5 pb-1">
+              <button key={t.id} onClick={() => switchTab(t.id)} className="flex flex-col items-center gap-0.5 pb-1">
                 <span className={cx('relative px-5 py-1.5 rounded-full transition', active ? 'bg-mint text-forest' : 'text-stone-400')}>
                   <Icon name={t.icon} size={21} stroke={active ? 2.3 : 2} />
                   {t.badge ? <span className={cx('absolute -top-0.5 right-1.5 min-w-[18px] h-[18px] px-1 rounded-full text-[10px] font-black text-white flex items-center justify-center border-2 border-white', t.badgeTone === 'amber' ? 'bg-amber-500' : 'bg-forest')}>{t.badge > 99 ? '99+' : t.badge}</span> : null}
@@ -986,16 +1469,23 @@ function App() {
 
       {mealSheet && openMealSlot && (
         <MealSheet key={`${weekStart}-${mealSheet.day}-${mealSheet.meal}`} day={mealSheet.day} meal={mealSheet.meal}
-          dayLabel={fmtDayLong(weekStart, DAYS.indexOf(mealSheet.day))} slot={openMealSlot}
-          recipes={recipes} recipesById={recipesById} aiBusy={aiBusy}
+          dayLabel={fmtDayLong(weekStart, DAYS.indexOf(mealSheet.day))} slot={openMealSlot} weekmenu={weekmenu}
+          recipes={recipes} recipesById={recipesById} aiBusy={aiBusy} members={members}
           onChange={(patch) => updateMealSlot(mealSheet.day, mealSheet.meal, patch)}
+          onClear={() => { clearMealSlot(mealSheet.day, mealSheet.meal); setMealSheet(null); }}
+          onCookDouble={(tDay, tMeal) => cookDouble(mealSheet.day, mealSheet.meal, tDay, tMeal)}
+          onUndoDouble={() => {
+            const s = openMealSlot;
+            if (s.doubleFor) undoDouble(mealSheet.day, mealSheet.meal);
+            else { const p = parseSlotKey(s.leftoverFrom); if (p) undoDouble(p.day, p.meal); }
+          }}
           onAiFill={() => aiFillSlot(mealSheet.day, mealSheet.meal)}
           onOpenRecipe={(id) => setRecipeSheet({ id })}
           onCreateRecipe={(preset) => openAdd(preset)}
           onClose={() => setMealSheet(null)} />
       )}
       {recipeSheet && openRecipe && (
-        <RecipeSheet key={openRecipe.id} recipe={openRecipe} startInEdit={!!recipeSheet.edit}
+        <RecipeSheet key={openRecipe.id} recipe={openRecipe} startInEdit={!!recipeSheet.edit} householdSize={householdSize}
           onUpdate={(patch) => updateRecipe(openRecipe.id, patch)}
           onDelete={() => { if (window.confirm(`"${openRecipe.title}" verwijderen?`)) { deleteRecipe(openRecipe.id); setRecipeSheet(null); } }}
           onPlan={() => setPlanSheetId(openRecipe.id)}
@@ -1016,12 +1506,22 @@ function App() {
         <PlanSheet recipe={recipesById[planSheetId]} nav={weekNav} weekmenu={weekmenu} recipesById={recipesById}
           onPick={(day, meal) => planRecipe(planSheetId, day, meal)} onClose={() => setPlanSheetId(null)} />
       )}
+      {familyOpen && (
+        <FamilySheet members={members} onAdd={addMember} onUpdate={updateMember} onDelete={deleteMember} onClose={() => setFamilyOpen(false)} />
+      )}
+      {accessOpen && <AccessSheet myEmail={myEmail} onClose={() => setAccessOpen(false)} />}
+      {storeMode && (
+        <StoreMode storeKey={storeMode} weekLabel={`Week ${isoWeekNumber(weekStart)}`} items={shoppingItems} storeAisles={storeAisles}
+          online={online} pendingOps={pendingOps} onToggle={toggleCart}
+          onAddExtra={(name) => addExtraItem(name, storeMode === '__all__' ? '' : storeMode)}
+          onClose={() => setStoreMode(null)} />
+      )}
 
       {toast && (
-        <div className="fixed inset-x-0 flex justify-center px-4 pointer-events-none" style={{ zIndex: 90, bottom: 'calc(env(safe-area-inset-bottom) + 92px)' }}>
+        <div className="fixed inset-x-0 flex justify-center px-4 pointer-events-none" style={{ zIndex: 95, bottom: 'calc(env(safe-area-inset-bottom) + 92px)' }}>
           <div className="toast-in pointer-events-auto max-w-md w-full bg-deep text-white rounded-2xl shadow-lift pl-4 pr-2 py-2.5 flex items-center gap-3">
             <div className="flex-1 text-sm font-semibold">{toast.msg}</div>
-            {toast.action && <button onClick={() => { toast.action.onClick(); setToast(null); }} className="text-sm font-black text-mint px-3 py-1.5 rounded-xl active:bg-white/10">{toast.action.label}</button>}
+            {toast.action && <button onClick={() => { toast.action.onClick(); setToast(null); }} className="text-sm font-black text-mint px-3 py-1.5 rounded-xl active:bg-white/10 whitespace-nowrap">{toast.action.label}</button>}
           </div>
         </div>
       )}
@@ -1029,18 +1529,30 @@ function App() {
   );
 }
 
-function UserMenu({ email, onSignOut }) {
+function UserMenu({ email, onSignOut, household, onHousehold, onOpenFamily, onOpenAccess }) {
   const [open, setOpen] = useState(false);
   const initial = (email || '?').slice(0, 1).toUpperCase();
+  const item = 'w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-bold text-deep active:bg-mist text-left';
   return (
     <div className="relative">
       <button onClick={() => setOpen(!open)} className="w-9 h-9 rounded-full bg-forest text-white font-black text-sm">{initial}</button>
       {open && (
         <>
           <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
-          <div className="absolute right-0 top-11 z-50 w-60 bg-white rounded-2xl border border-line shadow-lift p-2">
+          <div className="absolute right-0 top-11 z-50 w-72 bg-white rounded-2xl border border-line shadow-lift p-2">
             <div className="px-3 py-2 text-xs text-stone-500 truncate">Ingelogd als<br /><span className="font-bold text-deep">{email}</span></div>
-            <button onClick={onSignOut} className="w-full flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm font-bold text-red-600 active:bg-red-50"><Icon name="logout" size={16} />Uitloggen</button>
+            <div className="border-t border-line/70 pt-1">
+              <button className={item} onClick={() => { setOpen(false); onOpenFamily(); }}><span className="text-base w-5 text-center">👨‍👩‍👧‍👦</span>Gezin &amp; voorkeuren</button>
+              <button className={item} onClick={() => { setOpen(false); onOpenAccess(); }}><span className="text-base w-5 text-center">🔐</span>Toegang beheren</button>
+            </div>
+            <div className="px-3 py-2 border-t border-line/70">
+              <div className="text-xs font-extrabold text-deep mb-1.5">Aantal personen in huis</div>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] text-stone-400 leading-tight">Standaard voor nieuwe maaltijden</span>
+                <Stepper value={household || 5} min={1} onChange={onHousehold} />
+              </div>
+            </div>
+            <button onClick={onSignOut} className="w-full flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm font-bold text-red-600 active:bg-red-50 border-t border-line/70"><Icon name="logout" size={16} />Uitloggen</button>
           </div>
         </>
       )}
@@ -1061,15 +1573,60 @@ function WeekNav({ nav }) {
 // =================================================================
 // 6. Planner
 // =================================================================
-function PlannerPage({ nav, weekmenu, recipesById, weekLoading, selectedDay, setSelectedDay, onOpenMeal, onToggleLock, onFeedback, aiTargetCount, aiBusy, onAiFill }) {
+// Klein "⋯"-menu (weekoverzicht delen, vorige week kopiëren).
+function MoreMenu({ items }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="relative">
+      <IconBtn name="more" onClick={() => setOpen(!open)} title="Meer" className="bg-white border border-line" />
+      {open && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+          <div className="absolute right-0 top-11 z-50 w-64 bg-white rounded-2xl border border-line shadow-lift p-1.5">
+            {items.map(it => (
+              <button key={it.label} onClick={() => { setOpen(false); it.onClick(); }}
+                className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-bold text-deep active:bg-mist text-left">
+                <span className="w-5 text-center">{it.emoji}</span>{it.label}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function PlannerPage({ nav, weekmenu, recipesById, weekLoading, members, selectedDay, setSelectedDay, onOpenMeal, onToggleLock, onFeedback, aiTargetCount, aiBusy, onAiFill, onCopyPrev, showToast }) {
   const [view, setView] = useState('day');
   const today = todayISO();
   const dayIdx = DAYS.indexOf(selectedDay);
   const dayCarbs = MEALS.reduce((s, m) => s + (slotCarbs(weekmenu[selectedDay][m.key], recipesById) || 0), 0);
 
+  // Snel weekoverzicht om te delen (bv. met een coach): per dag wat er gegeten
+  // wordt bij ontbijt/middag/avond, in platte tekst.
+  async function shareWeekSummary() {
+    const lines = [`📋 Weekmenu — week ${isoWeekNumber(nav.weekStart)} (${fmtWeekRange(nav.weekStart)})`];
+    DAYS.forEach((day, i) => {
+      lines.push('', `*${fmtDayLong(nav.weekStart, i)}*`);
+      MEALS.forEach(m => {
+        const summary = slotSummary(weekmenu[day][m.key], recipesById);
+        lines.push(`${m.emoji} ${m.label}: ${summary || '—'}`);
+      });
+    });
+    const text = lines.join('\n');
+    try {
+      if (navigator.share) await navigator.share({ text });
+      else { await navigator.clipboard.writeText(text); showToast('Weekoverzicht gekopieerd — plak het in WhatsApp of een bericht'); }
+    } catch (e) { /* delen geannuleerd */ }
+  }
+
   return (
     <div>
-      <PageHeader eyebrow={`Week ${isoWeekNumber(nav.weekStart)}${nav.isCurrent ? ' · deze week' : ''}`} title={fmtWeekRange(nav.weekStart)} right={<WeekNav nav={nav} />} />
+      <PageHeader eyebrow={`Week ${isoWeekNumber(nav.weekStart)}${nav.isCurrent ? ' · deze week' : ''}`} title={fmtWeekRange(nav.weekStart)}
+        right={<><WeekNav nav={nav} /><MoreMenu items={[
+          { emoji: '📤', label: 'Weekoverzicht delen (coach)', onClick: shareWeekSummary },
+          { emoji: '📋', label: 'Kopieer vorige week', onClick: onCopyPrev },
+        ]} /></>} />
 
       <div className="grid grid-cols-7 gap-1.5 mb-3">
         {DAYS.map((day, i) => {
@@ -1097,12 +1654,9 @@ function PlannerPage({ nav, weekmenu, recipesById, weekLoading, selectedDay, set
         <Segmented className="flex-1" value={view} onChange={setView}
           options={[{ value: 'day', label: 'Dag', icon: 'list' }, { value: 'week', label: 'Hele week', icon: 'grid' }]} />
         {aiTargetCount > 0 && (
-          <button onClick={onAiFill} disabled={aiBusy} title={`AI vult ${aiTargetCount} open maaltijd(en) in deze week`}
-            className="relative shrink-0 w-11 h-11 rounded-2xl bg-gradient-to-br from-deep to-forest text-white flex items-center justify-center shadow-card disabled:opacity-50 active:scale-95 transition">
-            <Icon name="sparkles" size={19} />
-            <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] px-1 rounded-full bg-amber-500 text-white text-[10px] font-black flex items-center justify-center border-2 border-cream">
-              {aiBusy ? '…' : aiTargetCount}
-            </span>
+          <button onClick={onAiFill} disabled={aiBusy} title={`AI vult de open maaltijden van deze week in (${aiTargetCount}). Vaste maaltijden blijven staan.`}
+            className="shrink-0 h-11 px-3.5 rounded-2xl bg-gradient-to-br from-deep to-forest text-white flex items-center gap-1.5 text-sm font-black shadow-card disabled:opacity-50 active:scale-95 transition">
+            <Icon name="sparkles" size={16} />{aiBusy ? 'Bezig…' : 'Vul de week'}
           </button>
         )}
       </div>
@@ -1116,7 +1670,7 @@ function PlannerPage({ nav, weekmenu, recipesById, weekLoading, selectedDay, set
             {dayCarbs > 0 && <span className="text-xs font-bold text-stone-400">≈ {Math.round(dayCarbs)} g koolhydraten</span>}
           </div>
           {MEALS.map(m => (
-            <MealCard key={m.key} meal={m} slot={weekmenu[selectedDay][m.key]} recipesById={recipesById}
+            <MealCard key={m.key} meal={m} slot={weekmenu[selectedDay][m.key]} recipesById={recipesById} members={members}
               onOpen={() => onOpenMeal(selectedDay, m.key)} onToggleLock={() => onToggleLock(selectedDay, m.key)}
               onFeedback={(v) => onFeedback(selectedDay, m.key, v)} />
           ))}
@@ -1136,6 +1690,7 @@ function PlannerPage({ nav, weekmenu, recipesById, weekLoading, selectedDay, set
                   <button key={m.key} onClick={() => onOpenMeal(day, m.key)} className="w-full flex items-center gap-2 px-4 py-2 text-left border-t border-line/60 active:bg-mist">
                     <span className="w-16 text-[11px] font-extrabold text-stone-400 shrink-0">{m.emoji} {m.label}</span>
                     <span className={cx('flex-1 text-[13px] truncate', summary ? 'font-semibold text-ink' : 'text-stone-300')}>{summary || 'Nog niets'}</span>
+                    {s.doubleFor && <span className="text-[10px]" title="Dubbel koken">🍲</span>}
                     {s.aiGenerated && <span className="text-[10px]">✨</span>}
                     {s.locked && <Icon name="lock" size={12} className="text-sage" />}
                   </button>
@@ -1149,9 +1704,10 @@ function PlannerPage({ nav, weekmenu, recipesById, weekLoading, selectedDay, set
   );
 }
 
-function MealCard({ meal, slot, recipesById, onOpen, onToggleLock, onFeedback }) {
+function MealCard({ meal, slot, recipesById, members, onOpen, onToggleLock, onFeedback }) {
   const mode = slotMode(slot);
   const rs = slotRecipes(slot, recipesById);
+  const hits = restrictionHits(rs, members);
   const main = slot.recipeId ? recipesById[slot.recipeId] : null;
   const extras = (slot.componentIds || []).map(id => recipesById[id]).filter(Boolean);
   const carbs = slotCarbs(slot, recipesById);
@@ -1206,6 +1762,16 @@ function MealCard({ meal, slot, recipesById, onOpen, onToggleLock, onFeedback })
             </div>
           ) : <div className="text-sm font-bold text-stone-400">🧩 Samenstellen — kies vlees/vis, groenten, bijgerecht…</div>
         )}
+        {(slot.doubleFor || hits.length > 0) && (
+          <div className="flex flex-wrap gap-1 mt-2">
+            {slot.doubleFor && <span className="text-[10px] font-black rounded-full px-2 py-0.5 bg-mist text-forest">🍲 dubbel — restjes {slotLabel(slot.doubleFor)}</span>}
+            {hits.slice(0, 3).map((h, i) => (
+              <span key={i} className={cx('text-[10px] font-black rounded-full px-2 py-0.5', h.kind === 'allergie' ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-800')}>
+                {h.kind === 'allergie' ? '⚠️' : '🙅'} {h.who}: {h.term}
+              </span>
+            ))}
+          </div>
+        )}
       </button>
 
       {rs.length > 0 && (
@@ -1226,14 +1792,19 @@ function MealCard({ meal, slot, recipesById, onOpen, onToggleLock, onFeedback })
 // Keuzelijst met zoekveld, gebruikt overal waar je een recept kiest.
 function RecipePicker({ recipes, categories, excludeIds = [], onPick, onCreate, showCategory }) {
   const [q, setQ] = useState('');
+  const [gf, setGf] = useState(false);
   const list = useMemo(() => recipes
-    .filter(r => (!categories || categories.includes(r.category)) && !excludeIds.includes(r.id) && (!q || normalize(r.title).includes(normalize(q))))
-    .sort((a, b) => (b.stars || 0) - (a.stars || 0) || a.title.localeCompare(b.title)), [recipes, categories, excludeIds, q]);
+    .filter(r => (!categories || categories.includes(r.category)) && !excludeIds.includes(r.id) && (!gf || r.glutenFree) && (!q || normalize(r.title).includes(normalize(q))))
+    .sort((a, b) => (b.stars || 0) - (a.stars || 0) || a.title.localeCompare(b.title)), [recipes, categories, excludeIds, q, gf]);
   return (
     <div>
-      <div className="relative mb-2">
-        <Icon name="search" size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-300" />
-        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Zoek een recept…" className={cx(inputCls, 'pl-9 py-2 bg-cream')} />
+      <div className="flex items-center gap-2 mb-2">
+        <div className="relative flex-1">
+          <Icon name="search" size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-300" />
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Zoek een recept…" className={cx(inputCls, 'pl-9 py-2 bg-cream')} />
+        </div>
+        <button onClick={() => setGf(!gf)} title="Enkel glutenvrije recepten"
+          className={cx('shrink-0 rounded-xl border px-2.5 py-2 text-xs font-extrabold', gf ? 'bg-amber-500 text-white border-amber-500' : 'bg-white text-amber-800 border-amber-300')}>🌾 GV</button>
       </div>
       <div className="max-h-64 overflow-y-auto -mx-1">
         {list.map(r => (
@@ -1296,7 +1867,51 @@ function ComposeRow({ row, ids, recipes, recipesById, open, onToggle, onChange, 
   );
 }
 
-function MealSheet({ day, meal, dayLabel, slot, recipes, recipesById, aiBusy, onChange, onAiFill, onOpenRecipe, onCreateRecipe, onClose }) {
+// "Kook dubbel voor…": kies een latere maaltijd in dezelfde week die restjes wordt.
+function DoubleCookBlock({ day, meal, slot, weekmenu, recipesById, onPick, onUndo }) {
+  const [open, setOpen] = useState(false);
+  const di = DAYS.indexOf(day), mi = MEALS.findIndex(m => m.key === meal);
+  const later = [];
+  DAYS.forEach((d, i) => MEALS.forEach((m, j) => { if (i > di || (i === di && j > mi)) later.push({ day: d, meal: m.key, i, m }); }));
+  if (slot.doubleFor) {
+    return (
+      <Card className="p-3.5 flex items-center gap-3">
+        <span className="text-2xl">🍲</span>
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-extrabold text-deep">Dubbel koken</div>
+          <div className="text-xs text-stone-500">Restjes op {slotLabel(slot.doubleFor)} — de boodschappen tellen de extra porties mee.</div>
+        </div>
+        <Btn variant="secondary" size="sm" onClick={onUndo}>Opheffen</Btn>
+      </Card>
+    );
+  }
+  return (
+    <div>
+      <Btn variant="soft" className="w-full" onClick={() => setOpen(!open)}>🍲 Kook dubbel voor…</Btn>
+      {open && (
+        <Card className="p-2.5 mt-2">
+          {later.length === 0 ? <div className="text-xs text-stone-400 p-2">Geen latere maaltijd meer deze week.</div> : (
+            <div className="max-h-64 overflow-y-auto space-y-1">
+              {later.map(({ day: d, meal: mk, i, m }) => {
+                const s = weekmenu[d][mk];
+                const summary = slotSummary(s, recipesById);
+                return (
+                  <button key={d + mk} onClick={async () => { if (await onPick(d, mk)) setOpen(false); }}
+                    className="w-full flex items-center gap-2 px-2.5 py-2 rounded-xl text-left active:bg-mist">
+                    <span className="w-28 shrink-0 text-xs font-extrabold text-deep whitespace-nowrap">{DAY_SHORT[i]} · {m.emoji} {m.label}</span>
+                    <span className={cx('flex-1 text-xs truncate', summary ? 'text-stone-500' : 'text-stone-300')}>{summary || 'vrij'}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, aiBusy, members, onChange, onClear, onCookDouble, onUndoDouble, onAiFill, onOpenRecipe, onCreateRecipe, onClose }) {
   const mealDef = MEALS.find(m => m.key === meal);
   const mode = slotMode(slot);
   const [openRow, setOpenRow] = useState(null);
@@ -1315,7 +1930,6 @@ function MealSheet({ day, meal, dayLabel, slot, recipes, recipesById, aiBusy, on
     } else if (next === 'leftovers') onChange({ ...reset, category: TYPE_LEFTOVERS, recipeId: '', componentIds: [], locked: true });
     else if (next === 'skip') onChange({ ...reset, category: TYPE_SKIP, recipeId: '', componentIds: [], notes: '', locked: true });
   }
-  function clearMeal() { onChange({ ...reset, category: '', recipeId: '', componentIds: [], notes: '', locked: false }); }
   // zelf kiezen = automatisch "vast", zodat de AI het niet overschrijft
   function setComponents(ids) { onChange({ ...reset, componentIds: ids, locked: ids.length > 0 }); }
   const main = slot.recipeId ? recipesById[slot.recipeId] : null;
@@ -1334,7 +1948,7 @@ function MealSheet({ day, meal, dayLabel, slot, recipes, recipesById, aiBusy, on
     <Sheet title={`${mealDef.emoji} ${mealDef.label}`} subtitle={dayLabel} onClose={onClose} full
       footer={
         <div className="flex items-center gap-2">
-          {mode !== 'empty' && <Btn variant="danger" size="md" icon="trash" onClick={clearMeal}>Leegmaken</Btn>}
+          {mode !== 'empty' && <Btn variant="danger" size="md" icon="trash" onClick={onClear}>Leegmaken</Btn>}
           <div className="flex-1" />
           <Btn size="md" onClick={onClose} icon="check">Klaar</Btn>
         </div>
@@ -1415,12 +2029,36 @@ function MealSheet({ day, meal, dayLabel, slot, recipes, recipesById, aiBusy, on
         </div>
       )}
 
+      {mode === 'leftovers' && slot.leftoverFrom && (
+        <Card className="p-3.5 mb-3 flex items-center gap-3">
+          <span className="text-2xl">🍲</span>
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-extrabold text-deep">Restjes van {slotLabel(slot.leftoverFrom)}</div>
+            <div className="text-xs text-stone-500">Daar wordt dubbel gekookt.</div>
+          </div>
+          <Btn variant="secondary" size="sm" onClick={onUndoDouble}>Opheffen</Btn>
+        </Card>
+      )}
       {mode === 'leftovers' && <RestjesBlock slot={slot} onChange={onChange} />}
       {mode === 'skip' && <div className="text-center text-sm text-stone-500 py-6">⏭ Geen maaltijd gepland — hiervoor wordt niets ingekocht.</div>}
 
+      {(mode === 'compose' || mode === 'recipe') && slotRecipes(slot, recipesById).length > 0 && (() => {
+        const hits = restrictionHits(slotRecipes(slot, recipesById), members);
+        return (
+          <div className="mt-5 space-y-3">
+            {hits.length > 0 && (
+              <div className="text-xs font-bold rounded-2xl px-3.5 py-2.5 bg-amber-50 border border-amber-200 text-amber-900">
+                {hits.map((h, i) => <div key={i}>{h.kind === 'allergie' ? '⚠️ Allergie' : '🙅 Lust niet'} — {h.who}: {h.term}</div>)}
+              </div>
+            )}
+            <DoubleCookBlock day={day} meal={meal} slot={slot} weekmenu={weekmenu} recipesById={recipesById} onPick={onCookDouble} onUndo={onUndoDouble} />
+          </div>
+        );
+      })()}
+
       {(mode === 'compose' || mode === 'recipe') && (
         <div className="mt-5 space-y-3">
-          {carbs != null && <div className="text-center text-xs font-bold text-stone-400">≈ {Math.round(carbs)} g koolhydraten voor {slot.persons} personen</div>}
+          {carbs != null &&<div className="text-center text-xs font-bold text-stone-400">≈ {Math.round(carbs)} g koolhydraten voor {slot.persons} personen</div>}
           <Btn variant="secondary" className="w-full" icon="sparkles" disabled={aiBusy} onClick={onAiFill}>
             {aiBusy ? 'AI is bezig…' : mode === 'compose' ? (slot.componentIds.length ? 'Vul ontbrekende onderdelen aan met AI' : 'Laat AI dit bord samenstellen') : `Laat AI een ${slot.category.toLowerCase()} kiezen`}
           </Btn>
@@ -1496,35 +2134,43 @@ function PlanSheet({ recipe, nav, weekmenu, recipesById, onPick, onClose }) {
 // =================================================================
 // 7. Boodschappen
 // =================================================================
-function ShoppingPage({ nav, items, stores, itemStoreMap, checkedItems, extraItems, pantryStock, onToggle, onAssign, onAddExtra, onToggleExtra, onRemoveExtra, onAssignExtra, onAddStore, onRenameStore, onRemoveStore, onNewRound, showToast }) {
+// Items per afdeling groeperen in de volgorde van de winkel.
+function groupByAisle(items, order) {
+  const groups = order.map(a => ({ aisle: a, items: [] }));
+  const idx = {}; order.forEach((a, i) => { idx[a] = i; });
+  items.forEach(i => { const g = groups[idx[i.aisle] != null ? idx[i.aisle] : idx['Overig']]; g.items.push(i); });
+  return groups.filter(g => g.items.length);
+}
+
+function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendingOps, onToggle, onSetHave, onAssignStore, onAssignAisle, onRemoveItem,
+  onAddExtra, onStoreMode, onNewRound, onAddStore, onRenameStore, onRemoveStore, onSetAisleOrder, onAddStaple, onUpdateStaple, onDeleteStaple, showToast }) {
   const [extraName, setExtraName] = useState('');
   const [extraStore, setExtraStore] = useState('');
   const [showStores, setShowStores] = useState(false);
+  const [showStaples, setShowStaples] = useState(false);
+  const [pickStore, setPickStore] = useState(false);
+  const [editItem, setEditItem] = useState(null);
   const [openDone, setOpenDone] = useState({});
-  const stockNorm = pantryStock.filter(p => p.inStock).map(p => normalize(p.name));
 
-  const all = [
-    ...items.map(i => ({ ...i, checked: !!checkedItems[i.key], store: itemStoreMap[i.key], isExtra: false, inKast: stockNorm.length > 0 && ingredientMatches(i.name, stockNorm) })),
-    ...extraItems.map(it => ({ key: `extra:${it.id}`, extraId: it.id, name: it.name, unit: '', hasAmount: false, checked: !!it.checked, store: it.store, isExtra: true, uses: [] })),
-  ];
   const groups = {};
   [...stores, '__none__'].forEach(s => { groups[s] = []; });
-  all.forEach(i => { (i.store && groups[i.store] ? groups[i.store] : groups.__none__).push(i); });
-  Object.values(groups).forEach(list => list.sort((a, b) => a.name.localeCompare(b.name)));
-  const total = all.length;
-  const done = all.filter(i => i.checked).length;
+  items.forEach(i => { (i.store && groups[i.store] ? groups[i.store] : groups.__none__).push(i); });
+  const active = items.filter(i => i.state !== 'have');
+  const total = active.length;
+  const done = active.filter(i => i.state === 'cart').length;
 
-  function toggle(i) { i.isExtra ? onToggleExtra(i.extraId) : onToggle(i.key); }
-  function assign(i, store) { i.isExtra ? onAssignExtra(i.extraId, store) : onAssign(i.key, store); }
-  function addExtra() { if (!extraName.trim()) return; onAddExtra(extraName, extraStore); setExtraName(''); }
+  function addExtra() { if (onAddExtra(extraName, extraStore)) setExtraName(''); }
 
   async function share() {
     const lines = [`🛒 Boodschappen — week ${isoWeekNumber(nav.weekStart)}`];
     [...stores, '__none__'].forEach(s => {
-      const todo = groups[s].filter(i => !i.checked);
+      const todo = groups[s].filter(i => !i.state);
       if (!todo.length) return;
       lines.push('', `*${s === '__none__' ? 'Overige' : s}*`);
-      todo.forEach(i => lines.push(`☐ ${i.name}${!i.isExtra ? ' — ' + (i.hasAmount ? `${fmtAmount(i.amount)} ${i.unit}` : (i.unit || 'naar smaak')) : ''}`));
+      groupByAisle(todo, aisleOrderFor(s, storeAisles)).forEach(g => {
+        lines.push(`_${g.aisle}_`);
+        g.items.forEach(i => lines.push(`☐ ${i.name}${i.kind === 'recipe' ? ' — ' + fmtShopAmount(i) : ''}`));
+      });
     });
     const text = lines.join('\n');
     try {
@@ -1533,22 +2179,38 @@ function ShoppingPage({ nav, items, stores, itemStoreMap, checkedItems, extraIte
     } catch (e) { /* delen geannuleerd */ }
   }
 
+  const storeCounts = {};
+  [...stores, '__none__'].forEach(s => { storeCounts[s] = groups[s].filter(i => !i.state).length; });
+
   return (
     <div>
       <PageHeader eyebrow={`Week ${isoWeekNumber(nav.weekStart)} · ${fmtWeekRange(nav.weekStart)}`} title="Boodschappen"
-        right={<><IconBtn name="share" onClick={share} title="Delen" className="bg-white border border-line" /><IconBtn name="settings" onClick={() => setShowStores(true)} title="Winkels" className="bg-white border border-line" /></>} />
+        right={<><IconBtn name="share" onClick={share} title="Delen" className="bg-white border border-line" /><IconBtn name="settings" onClick={() => setShowStores(true)} title="Winkels & afdelingen" className="bg-white border border-line" /></>} />
+
+      {total > 0 && (
+        <button onClick={() => setPickStore(true)}
+          className="w-full mb-3 rounded-2xl bg-gradient-to-br from-deep to-forest text-white p-4 flex items-center gap-3 text-left shadow-card active:scale-[.99] transition">
+          <div className="w-11 h-11 rounded-xl bg-white/10 flex items-center justify-center"><Icon name="cart" size={22} /></div>
+          <div className="flex-1">
+            <div className="text-[15px] font-black">Ik ben in de winkel</div>
+            <div className="text-[11px] text-white/70">Grote vinkjes, afdeling per afdeling — het scherm blijft aan.</div>
+          </div>
+          <Icon name="right" size={18} className="text-white/60" />
+        </button>
+      )}
 
       {total > 0 && (
         <Card className="p-4 mb-3">
           <div className="flex items-center justify-between mb-2">
-            <span className="text-sm font-extrabold text-deep">{done} van {total} in je mandje</span>
+            <span className="text-sm font-extrabold text-deep">{done} van {total} in de kar</span>
             <button onClick={onNewRound} className="text-xs font-extrabold text-sage flex items-center gap-1"><Icon name="refresh" size={13} />Nieuwe ronde</button>
           </div>
           <div className="h-2 rounded-full bg-mist overflow-hidden"><div className="h-full bg-sage rounded-full transition-all" style={{ width: `${total ? (done / total) * 100 : 0}%` }} /></div>
+          {(!online || pendingOps > 0) && <div className="text-[11px] font-bold text-amber-700 mt-2">{online ? '⏳ Wijzigingen worden verstuurd…' : '📴 Offline — wordt later gesynchroniseerd'}</div>}
         </Card>
       )}
 
-      <Card className="p-2 mb-4 flex gap-1.5">
+      <Card className="p-2 mb-2 flex gap-1.5">
         <input value={extraName} onChange={(e) => setExtraName(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') addExtra(); }}
           placeholder="Iets extra? bv. wc-papier" className="flex-1 min-w-0 bg-transparent px-2 py-2 text-sm placeholder:text-stone-300 border-0 focus:shadow-none" />
         <select value={extraStore} onChange={(e) => setExtraStore(e.target.value)} className="bg-mist rounded-xl px-2 text-xs font-bold text-forest border-0 max-w-[6.5rem]">
@@ -1557,92 +2219,307 @@ function ShoppingPage({ nav, items, stores, itemStoreMap, checkedItems, extraIte
         </select>
         <button onClick={addExtra} className="w-10 rounded-xl bg-forest text-white flex items-center justify-center"><Icon name="plus" /></button>
       </Card>
+      <button onClick={() => setShowStaples(true)} className="w-full mb-4 flex items-center gap-2 px-3 py-2 text-xs font-extrabold text-forest">
+        <Icon name="pin" size={14} />Vaste items (elke week){staples.length ? ` · ${staples.filter(s => s.active).length} actief` : ''}<Icon name="right" size={14} className="ml-auto text-stone-300" />
+      </button>
 
-      {total === 0 && <EmptyState emoji="🧺" title="Je lijst is nog leeg" text="Plan maaltijden in de Planner — de ingrediënten verschijnen hier vanzelf, per winkel gegroepeerd." />}
+      {items.length === 0 && <EmptyState emoji="🧺" title="Je lijst is nog leeg" text="Plan maaltijden in de Planner — de ingrediënten verschijnen hier vanzelf, per winkel en afdeling." />}
 
       <div className="space-y-3">
         {[...stores, '__none__'].map(s => {
           const list = groups[s];
           if (!list.length) return null;
-          const todo = list.filter(i => !i.checked);
-          const doneList = list.filter(i => i.checked);
+          const todo = list.filter(i => !i.state);
+          const cart = list.filter(i => i.state === 'cart');
+          const have = list.filter(i => i.state === 'have');
           const isNone = s === '__none__';
+          const open = openDone[s] || {};
           return (
             <Card key={s} className="overflow-hidden">
               <div className={cx('px-4 py-2.5 flex items-center justify-between', isNone ? 'bg-amber-50' : 'bg-mist')}>
                 <span className="text-sm font-black text-deep">{isNone ? 'Nog geen winkel' : s}</span>
                 <span className="text-[11px] font-bold text-stone-500">{todo.length ? `${todo.length} te halen` : 'alles binnen ✓'}</span>
               </div>
-              <div className="divide-y divide-line/70">
-                {todo.map(i => <ShoppingRow key={i.key} item={i} stores={stores} showAssign={isNone} onToggle={() => toggle(i)} onAssign={(st) => assign(i, st)} onRemove={() => onRemoveExtra(i.extraId)} />)}
-              </div>
-              {doneList.length > 0 && (
-                <>
-                  <button onClick={() => setOpenDone({ ...openDone, [s]: !openDone[s] })} className="w-full px-4 py-2 flex items-center justify-between text-[11px] font-extrabold text-stone-400 border-t border-line/70 bg-cream/60">
-                    <span>In je mandje ({doneList.length})</span><Icon name="down" size={14} className={openDone[s] ? 'rotate-180' : ''} />
+              {groupByAisle(todo, aisleOrderFor(isNone ? '' : s, storeAisles)).map(g => (
+                <div key={g.aisle}>
+                  <div className="px-4 pt-2 pb-1 text-[10px] font-black uppercase tracking-wider text-stone-400">{g.aisle}</div>
+                  <div className="divide-y divide-line/70">
+                    {g.items.map(i => <ShoppingRow key={i.key} item={i} stores={stores} showAssign={isNone}
+                      onToggle={() => onToggle(i)} onAssign={(st) => onAssignStore(i, st)} onHave={() => onSetHave(i, true)} onEdit={() => setEditItem(i)} />)}
+                  </div>
+                </div>
+              ))}
+              {[['cart', cart, '🛒 In de kar'], ['have', have, '🥫 Heb ik al']].map(([k, arr, label]) => arr.length > 0 && (
+                <div key={k}>
+                  <button onClick={() => setOpenDone({ ...openDone, [s]: { ...open, [k]: !open[k] } })} className="w-full px-4 py-2 flex items-center justify-between text-[11px] font-extrabold text-stone-400 border-t border-line/70 bg-cream/60">
+                    <span>{label} ({arr.length})</span><Icon name="down" size={14} className={open[k] ? 'rotate-180' : ''} />
                   </button>
-                  {openDone[s] && <div className="divide-y divide-line/70">{doneList.map(i => <ShoppingRow key={i.key} item={i} stores={stores} onToggle={() => toggle(i)} onRemove={() => onRemoveExtra(i.extraId)} />)}</div>}
-                </>
-              )}
+                  {open[k] && <div className="divide-y divide-line/70">{arr.map(i => <ShoppingRow key={i.key} item={i} stores={stores}
+                    onToggle={() => k === 'have' ? onSetHave(i, false) : onToggle(i)} onEdit={() => setEditItem(i)} />)}</div>}
+                </div>
+              ))}
             </Card>
           );
         })}
       </div>
 
-      {showStores && <StoresSheet stores={stores} onAdd={onAddStore} onRename={onRenameStore} onRemove={onRemoveStore} onClose={() => setShowStores(false)} />}
+      {pickStore && (
+        <Sheet title="In welke winkel ben je?" subtitle="Je ziet enkel wat je daar moet halen (plus items zonder winkel)" onClose={() => setPickStore(false)}>
+          <div className="space-y-2">
+            {stores.map(s => (
+              <button key={s} onClick={() => { setPickStore(false); onStoreMode(s); }}
+                className="w-full flex items-center justify-between rounded-2xl border border-line bg-white px-4 py-3.5 text-left active:bg-mist">
+                <span className="text-[15px] font-extrabold text-deep">{s}</span>
+                <span className="text-xs font-bold text-stone-400">{storeCounts[s] + storeCounts.__none__} te halen</span>
+              </button>
+            ))}
+            <button onClick={() => { setPickStore(false); onStoreMode('__all__'); }}
+              className="w-full flex items-center justify-between rounded-2xl border-2 border-dashed border-line px-4 py-3.5 text-left active:bg-mist">
+              <span className="text-[15px] font-extrabold text-forest">Alles (alle winkels)</span>
+              <span className="text-xs font-bold text-stone-400">{Object.values(storeCounts).reduce((a, b) => a + b, 0)} te halen</span>
+            </button>
+          </div>
+        </Sheet>
+      )}
+      {editItem && (
+        <ItemEditSheet item={items.find(i => i.key === editItem.key) || editItem} stores={stores}
+          onAssignStore={(st) => onAssignStore(editItem, st)} onAssignAisle={(a) => onAssignAisle(editItem, a)}
+          onRemove={editItem.kind !== 'recipe' ? () => { onRemoveItem(editItem); setEditItem(null); } : null}
+          onClose={() => setEditItem(null)} />
+      )}
+      {showStores && <StoresSheet stores={stores} storeAisles={storeAisles} onAdd={onAddStore} onRename={onRenameStore} onRemove={onRemoveStore}
+        onSetAisleOrder={onSetAisleOrder} onClose={() => setShowStores(false)} />}
+      {showStaples && <StaplesSheet staples={staples} stores={stores} onAdd={onAddStaple} onUpdate={onUpdateStaple} onDelete={onDeleteStaple} onClose={() => setShowStaples(false)} />}
     </div>
   );
 }
 
-function ShoppingRow({ item, stores, showAssign, onToggle, onAssign, onRemove }) {
+function ShoppingRow({ item, stores, showAssign, onToggle, onAssign, onHave, onEdit }) {
+  const checked = !!item.state;
   return (
     <div className="px-3 py-2.5 flex items-center gap-3">
       <button onClick={onToggle} aria-label="Afvinken"
-        className={cx('w-6 h-6 shrink-0 rounded-full border-2 flex items-center justify-center transition', item.checked ? 'bg-sage border-sage text-white' : 'border-stone-300')}>
-        {item.checked && <Icon name="check" size={14} stroke={3} />}
+        className={cx('w-6 h-6 shrink-0 rounded-full border-2 flex items-center justify-center transition', checked ? 'bg-sage border-sage text-white' : 'border-stone-300')}>
+        {checked && <Icon name="check" size={14} stroke={3} />}
       </button>
       <button onClick={onToggle} className="flex-1 min-w-0 text-left">
-        <div className={cx('text-sm font-bold', item.checked ? 'line-through text-stone-300' : 'text-ink')}>
+        <div className={cx('text-sm font-bold', checked ? 'line-through text-stone-300' : 'text-ink')}>
           {item.name}
-          {item.inKast && !item.checked && <span className="ml-1.5 text-[10px] font-black text-leaf bg-mint rounded-full px-1.5 py-0.5 align-middle">🥫 in kast?</span>}
+          {item.kind === 'staple' && <span className="ml-1.5 text-[10px] font-black text-stone-400 align-middle">📌</span>}
         </div>
         <div className="text-[11px] text-stone-400 truncate">
-          {item.isExtra ? 'los item' : (item.hasAmount ? `${fmtAmount(item.amount)} ${item.unit}` : (item.unit || 'naar smaak'))}
-          {!item.isExtra && item.uses && item.uses.length ? ` · ${item.uses.join(', ')}` : ''}
+          {item.kind === 'extra' ? 'los item' : item.kind === 'staple' ? 'vast item' : fmtShopAmount(item)}
+          {item.kind === 'recipe' && item.uses && item.uses.length ? ` · ${item.uses.join(', ')}` : ''}
         </div>
       </button>
-      {showAssign && !item.checked && (
-        <select onChange={(e) => onAssign(e.target.value)} defaultValue="" className="text-xs font-bold bg-amber-50 text-amber-800 rounded-lg px-1.5 py-1.5 border-0 max-w-[6rem]">
+      {item.inKast && !checked && onHave && (
+        <button onClick={onHave} className="shrink-0 text-[11px] font-black text-leaf bg-mint rounded-lg px-2 py-1.5" title="Staat in je kast — niet kopen">🥫 Heb ik al</button>
+      )}
+      {showAssign && !checked && (
+        <select onChange={(e) => onAssign(e.target.value)} defaultValue="" className="text-xs font-bold bg-amber-50 text-amber-800 rounded-lg px-1.5 py-1.5 border-0 max-w-[5.5rem]">
           <option value="" disabled>Winkel…</option>
           {stores.map(s => <option key={s} value={s}>{s}</option>)}
         </select>
       )}
-      {item.isExtra && <button onClick={onRemove} className="text-stone-300 p-1" aria-label="Verwijderen"><Icon name="x" size={16} /></button>}
+      {onEdit && <IconBtn name="pencil" size={14} title="Winkel / afdeling" onClick={onEdit} className="w-8 h-8 text-stone-300" />}
     </div>
   );
 }
 
-function StoresSheet({ stores, onAdd, onRename, onRemove, onClose }) {
+function ItemEditSheet({ item, stores, onAssignStore, onAssignAisle, onRemove, onClose }) {
+  return (
+    <Sheet title={item.name} subtitle={item.kind === 'recipe' ? 'Wordt onthouden voor volgende weken' : item.kind === 'staple' ? 'Vast item' : 'Los item'} onClose={onClose} z={60}>
+      <div className="space-y-4">
+        <Field label="Winkel">
+          <select value={item.store || ''} onChange={(e) => onAssignStore(e.target.value)} className={inputCls}>
+            <option value="">Nog geen winkel</option>
+            {stores.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </Field>
+        <Field label="Afdeling">
+          <div className="grid grid-cols-2 gap-1.5">
+            {AISLES.map(a => (
+              <button key={a} onClick={() => onAssignAisle(a)}
+                className={cx('rounded-xl border px-2.5 py-2 text-xs font-extrabold text-left', item.aisle === a ? 'bg-forest text-white border-forest' : 'bg-white text-deep border-line')}>{a}</button>
+            ))}
+          </div>
+        </Field>
+        {onRemove && <Btn variant="danger" icon="trash" className="w-full" onClick={onRemove}>{item.kind === 'staple' ? 'Deze week niet (vast item uitzetten)' : 'Verwijderen van de lijst'}</Btn>}
+        <Btn className="w-full" icon="check" onClick={onClose}>Klaar</Btn>
+      </div>
+    </Sheet>
+  );
+}
+
+function AisleOrderEditor({ order, onChange }) {
+  const move = (i, d) => { const n = [...order]; const j = i + d; if (j < 0 || j >= n.length) return; [n[i], n[j]] = [n[j], n[i]]; onChange(n); };
+  return (
+    <div className="space-y-1">
+      {order.map((a, i) => (
+        <div key={a} className="flex items-center gap-2 bg-cream rounded-xl px-2.5 py-1.5">
+          <span className="w-5 text-[11px] font-black text-stone-400">{i + 1}</span>
+          <span className="flex-1 text-xs font-bold text-deep">{a}</span>
+          <IconBtn name="up2" size={14} title="Hoger" onClick={() => move(i, -1)} className="w-8 h-8" />
+          <IconBtn name="down" size={14} title="Lager" onClick={() => move(i, 1)} className="w-8 h-8" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function StoresSheet({ stores, storeAisles, onAdd, onRename, onRemove, onSetAisleOrder, onClose }) {
   const [names, setNames] = useState({});
   const [newStore, setNewStore] = useState('');
+  const [openAisles, setOpenAisles] = useState(null);
   const commit = (old) => { const v = names[old]; if (v !== undefined && v.trim() && v.trim() !== old) onRename(old, v.trim()); };
+  const add = () => { if (newStore.trim() && !stores.includes(newStore.trim())) { onAdd(newStore.trim()); setNewStore(''); } };
   return (
-    <Sheet title="Winkels" subtitle="Hernoem, verwijder of voeg winkels toe" onClose={onClose}>
-      <div className="space-y-2">
+    <Sheet title="Winkels & afdelingen" subtitle="Zet de afdelingen in de volgorde waarin je door de winkel loopt" onClose={onClose}>
+      <div className="space-y-2.5">
         {stores.map(s => (
-          <div key={s} className="flex items-center gap-2">
-            <input value={names[s] !== undefined ? names[s] : s} onChange={(e) => setNames({ ...names, [s]: e.target.value })}
-              onBlur={() => commit(s)} onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }} className={inputCls} />
-            <IconBtn name="trash" title="Verwijderen" onClick={() => { if (window.confirm(`Winkel "${s}" verwijderen?`)) onRemove(s); }} />
-          </div>
+          <Card key={s} className="p-2.5">
+            <div className="flex items-center gap-2">
+              <input value={names[s] !== undefined ? names[s] : s} onChange={(e) => setNames({ ...names, [s]: e.target.value })}
+                onBlur={() => commit(s)} onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }} className={inputCls} />
+              <IconBtn name="trash" title="Verwijderen" onClick={() => { if (window.confirm(`Winkel "${s}" verwijderen?`)) onRemove(s); }} />
+            </div>
+            <button onClick={() => setOpenAisles(openAisles === s ? null : s)} className="mt-2 w-full flex items-center justify-between px-1 text-xs font-extrabold text-forest">
+              <span>Volgorde afdelingen</span><Icon name="down" size={14} className={openAisles === s ? 'rotate-180' : ''} />
+            </button>
+            {openAisles === s && <div className="mt-2"><AisleOrderEditor order={aisleOrderFor(s, storeAisles)} onChange={(o) => onSetAisleOrder(s, o)} /></div>}
+          </Card>
         ))}
         <div className="flex gap-2 pt-2">
           <input value={newStore} onChange={(e) => setNewStore(e.target.value)} placeholder="Nieuwe winkel…" className={inputCls}
-            onKeyDown={(e) => { if (e.key === 'Enter' && newStore.trim() && !stores.includes(newStore.trim())) { onAdd(newStore.trim()); setNewStore(''); } }} />
-          <Btn onClick={() => { if (newStore.trim() && !stores.includes(newStore.trim())) { onAdd(newStore.trim()); setNewStore(''); } }}>Voeg toe</Btn>
+            onKeyDown={(e) => { if (e.key === 'Enter') add(); }} />
+          <Btn onClick={add}>Voeg toe</Btn>
         </div>
       </div>
     </Sheet>
+  );
+}
+
+function StaplesSheet({ staples, stores, onAdd, onUpdate, onDelete, onClose }) {
+  const [name, setName] = useState('');
+  const [store, setStore] = useState('');
+  const add = () => { if (!name.trim()) return; onAdd(name, store); setName(''); };
+  return (
+    <Sheet title="📌 Vaste items" subtitle="Komen elke week vanzelf op de boodschappenlijst" onClose={onClose}>
+      <div className="space-y-3">
+        <Card className="p-2 flex gap-1.5">
+          <input value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') add(); }}
+            placeholder="bv. melk, brood, wc-papier" className="flex-1 min-w-0 bg-transparent px-2 py-2 text-sm placeholder:text-stone-300 border-0 focus:shadow-none" />
+          <select value={store} onChange={(e) => setStore(e.target.value)} className="bg-mist rounded-xl px-2 text-xs font-bold text-forest border-0 max-w-[6.5rem]">
+            <option value="">Winkel…</option>
+            {stores.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+          <button onClick={add} className="w-10 rounded-xl bg-forest text-white flex items-center justify-center"><Icon name="plus" /></button>
+        </Card>
+        {staples.length === 0 && <div className="text-center text-sm text-stone-400 py-4">Nog geen vaste items.</div>}
+        <div className="space-y-1.5">
+          {staples.map(s => (
+            <div key={s.id} className="flex items-center gap-2 bg-white border border-line rounded-xl px-2.5 py-2">
+              <button onClick={() => onUpdate(s.id, { active: !s.active })} title={s.active ? 'Actief' : 'Uit'}
+                className={cx('w-10 h-6 rounded-full relative transition shrink-0', s.active ? 'bg-sage' : 'bg-stone-200')}>
+                <span className={cx('absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition', s.active ? 'left-[18px]' : 'left-0.5')} />
+              </button>
+              <span className={cx('flex-1 min-w-0 truncate text-sm font-bold', s.active ? 'text-ink' : 'text-stone-400')}>{s.name}</span>
+              <select value={s.store || ''} onChange={(e) => onUpdate(s.id, { store: e.target.value || null })} className="text-xs font-bold bg-mist text-forest rounded-lg px-1.5 py-1.5 border-0 max-w-[6rem]">
+                <option value="">Winkel…</option>
+                {stores.map(st => <option key={st} value={st}>{st}</option>)}
+              </select>
+              <IconBtn name="trash" size={14} title="Verwijderen" onClick={() => { if (window.confirm(`"${s.name}" verwijderen uit vaste items?`)) onDelete(s.id); }} className="w-8 h-8 text-stone-300" />
+            </div>
+          ))}
+        </div>
+      </div>
+    </Sheet>
+  );
+}
+
+// Winkelmodus — zoals Google Keep: grote vinkzones, afgevinkt zakt naar "In de kar".
+function StoreMode({ storeKey, weekLabel, items, storeAisles, online, pendingOps, onToggle, onAddExtra, onClose }) {
+  const [showCart, setShowCart] = useState(false);
+  const [name, setName] = useState('');
+  const wakeSupported = useWakeLock(true);
+  useEffect(() => {
+    const prev = document.body.style.overflow; document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = prev; };
+  }, []);
+  const all = storeKey === '__all__';
+  const mine = items.filter(i => i.state !== 'have' && (all || i.store === storeKey || !i.store));
+  const todo = mine.filter(i => i.state !== 'cart');
+  const cart = mine.filter(i => i.state === 'cart');
+  const order = aisleOrderFor(all ? '' : storeKey, storeAisles);
+  function add() { if (onAddExtra(name)) setName(''); }
+
+  return (
+    <Portal>
+      <div className="fixed inset-0 bg-cream flex flex-col" style={{ zIndex: 70 }}>
+        <div className="pt-safe bg-forest text-white">
+          <div className="max-w-lg mx-auto px-4 py-3 flex items-center gap-3">
+            <div className="flex-1 min-w-0">
+              <div className="text-[11px] font-bold text-white/70">{weekLabel} · {cart.length} van {mine.length} in de kar</div>
+              <div className="text-xl font-black truncate">🛒 {all ? 'Alle winkels' : storeKey}</div>
+            </div>
+            <button onClick={onClose} className="rounded-xl bg-white text-forest font-black text-sm px-4 py-2">Klaar</button>
+          </div>
+          <div className="h-1.5 bg-white/15"><div className="h-full bg-mint transition-all" style={{ width: `${mine.length ? (cart.length / mine.length) * 100 : 0}%` }} /></div>
+        </div>
+        {(!online || pendingOps > 0) && (
+          <div className="bg-amber-100 text-amber-900 text-xs font-bold text-center py-1.5">{online ? '⏳ Wijzigingen worden verstuurd…' : '📴 Offline — afvinken werkt, wordt later gesynchroniseerd'}</div>
+        )}
+        <div className="flex-1 overflow-y-auto">
+          <div className="max-w-lg mx-auto px-3 pt-3 pb-safe">
+            <div className="flex gap-2 mb-3">
+              <input value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') add(); }}
+                placeholder="Snel iets toevoegen…" className={cx(inputCls, 'py-3 text-base')} />
+              <button onClick={add} className="w-12 rounded-xl bg-forest text-white flex items-center justify-center shrink-0"><Icon name="plus" size={20} /></button>
+            </div>
+            {todo.length === 0 && mine.length > 0 && <div className="text-center py-8"><div className="text-4xl">🎉</div><div className="font-black text-deep mt-2">Alles in de kar!</div></div>}
+            {mine.length === 0 && <div className="text-center text-stone-400 py-8 font-bold">Niets te halen in deze winkel.</div>}
+            {groupByAisle(todo, order).map(g => (
+              <div key={g.aisle} className="mb-3">
+                <div className="px-2 pb-1 text-[11px] font-black uppercase tracking-wider text-sage">{g.aisle}</div>
+                <div className="bg-white rounded-2xl border border-line divide-y divide-line/70 overflow-hidden">
+                  {g.items.map(i => (
+                    <button key={i.key} onClick={() => onToggle(i)} className="w-full flex items-center gap-3.5 px-4 py-3.5 text-left active:bg-mint">
+                      <span className="w-7 h-7 rounded-full border-2 border-stone-300 shrink-0" />
+                      <span className="flex-1 min-w-0">
+                        <span className="block text-[17px] font-bold text-ink leading-snug">{i.name}</span>
+                        {(i.kind === 'recipe' || (all && i.store) || (!all && !i.store)) && (
+                          <span className="block text-xs text-stone-400">
+                            {i.kind === 'recipe' ? fmtShopAmount(i) : ''}{all && i.store ? `${i.kind === 'recipe' ? ' · ' : ''}${i.store}` : ''}{!all && !i.store ? `${i.kind === 'recipe' ? ' · ' : ''}geen winkel gekozen` : ''}
+                          </span>
+                        )}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+            {cart.length > 0 && (
+              <div className="mb-6">
+                <button onClick={() => setShowCart(!showCart)} className="w-full flex items-center justify-between px-2 py-2 text-xs font-black text-stone-400">
+                  <span>🛒 In de kar ({cart.length})</span><Icon name="down" size={16} className={showCart ? 'rotate-180' : ''} />
+                </button>
+                {showCart && (
+                  <div className="bg-white/60 rounded-2xl border border-line divide-y divide-line/70 overflow-hidden">
+                    {cart.map(i => (
+                      <button key={i.key} onClick={() => onToggle(i)} className="w-full flex items-center gap-3.5 px-4 py-3 text-left active:bg-mist">
+                        <span className="w-7 h-7 rounded-full bg-sage text-white flex items-center justify-center shrink-0"><Icon name="check" size={16} stroke={3} /></span>
+                        <span className="flex-1 text-[16px] font-semibold text-stone-300 line-through">{i.name}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+            {!wakeSupported && <div className="text-center text-[11px] text-stone-400 pb-4">Tip: dit toestel ondersteunt "scherm aan houden" niet — zet eventueel de automatische schermvergrendeling even langer.</div>}
+          </div>
+        </div>
+      </div>
+    </Portal>
   );
 }
 
@@ -1656,10 +2533,14 @@ function RecipesPage({ recipes, suggestions, onApprove, onReject, onOpenRecipe, 
   const [sort, setSort] = useState('az');
   const [showSugg, setShowSugg] = useState(true);
   const [openSugg, setOpenSugg] = useState(null);
+  const [gf, setGf] = useState(false);
 
   const groupCats = group === 'dish' ? DISH_CATEGORIES : group === 'comp' ? COMPONENT_CATEGORIES : CATEGORIES;
+  // Zoeken op titel én op ingrediënt ("kip" vindt ook recepten met kipfilet).
+  const qn = normalize(q);
+  const ingHit = (r) => qn && !normalize(r.title).includes(qn) ? (r.ingredients || []).find(i => normalize(i.name).includes(qn)) : null;
   const filtered = recipes
-    .filter(r => (group === 'all' || groupCats.includes(r.category)) && (!cat || r.category === cat) && (!q || normalize(r.title).includes(normalize(q))))
+    .filter(r => (group === 'all' || groupCats.includes(r.category)) && (!cat || r.category === cat) && (!gf || r.glutenFree) && (!qn || normalize(r.title).includes(qn) || ingHit(r)))
     .sort((a, b) => sort === 'stars' ? ((b.stars || 0) - (a.stars || 0) || a.title.localeCompare(b.title)) : a.title.localeCompare(b.title));
 
   return (
@@ -1698,11 +2579,15 @@ function RecipesPage({ recipes, suggestions, onApprove, onReject, onOpenRecipe, 
 
       <div className="relative mb-3">
         <Icon name="search" size={16} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-stone-300" />
-        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Zoek een recept…" className={cx(inputCls, 'pl-10 rounded-2xl')} />
+        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Zoek op naam of ingrediënt…" className={cx(inputCls, 'pl-10 rounded-2xl')} />
       </div>
       <Segmented className="mb-2.5" value={group} onChange={(g) => { setGroup(g); setCat(''); }}
         options={[{ value: 'all', label: 'Alles' }, { value: 'dish', label: '🍽️ Gerechten' }, { value: 'comp', label: '🧩 Onderdelen' }]} />
       <div className="flex gap-1.5 overflow-x-auto no-scrollbar -mx-4 px-4 mb-3">
+        <button onClick={() => setGf(!gf)}
+          className={cx('shrink-0 rounded-full px-3 py-1.5 text-xs font-extrabold border', gf ? 'bg-amber-500 text-white border-amber-500' : 'bg-white text-amber-800 border-amber-300')}>
+          🌾 Glutenvrij <span className="opacity-60">{recipes.filter(r => r.glutenFree).length}</span>
+        </button>
         {groupCats.map(c => {
           const n = recipes.filter(r => r.category === c).length;
           if (!n && c === 'Onderdeel') return null;
@@ -1735,9 +2620,11 @@ function RecipesPage({ recipes, suggestions, onApprove, onReject, onOpenRecipe, 
                 <span className="block text-sm font-extrabold text-ink truncate">{r.title}</span>
                 <span className="flex items-center gap-2 mt-0.5 text-[11px] text-stone-400 font-semibold">
                   <span>{catShort(r.category)}</span>
+                  {r.glutenFree && <span className="rounded-full bg-amber-100 text-amber-800 px-1.5 py-px text-[10px] font-extrabold">🌾 GV</span>}
                   {r.stars ? <Stars value={r.stars} size={10} /> : null}
                   {r.carbsPerPortion != null && <span>{fmtAmount(r.carbsPerPortion)} g koolh.</span>}
                 </span>
+                {ingHit(r) && <span className="block text-[11px] font-bold text-sage truncate">bevat: {ingHit(r).name}</span>}
               </span>
               <Icon name="right" size={16} className="text-stone-300" />
             </button>
@@ -1826,6 +2713,12 @@ function RecipeForm({ draft, setDraft }) {
       <Field label="Categorie" hint={isComponent(draft.category) ? 'Onderdeel: kies je in de planner via 🧩 Samenstellen.' : null}>
         <CategorySelect value={draft.category} onChange={(v) => set({ category: v })} />
       </Field>
+      <button type="button" onClick={() => set({ glutenFree: !draft.glutenFree })}
+        className={cx('w-full flex items-center gap-2.5 rounded-xl border px-3.5 py-2.5 text-sm font-extrabold transition', draft.glutenFree ? 'bg-amber-50 border-amber-300 text-amber-900' : 'bg-white border-line text-stone-500')}>
+        <span className="text-lg leading-none">🌾</span>
+        <span className="flex-1 text-left">Glutenvrij</span>
+        <span className={cx('w-5 h-5 rounded-md border flex items-center justify-center', draft.glutenFree ? 'bg-amber-500 border-amber-500 text-white' : 'border-line')}>{draft.glutenFree && <Icon name="check" size={14} stroke={3} />}</span>
+      </button>
       <div className="grid grid-cols-2 gap-3">
         <Field label="Voor # personen"><input type="number" min="1" value={draft.basePortions} onChange={(e) => set({ basePortions: e.target.value })} className={inputCls} /></Field>
         <Field label="Koolh. per pers. (g)"><input type="number" min="0" value={draft.carbsPerPortion} onChange={(e) => set({ carbsPerPortion: e.target.value })} placeholder="optioneel" className={inputCls} /></Field>
@@ -1866,7 +2759,7 @@ function recipeToDraft(r) {
     carbsPerPortion: r.carbsPerPortion == null ? '' : r.carbsPerPortion,
     ingredients: (r.ingredients && r.ingredients.length ? r.ingredients : [{}]).map(i => ({ name: i.name || '', amount: i.amount == null ? '' : i.amount, unit: i.unit || '' })),
     steps: r.steps && r.steps.length ? [...r.steps] : [''],
-    image: r.image || '',
+    image: r.image || '', glutenFree: !!r.glutenFree,
   };
 }
 function draftToRecipe(d) {
@@ -1875,14 +2768,15 @@ function draftToRecipe(d) {
     carbsPerPortion: d.carbsPerPortion === '' || d.carbsPerPortion === null ? null : Number(d.carbsPerPortion),
     ingredients: d.ingredients.filter(i => (i.name || '').trim()).map(i => ({ name: i.name.trim(), amount: i.amount === '' || i.amount == null ? null : Number(i.amount), unit: (i.unit || '').trim() })),
     steps: d.steps.map(s => (s || '').trim()).filter(Boolean),
-    image: d.image || null,
+    image: d.image || null, glutenFree: !!d.glutenFree,
   };
 }
 
-function RecipeSheet({ recipe, startInEdit, onUpdate, onDelete, onPlan, onClose }) {
+function RecipeSheet({ recipe, startInEdit, householdSize, onUpdate, onDelete, onPlan, onClose }) {
   const [editing, setEditing] = useState(startInEdit);
   const [draft, setDraft] = useState(() => recipeToDraft(recipe));
-  const [persons, setPersons] = useState(recipe.basePortions || 1);
+  const [persons, setPersons] = useState(householdSize || recipe.basePortions || 1);
+  const [cooking, setCooking] = useState(false);
   const ratio = recipe.basePortions ? persons / recipe.basePortions : 1;
 
   const [saving, setSaving] = useState(false);
@@ -1927,9 +2821,11 @@ function RecipeSheet({ recipe, startInEdit, onUpdate, onDelete, onPlan, onClose 
             <span className="text-sm font-extrabold text-deep">Hoeveelheden voor</span>
             <Stepper value={persons} onChange={setPersons} label="pers." />
           </div>
+          <Btn variant="soft" size="lg" className="w-full" onClick={() => setCooking(true)}>👩‍🍳 Kookmodus — stap voor stap</Btn>
           <RecipeBody recipe={recipe} ratio={ratio} />
         </div>
       )}
+      {cooking && <CookMode recipe={recipe} persons={persons} onClose={() => setCooking(false)} />}
     </Sheet>
   );
 }
@@ -2052,7 +2948,22 @@ function AddRecipeSheet({ preset, onSave, onClose }) {
 // =================================================================
 // 9. Kast
 // =================================================================
-function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onAddToShopping, onOpenRecipe, onAiSuggest, aiSuggesting }) {
+function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onAddToShopping, onOpenRecipe, onAiSuggest, aiSuggesting, showToast }) {
+  const scanRef = useRef(null);
+  const [scanning, setScanning] = useState(false);
+  const [scanItems, setScanItems] = useState(null);
+  async function scanPhoto(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    setScanning(true);
+    try {
+      const dataUrl = await resizeImageFile(file, 1400, 0.8);
+      const data = await invokeAi({ task: 'scan_pantry', imageBase64: dataUrl.split(',')[1], mimeType: 'image/jpeg' });
+      setScanItems((data && data.items) || []);
+    } catch (err) { showToast(err.message || 'Foto herkennen mislukt'); }
+    finally { setScanning(false); }
+  }
   const [view, setView] = useState('voorraad');
   const [input, setInput] = useState('');
   const [extra, setExtra] = useState([]);
@@ -2082,6 +2993,12 @@ function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onAddToShop
               placeholder="Toevoegen: eieren, rijst, passata…" className="flex-1 min-w-0 bg-transparent px-2 py-2 text-sm placeholder:text-stone-300 border-0 focus:shadow-none" />
             <button onClick={add} className="w-10 rounded-xl bg-forest text-white flex items-center justify-center"><Icon name="plus" /></button>
           </Card>
+
+          <input ref={scanRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={scanPhoto} />
+          <Btn variant="secondary" className="w-full" icon="camera" disabled={scanning} onClick={() => scanRef.current.click()}>
+            {scanning ? 'Foto wordt bekeken…' : 'Foto van koelkast of kast'}
+          </Btn>
+          {scanItems && <PantryScanSheet items={scanItems} pantryStock={pantryStock} onAdd={onAdd} onClose={() => setScanItems(null)} />}
 
           <button onClick={onAiSuggest} disabled={aiSuggesting || !inStock.length}
             className="w-full rounded-2xl bg-gradient-to-br from-deep to-forest text-white p-3.5 flex items-center gap-3 text-left shadow-card disabled:opacity-50">
@@ -2140,7 +3057,7 @@ function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onAddToShop
             <Segmented value={matchMode} onChange={setMatchMode} options={[{ value: 'any', label: 'Minstens 1 match' }, { value: 'full', label: 'Volledig in huis' }]} />
             <div className="text-[11px] text-stone-400">Zout, peper, olie, boter en water tellen we als altijd in huis.</div>
           </Card>
-          {!sources.length ? <EmptyState emoji="🧺" title="Nog niets om mee te zoeken" text="Zet eerst wat in je voorraad of typ hierboven wat je hebt." />
+          {!sources.length ?<EmptyState emoji="🧺" title="Nog niets om mee te zoeken" text="Zet eerst wat in je voorraad of typ hierboven wat je hebt." />
             : results.length === 0 ? <EmptyState emoji="🤷" title="Geen passende recepten" text={matchMode === 'full' ? 'Geen enkel recept kan je volledig maken — probeer "Minstens 1 match".' : 'Geen enkel recept gebruikt deze ingrediënten.'} />
             : (
               <Card className="divide-y divide-line/70 overflow-hidden">
@@ -2160,6 +3077,276 @@ function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onAddToShop
         </div>
       )}
     </div>
+  );
+}
+
+// =================================================================
+// 10. Gezin, toegang, kookmodus, kastfoto
+// =================================================================
+function FamilySheet({ members, onAdd, onUpdate, onDelete, onClose }) {
+  const [newName, setNewName] = useState('');
+  return (
+    <Sheet title="👨‍👩‍👧‍👦 Gezin & voorkeuren" subtitle="Allergie = de AI kiest het nooit · Lust niet = liefst vermijden" onClose={onClose} full>
+      <div className="space-y-3">
+        {members.map(m => <MemberCard key={m.id} member={m} onUpdate={(patch) => onUpdate(m.id, patch)}
+          onDelete={() => { if (window.confirm(`${m.name} verwijderen?`)) onDelete(m.id); }} />)}
+        {members.length === 0 && <div className="text-center text-sm text-stone-500 py-3">Voeg de gezinsleden toe en noteer wat ze niet lusten of niet mogen eten.</div>}
+        <div className="flex gap-2">
+          <input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Naam gezinslid…" className={inputCls}
+            onKeyDown={(e) => { if (e.key === 'Enter' && newName.trim()) { onAdd(newName); setNewName(''); } }} />
+          <Btn icon="plus" onClick={() => { if (newName.trim()) { onAdd(newName); setNewName(''); } }}>Voeg toe</Btn>
+        </div>
+      </div>
+    </Sheet>
+  );
+}
+
+function MemberCard({ member, onUpdate, onDelete }) {
+  const [name, setName] = useState(member.name);
+  const [term, setTerm] = useState('');
+  const [kind, setKind] = useState('lust_niet');
+  const list = member.restrictions || [];
+  function addTerm() {
+    const parts = term.split(',').map(s => s.trim()).filter(Boolean)
+      .filter(t => !list.some(r => normalize(r.term) === normalize(t)));
+    if (!parts.length) { setTerm(''); return; }
+    onUpdate({ restrictions: [...list, ...parts.map(t => ({ term: t, kind }))] });
+    setTerm('');
+  }
+  return (
+    <Card className="p-3.5">
+      <div className="flex items-center gap-2 mb-2.5">
+        <input value={name} onChange={(e) => setName(e.target.value)} onBlur={() => { if (name.trim() && name.trim() !== member.name) onUpdate({ name: name.trim() }); }}
+          className={cx(inputCls, 'font-extrabold')} />
+        <IconBtn name="trash" title="Verwijderen" onClick={onDelete} className="text-stone-400" />
+      </div>
+      <div className="flex flex-wrap gap-1.5 mb-2.5">
+        {list.length === 0 && <span className="text-xs text-stone-400">Eet alles 👍</span>}
+        {list.map((r, i) => (
+          <span key={i} className={cx('inline-flex items-center rounded-full text-xs font-bold', r.kind === 'allergie' ? 'bg-red-100 text-red-800' : 'bg-amber-100 text-amber-900')}>
+            <button onClick={() => onUpdate({ restrictions: list.map((x, k) => k === i ? { ...x, kind: x.kind === 'allergie' ? 'lust_niet' : 'allergie' } : x) })}
+              className="pl-2.5 pr-1 py-1" title="Tik om te wisselen tussen allergie en lust niet">
+              {r.kind === 'allergie' ? '⚠️' : '🙅'} {r.term}
+            </button>
+            <button onClick={() => onUpdate({ restrictions: list.filter((_, k) => k !== i) })} className="pr-2 pl-0.5 py-1 opacity-60" aria-label="Verwijderen"><Icon name="x" size={12} /></button>
+          </span>
+        ))}
+      </div>
+      <div className="flex gap-1.5">
+        <input value={term} onChange={(e) => setTerm(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') addTerm(); }}
+          placeholder="bv. champignons, vis" className={cx(inputBase, 'flex-1 min-w-0 py-2')} />
+        <select value={kind} onChange={(e) => setKind(e.target.value)} className="bg-mist rounded-xl px-2 text-xs font-bold text-forest border-0">
+          <option value="lust_niet">Lust niet</option>
+          <option value="allergie">Allergie</option>
+        </select>
+        <button onClick={addTerm} className="w-10 rounded-xl bg-forest text-white flex items-center justify-center shrink-0"><Icon name="plus" size={16} /></button>
+      </div>
+    </Card>
+  );
+}
+
+function AccessSheet({ myEmail, onClose }) {
+  const [rows, setRows] = useState(null);
+  const [email, setEmail] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const me = (myEmail || '').toLowerCase();
+  async function load() {
+    try { setRows(throwIfError(await sb.from('allowed_emails').select('*').order('email')) || []); setError(''); }
+    catch (e) { setRows([]); setError(/does not exist|schema cache|relation/i.test(e.message) ? 'De database is nog niet bijgewerkt — voer eerst migratie-mealio-v2.sql uit.' : e.message); }
+  }
+  useEffect(() => { load(); }, []);
+  async function add() {
+    const v = email.trim().toLowerCase();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v)) { setError('Dat lijkt geen geldig e-mailadres.'); return; }
+    setBusy(true); setError('');
+    try { throwIfError(await sb.from('allowed_emails').insert({ email: v, added_by: me })); setEmail(''); await load(); }
+    catch (e) { setError(/duplicate|unique/i.test(e.message) ? 'Dat adres staat al op de lijst.' : e.message); }
+    finally { setBusy(false); }
+  }
+  async function remove(addr) {
+    if (!window.confirm(`${addr} verwijderen? Die persoon kan dan niet meer inloggen in Mealio.`)) return;
+    setError('');
+    try { throwIfError(await sb.from('allowed_emails').delete().eq('email', addr)); await load(); }
+    catch (e) { setError(e.message); }
+  }
+  return (
+    <Sheet title="🔐 Toegang beheren" subtitle="Wie met Google mag inloggen in Mealio" onClose={onClose}>
+      <div className="space-y-3">
+        {rows === null ? <div className="text-sm text-stone-400 py-3 text-center">Laden…</div> : (
+          <Card className="divide-y divide-line/70 overflow-hidden">
+            {rows.map(r => (
+              <div key={r.email} className="flex items-center gap-2 px-3.5 py-2.5">
+                <span className="flex-1 min-w-0 truncate text-sm font-bold text-ink">{r.email}</span>
+                {r.email === me ? <span className="text-[11px] font-black text-sage">jij</span>
+                  : <IconBtn name="trash" size={15} title="Verwijderen" onClick={() => remove(r.email)} className="text-stone-400" />}
+              </div>
+            ))}
+          </Card>
+        )}
+        <div className="flex gap-2">
+          <input value={email} onChange={(e) => setEmail(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') add(); }}
+            type="email" inputMode="email" autoCapitalize="none" placeholder="naam@gmail.com" className={inputCls} />
+          <Btn onClick={add} disabled={busy}>Voeg toe</Btn>
+        </div>
+        {error && <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-xl px-3 py-2">{error}</div>}
+        <p className="text-[11px] text-stone-400">Iemand toevoegen geeft volledige toegang tot jullie weekmenu, recepten en boodschappen. Je eigen adres kan je niet verwijderen.</p>
+      </div>
+    </Sheet>
+  );
+}
+
+// Kookmodus: eerst ingrediënten klaarzetten, dan stap per stap met timers.
+let audioCtx = null;
+function beep() {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    [0, 0.35, 0.7].forEach(t => {
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.frequency.value = 880; o.connect(g); g.connect(audioCtx.destination);
+      g.gain.setValueAtTime(0.25, audioCtx.currentTime + t);
+      g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + t + 0.28);
+      o.start(audioCtx.currentTime + t); o.stop(audioCtx.currentTime + t + 0.3);
+    });
+  } catch (e) {}
+  try { if (navigator.vibrate) navigator.vibrate([400, 150, 400, 150, 400]); } catch (e) {}
+}
+
+function CookMode({ recipe, persons: startPersons, onClose }) {
+  const [persons, setPersons] = useState(startPersons || recipe.basePortions || 1);
+  const [phase, setPhase] = useState(-1);     // -1 = ingrediënten, 0..n-1 = stappen
+  const [have, setHave] = useState({});
+  const [timers, setTimers] = useState([]);   // { id, label, endsAt, total, rung }
+  const [now, setNow] = useState(Date.now());
+  const touch = useRef(null);
+  useWakeLock(true);
+  useEffect(() => {
+    const prev = document.body.style.overflow; document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = prev; };
+  }, []);
+  useEffect(() => {
+    if (!timers.some(t => !t.rung)) return;
+    const id = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(id);
+  }, [timers]);
+  useEffect(() => {
+    const due = timers.filter(t => !t.rung && t.endsAt <= now);
+    if (due.length) { beep(); setTimers(ts => ts.map(t => due.some(d => d.id === t.id) ? { ...t, rung: true } : t)); }
+  }, [now]); // eslint-disable-line
+
+  const steps = (recipe.steps || []).map(s => s.replace(/^\d+[\.\)]\s*/, ''));
+  const ratio = recipe.basePortions ? persons / recipe.basePortions : 1;
+  const ings = recipe.ingredients || [];
+  const last = steps.length - 1;
+  function go(d) { setPhase(p => Math.max(-1, Math.min(last, p + d))); }
+  function startTimer(seconds, label) {
+    try { audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)(); if (audioCtx.state === 'suspended') audioCtx.resume(); } catch (e) {}
+    setTimers(ts => [...ts, { id: Date.now() + Math.random(), label, total: seconds, endsAt: Date.now() + seconds * 1000, rung: false }]);
+    setNow(Date.now());
+  }
+
+  return (
+    <Portal>
+      <div className="fixed inset-0 bg-cream flex flex-col" style={{ zIndex: 80 }}
+        onTouchStart={(e) => { touch.current = e.touches[0].clientX; }}
+        onTouchEnd={(e) => { if (touch.current == null) return; const dx = e.changedTouches[0].clientX - touch.current; touch.current = null; if (Math.abs(dx) > 70) go(dx < 0 ? 1 : -1); }}>
+        <div className="pt-safe bg-forest text-white">
+          <div className="max-w-lg mx-auto px-4 py-3 flex items-center gap-3">
+            <div className="flex-1 min-w-0">
+              <div className="text-[11px] font-bold text-white/70">{phase < 0 ? 'Klaarzetten' : `Stap ${phase + 1} van ${steps.length}`}</div>
+              <div className="text-lg font-black truncate">👩‍🍳 {recipe.title}</div>
+            </div>
+            <button onClick={onClose} className="rounded-xl bg-white text-forest font-black text-sm px-4 py-2">Sluiten</button>
+          </div>
+          <div className="h-1.5 bg-white/15"><div className="h-full bg-mint transition-all" style={{ width: `${steps.length ? ((phase + 1) / steps.length) * 100 : 0}%` }} /></div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto">
+          <div className="max-w-lg mx-auto px-4 py-5">
+            {phase < 0 ? (
+              <div>
+                <div className="flex items-center justify-between mb-3">
+                  <span className="text-base font-black text-deep">Ingrediënten</span>
+                  <Stepper value={persons} onChange={setPersons} label="pers." />
+                </div>
+                <div className="bg-white rounded-2xl border border-line divide-y divide-line/70 overflow-hidden">
+                  {ings.length === 0 && <div className="px-4 py-3 text-sm text-stone-400">Geen ingrediënten.</div>}
+                  {ings.map((ing, i) => (
+                    <button key={i} onClick={() => setHave({ ...have, [i]: !have[i] })} className="w-full flex items-center gap-3 px-4 py-3.5 text-left active:bg-mist">
+                      <span className={cx('w-7 h-7 rounded-full border-2 flex items-center justify-center shrink-0', have[i] ? 'bg-sage border-sage text-white' : 'border-stone-300')}>{have[i] && <Icon name="check" size={16} stroke={3} />}</span>
+                      <span className={cx('flex-1 text-[17px] font-bold', have[i] ? 'line-through text-stone-300' : 'text-ink')}>{ing.name}</span>
+                      <span className="text-sm font-bold text-stone-400 shrink-0">{ing.amount != null ? `${fmtAmount(ing.amount * ratio)} ${ing.unit || ''}` : (ing.unit || 'naar smaak')}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="text-[24px] leading-relaxed font-bold text-ink">
+                {splitDurations(steps[phase]).map((p, i) => p.seconds ? (
+                  <button key={i} onClick={() => startTimer(p.seconds, `Stap ${phase + 1}: ${p.text}`)}
+                    className="inline-flex items-center gap-1 mx-0.5 px-2.5 py-0.5 rounded-xl bg-amber-100 text-amber-900 border border-amber-300 align-baseline">
+                    <Icon name="timer" size={18} />{p.text}
+                  </button>
+                ) : <span key={i}>{p.text}</span>)}
+                {splitDurations(steps[phase]).some(p => p.seconds) && <div className="text-xs font-bold text-stone-400 mt-4">Tik op een tijd om een timer te starten.</div>}
+              </div>
+            )}
+            {phase < 0 && steps.length === 0 && <div className="text-sm text-stone-400 mt-4">Dit recept heeft nog geen bereidingsstappen.</div>}
+          </div>
+        </div>
+
+        {timers.length > 0 && (
+          <div className="max-w-lg w-full mx-auto px-4 space-y-1.5 pb-2">
+            {timers.map(t => {
+              const left = Math.max(0, (t.endsAt - now) / 1000);
+              return (
+                <div key={t.id} className={cx('flex items-center gap-3 rounded-2xl px-3.5 py-2.5 shadow-card', t.rung ? 'bg-red-600 text-white animate-pulse' : 'bg-white border border-line')}>
+                  <Icon name="timer" size={18} />
+                  <span className="flex-1 min-w-0 truncate text-sm font-bold">{t.rung ? `⏰ Klaar — ${t.label}` : t.label}</span>
+                  <span className="text-lg font-black tabular-nums">{t.rung ? '0:00' : fmtClock(left)}</span>
+                  <button onClick={() => setTimers(ts => ts.filter(x => x.id !== t.id))} className={cx('rounded-lg px-2 py-1 text-xs font-black', t.rung ? 'bg-white text-red-700' : 'bg-mist text-forest')}>{t.rung ? 'OK' : <Icon name="x" size={14} />}</button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        <div className="border-t border-line bg-white pb-safe">
+          <div className="max-w-lg mx-auto px-4 py-3 flex gap-2">
+            <Btn variant="secondary" size="lg" className="flex-1" icon="left" disabled={phase < 0} onClick={() => go(-1)}>Vorige</Btn>
+            {phase < last
+              ? <Btn size="lg" className="flex-[2]" onClick={() => go(1)}>{phase < 0 ? 'Start met koken' : 'Volgende stap'}</Btn>
+              : <Btn size="lg" className="flex-[2]" icon="check" onClick={onClose}>Smakelijk! Klaar</Btn>}
+          </div>
+        </div>
+      </div>
+    </Portal>
+  );
+}
+
+// Na een koelkast-/kastfoto: aanvinken wat klopt, dan in de kast zetten.
+function PantryScanSheet({ items, pantryStock, onAdd, onClose }) {
+  const inStock = new Set(pantryStock.filter(p => p.inStock).map(p => normalize(p.name)));
+  const [sel, setSel] = useState(() => Object.fromEntries(items.map(n => [n, !inStock.has(normalize(n))])));
+  const chosen = items.filter(n => sel[n]);
+  return (
+    <Sheet title="📸 Herkend op de foto" subtitle="Vink aan wat klopt — dat komt in je kast" onClose={onClose}
+      footer={<Btn size="lg" className="w-full" icon="check" disabled={!chosen.length} onClick={() => { chosen.forEach(onAdd); onClose(); }}>In de kast ({chosen.length})</Btn>}>
+      {items.length === 0 ? <div className="text-center text-sm text-stone-500 py-6">Er werd niets herkend. Probeer een scherpere foto met meer licht.</div> : (
+        <Card className="divide-y divide-line/70 overflow-hidden">
+          {items.map(n => {
+            const already = inStock.has(normalize(n));
+            return (
+              <button key={n} onClick={() => setSel({ ...sel, [n]: !sel[n] })} className="w-full flex items-center gap-3 px-3.5 py-3 text-left active:bg-mist">
+                <span className={cx('w-6 h-6 rounded-md border-2 flex items-center justify-center shrink-0', sel[n] ? 'bg-sage border-sage text-white' : 'border-stone-300')}>{sel[n] && <Icon name="check" size={14} stroke={3} />}</span>
+                <span className="flex-1 text-sm font-bold text-ink">{n}</span>
+                {already && <span className="text-[10px] font-black text-sage">al in kast</span>}
+              </button>
+            );
+          })}
+        </Card>
+      )}
+    </Sheet>
   );
 }
 
