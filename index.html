@@ -1472,6 +1472,13 @@ function App() {
     weekStart, isCurrent: weekStart === mondayOf(new Date()),
     prev: () => setWeekStart(addDays(weekStart, -7)), next: () => setWeekStart(addDays(weekStart, 7)),
     today: () => setWeekStart(mondayOf(new Date())),
+    // vorige/volgende dag, over de weekgrens heen (zondag → maandag volgende week)
+    shiftDay: (d) => {
+      const i = DAYS.indexOf(selectedDay) + d;
+      if (i >= 0 && i < DAYS.length) { setSelectedDay(DAYS[i]); return; }
+      setWeekStart(addDays(weekStart, i < 0 ? -7 : 7));
+      setSelectedDay(i < 0 ? DAYS[DAYS.length - 1] : DAYS[0]);
+    },
   };
   const openAdd = (preset = {}) => setAddSheet(preset);
 
@@ -1681,6 +1688,7 @@ function MoreMenu({ items }) {
 
 function PlannerPage({ nav, weekmenu, recipesById, weekLoading, members, selectedDay, setSelectedDay, onOpenMeal, onToggleLock, onFeedback, aiTargetCount, aiBusy, onAiFill, onCopyPrev, showToast }) {
   const [view, setView] = useState('day');
+  const swipeRef = useRef(null);
   const today = todayISO();
   const dayIdx = DAYS.indexOf(selectedDay);
   const dayCarbs = MEALS.reduce((s, m) => s + (slotCarbs(weekmenu[selectedDay][m.key], recipesById) || 0), 0);
@@ -1747,10 +1755,22 @@ function PlannerPage({ nav, weekmenu, recipesById, weekLoading, members, selecte
       {weekLoading && <div className="text-center text-xs font-bold text-sage mb-3">Week laden…</div>}
 
       {view === 'day' ? (
-        <div className="space-y-3">
-          <div className="flex items-baseline justify-between px-1">
-            <h3 className="text-base font-black text-deep">{fmtDayLong(nav.weekStart, dayIdx)}</h3>
-            {dayCarbs > 0 && <span className="text-xs font-bold text-stone-400">≈ {Math.round(dayCarbs)} g koolhydraten</span>}
+        <div className="space-y-3"
+          onTouchStart={(e) => { const t = e.touches[0]; swipeRef.current = { x: t.clientX, y: t.clientY }; }}
+          onTouchEnd={(e) => {
+            const st = swipeRef.current; swipeRef.current = null; if (!st) return;
+            const t = e.changedTouches[0]; const dx = t.clientX - st.x, dy = t.clientY - st.y;
+            if (Math.abs(dx) > 70 && Math.abs(dx) > Math.abs(dy) * 1.8) nav.shiftDay(dx < 0 ? 1 : -1);
+          }}>
+          <div className="flex items-center gap-2">
+            <button onClick={() => nav.shiftDay(-1)} aria-label="Vorige dag"
+              className="w-11 h-11 shrink-0 rounded-2xl bg-white border border-line text-forest flex items-center justify-center active:scale-95 transition"><Icon name="left" size={20} /></button>
+            <div className="flex-1 min-w-0 text-center">
+              <h3 className="text-base font-black text-deep truncate">{fmtDayLong(nav.weekStart, dayIdx)}</h3>
+              {dayCarbs > 0 && <div className="text-[11px] font-bold text-stone-400">≈ {Math.round(dayCarbs)} g koolhydraten</div>}
+            </div>
+            <button onClick={() => nav.shiftDay(1)} aria-label="Volgende dag"
+              className="w-11 h-11 shrink-0 rounded-2xl bg-white border border-line text-forest flex items-center justify-center active:scale-95 transition"><Icon name="right" size={20} /></button>
           </div>
           {MEALS.map(m => (
             <MealCard key={m.key} meal={m} slot={weekmenu[selectedDay][m.key]} recipesById={recipesById} members={members}
