@@ -2333,6 +2333,11 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
     else onSetHave(i, true);                        // heb ik al
   }
   function undo(i) { if (i.state === 'have') onSetHave(i, false); else onToggle(i); }
+  // snelknop: van de lijst halen (heb ik al) — met ongedaan maken
+  function haveItem(i) {
+    onSetHave(i, true);
+    showToast(`"${i.name}" staat bij Al in huis`, { label: 'Ongedaan', onClick: () => onSetHave(i, false) });
+  }
   // basisvoorraad toch nodig? → komt als los item op de lijst
   function needBasic(i) {
     if (onAddExtra(i.name, i.store || '', i.aisle)) { onSetHave(i, true); showToast(`"${i.name}" staat op de lijst`); }
@@ -2412,7 +2417,7 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
       )}
       {todo.length > 0 && (
         <p className="text-[13px] text-stone-600 px-1 mb-3">
-          {arrange ? 'Tik op een item om de winkel of afdeling te kiezen. De app onthoudt dat.' : 'Tik aan wat je al in huis hebt. Wat overblijft, koop je.'}
+          {arrange ? 'Tik op een item om de winkel of afdeling te kiezen. De app onthoudt dat.' : 'Heb je iets al in huis? Tik op 🏠 Heb ik. Wat overblijft, koop je.'}
         </p>
       )}
 
@@ -2429,7 +2434,7 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
               <div key={g.aisle}>
                 <div className="px-4 pt-2.5 pb-1 text-[11px] font-black uppercase tracking-wider text-stone-500">{g.aisle}</div>
                 <div className="divide-y divide-line/70">
-                  {g.items.map(i => <ShoppingRow key={i.key} item={i} arrange={arrange} onTap={() => tapItem(i)} onRemove={() => onRemoveItem(i)} />)}
+                  {g.items.map(i => <ShoppingRow key={i.key} item={i} arrange={arrange} onTap={() => tapItem(i)} onRemove={() => onRemoveItem(i)} onHave={() => haveItem(i)} />)}
                 </div>
               </div>
             ))}
@@ -2482,7 +2487,7 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
 }
 
 // Eén rij: naam, hoeveelheid, waarvoor. De hele rij is de knop.
-function ShoppingRow({ item, arrange, onTap, onRemove }) {
+function ShoppingRow({ item, arrange, onTap, onRemove, onHave }) {
   const sub = item.kind === 'extra' ? 'zelf toegevoegd' : item.kind === 'staple' ? 'vast item' : fmtShopAmount(item);
   const uses = (item.kind === 'recipe' || item.kind === 'free') && item.uses && item.uses.length ? item.uses.join(', ') : '';
   return (
@@ -2493,12 +2498,14 @@ function ShoppingRow({ item, arrange, onTap, onRemove }) {
         </span>
         <span className="flex-1 min-w-0">
           <span className="block text-[15px] font-bold text-ink">{item.name}{item.kind === 'staple' ? ' 📌' : ''}</span>
-          <span className="block text-[12px] text-stone-600 truncate">{sub}{uses ? ` · ${uses}` : ''}{arrange ? ` · ${item.store || 'geen winkel'} › ${item.aisle}` : ''}</span>
+          <span className="block text-[12px] text-stone-600 truncate">{!arrange && item.inKast ? <b className="text-leaf">in kast · </b> : null}{sub}{uses ? ` · ${uses}` : ''}{arrange ? ` · ${item.store || 'geen winkel'} › ${item.aisle}` : ''}</span>
         </span>
-        {!arrange && item.inKast && <span className="shrink-0 text-[11px] font-black text-leaf bg-mint rounded-full px-2 py-1">in kast</span>}
       </button>
-      {item.kind === 'extra' && !arrange && (
+      {item.kind === 'extra' ? (
         <button onClick={onRemove} className="w-11 h-11 mr-1 shrink-0 flex items-center justify-center text-stone-400" aria-label={`${item.name} verwijderen`}><Icon name="x" size={16} /></button>
+      ) : (
+        <button onClick={onHave} aria-label={`${item.name}: heb ik al`}
+          className="shrink-0 mr-2 h-9 px-3 rounded-full bg-mint text-forest text-[12px] font-black flex items-center gap-1 active:scale-95 transition">🏠 Heb ik</button>
       )}
     </div>
   );
