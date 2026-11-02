@@ -736,13 +736,28 @@ const SETTINGS_DB_KEYS = { stores: 'stores', itemStoreMap: 'item_store_map', hou
 // gewoon verder zonder de "kook dubbel"-kolommen.
 let HAS_V2_COLUMNS = true;
 
+
+// Android/iOS sluiten een app op de achtergrond soms af; bij terugkeren laadt de pagina dan opnieuw.
+// We onthouden waar je was (tab, dag, week, winkelmodus, scrollpositie, open recept) zodat je daar terugkomt.
+const UI_KEY = 'mealio-ui-v1';
+const UI_MAX_AGE = 3 * 60 * 60 * 1000; // 3 uur
+const UI_SAVED = (() => {
+  try {
+    const v = JSON.parse(localStorage.getItem(UI_KEY) || 'null');
+    return v && Date.now() - (v.t || 0) < UI_MAX_AGE ? v : {};
+  } catch (e) { return {}; }
+})();
+function saveUi(patch) {
+  try { const cur = JSON.parse(localStorage.getItem(UI_KEY) || '{}'); localStorage.setItem(UI_KEY, JSON.stringify({ ...cur, ...patch, t: Date.now() })); } catch (e) {}
+}
+
 function App() {
   const [session, setSession] = useState(undefined);
   const [authError, setAuthError] = useState('');
   const [loaded, setLoaded] = useState(false);
 
   const [recipes, setRecipes] = useState([]);
-  const [weekStart, setWeekStartState] = useState(mondayOf(new Date()));
+  const [weekStart, setWeekStartState] = useState(UI_SAVED.weekStart && /^\d{4}-\d{2}-\d{2}$/.test(UI_SAVED.weekStart) ? UI_SAVED.weekStart : mondayOf(new Date()));
   const [weekEntries, setWeekEntriesState] = useState([]);
   const [weekLoading, setWeekLoading] = useState(false);
   const [stores, setStores] = useState(DEFAULT_STORES);
@@ -760,14 +775,14 @@ function App() {
   const [pendingOps, setPendingOps] = useState(QUEUE.length);
   const [online, setOnline] = useState(typeof navigator === 'undefined' ? true : navigator.onLine);
 
-  const [tab, setTab] = useState('planner');
-  const [selectedDay, setSelectedDay] = useState(DAYS[dayIndexOf(todayISO())]);
+  const [tab, setTab] = useState(['planner', 'shopping', 'recipes', 'kast'].includes(UI_SAVED.tab) ? UI_SAVED.tab : 'planner');
+  const [selectedDay, setSelectedDay] = useState(DAYS.includes(UI_SAVED.day) ? UI_SAVED.day : DAYS[dayIndexOf(todayISO())]);
   const [toast, setToast] = useState(null);
   const [mealSheet, setMealSheet] = useState(null);        // { day, meal }
-  const [recipeSheet, setRecipeSheet] = useState(null);    // { id, edit }
+  const [recipeSheet, setRecipeSheet] = useState(UI_SAVED.recipeId ? { id: UI_SAVED.recipeId } : null);    // { id, edit }
   const [addSheet, setAddSheet] = useState(null);          // { category, title, onCreated }
   const [planSheetId, setPlanSheetId] = useState(null);
-  const [storeMode, setStoreMode] = useState(null);        // winkelnaam of '__all__'
+  const [storeMode, setStoreMode] = useState(UI_SAVED.storeMode || null);        // winkelnaam of '__all__'
   const [familyOpen, setFamilyOpen] = useState(false);
   const [accessOpen, setAccessOpen] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
@@ -790,6 +805,20 @@ function App() {
     setToast({ msg, action });
     toastTimer.current = setTimeout(() => setToast(null), action ? 5500 : 2600);
   }
+
+  // ---------- plaats onthouden (zie UI_KEY) ----------
+  useEffect(() => { saveUi({ tab, day: selectedDay, weekStart, storeMode: storeMode || null, recipeId: recipeSheet && !recipeSheet.edit ? recipeSheet.id : null }); },
+    [tab, selectedDay, weekStart, storeMode, recipeSheet]);
+  useEffect(() => {
+    let t;
+    const onScroll = () => { clearTimeout(t); t = setTimeout(() => { let prev = {}; try { prev = JSON.parse(localStorage.getItem(UI_KEY) || '{}').scroll || {}; } catch (e) {} saveUi({ scroll: { ...prev, [tabRef.current]: window.scrollY } }); }, 250); };
+    const onHide = () => { if (document.hidden) saveUi({}); };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    document.addEventListener('visibilitychange', onHide);
+    return () => { window.removeEventListener('scroll', onScroll); document.removeEventListener('visibilitychange', onHide); };
+  }, []);
+  const tabRef = useRef(tab); tabRef.current = tab;
+  const scrollRestored = useRef(false);
 
   // ---------- auth ----------
   useEffect(() => {
@@ -871,6 +900,12 @@ function App() {
   }, [loadWeek, loadShopping, loadMembers, applySettings]);
 
   useEffect(() => { if (session) loadAll(false).then(() => { setLoaded(true); flushQueue(); }); }, [session]); // eslint-disable-line
+  useEffect(() => {
+    if (!loaded || scrollRestored.current) return;
+    scrollRestored.current = true;
+    const y = UI_SAVED.scroll && UI_SAVED.scroll[tab];
+    if (y > 0) window.requestAnimationFrame(() => window.requestAnimationFrame(() => window.scrollTo(0, y)));
+  }, [loaded]); // eslint-disable-line
 
   // Live: wijzigingen van de andere ouder verschijnen meteen (Supabase Realtime).
   useEffect(() => {
