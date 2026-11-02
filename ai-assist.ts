@@ -7,8 +7,9 @@
 //   import_url    - haalt een recept op van een URL en zet het om naar
 //                    Mealio's formaat (eerst gratis via Schema.org-data op
 //                    de pagina zelf, pas als dat niets oplevert via Gemini)
-//   import_photo  - leest een foto van een recept (kookboek, kaartje, …) en
-//                    zet het om naar Mealio's formaat via Gemini vision
+//   import_photo  - leest een recept uit een foto, screenshot(s) of PDF
+//                    ({ files: [{data, mimeType}] }, max 5; oud formaat
+//                    { imageBase64, mimeType } blijft werken) via Gemini
 //   scan_pantry   - herkent voedingsmiddelen op een foto van koelkast/kast
 //
 // Toegang: wie mag, staat in de tabel allowed_emails (beheerbaar in de app);
@@ -146,9 +147,12 @@ function callGeminiVision(prompt, base64, mimeType) {
 }
 
 function importPhotoPrompt() {
-  return `Je krijgt een foto van een recept: bv. een receptenkaart, een pagina uit een
-kookboek, een tijdschriftknipsel of een handgeschreven notitie. Lees de tekst op de
-foto en zet het recept om naar Mealio's formaat.
+  return `Je krijgt één of meer bestanden met samen één recept: een foto (receptenkaart,
+kookboekpagina, tijdschriftknipsel, handgeschreven notitie), screenshots (bv. van een
+website, Instagram of een app) of een PDF. Meerdere bestanden horen bij hetzelfde recept
+(bv. ingrediënten op het ene, bereiding op het andere). Staan er meerdere recepten in,
+neem dan het belangrijkste/eerste. Negeer reclame, menu's, knoppen en commentaren.
+Lees de tekst en zet het recept om naar Mealio's formaat, in het Nederlands.
 Categorie is één van: Hoofdmaaltijd, Salade, Ontbijt, Snack, Dessert, Extra
 (volledige gerechten) of Eiwit, Groenten, Bijgerecht, Saus (als het duidelijk maar
 één onderdeel van een bord is).
@@ -292,9 +296,16 @@ Deno.serve(async (req) => {
       return json(result);
     }
     if (body.task === 'import_photo') {
-      if (!body.imageBase64) throw new Error('Geen foto ontvangen');
-      const result = await callGeminiVision(importPhotoPrompt(), body.imageBase64, body.mimeType);
-      return json({ ...result, method: 'photo' });
+      const ALLOWED = /^(image\/(jpeg|png|webp|heic|heif)|application\/pdf)$/;
+      let files = Array.isArray(body.files) ? body.files : [];
+      if (!files.length && body.imageBase64) files = [{ data: body.imageBase64, mimeType: body.mimeType || 'image/jpeg' }];
+      files = files.filter(f => f && typeof f.data === 'string' && f.data && ALLOWED.test(f.mimeType || '')).slice(0, 5);
+      if (!files.length) throw new Error('Geen foto of PDF ontvangen');
+      const total = files.reduce((n, f) => n + f.data.length, 0);
+      if (total > 18_000_000) throw new Error('Bestanden te groot (samen max ± 13 MB)');
+      const result = await callGeminiParts([{ text: importPhotoPrompt() },
+        ...files.map(f => ({ inline_data: { mime_type: f.mimeType, data: f.data } }))]);
+      return json({ ...result, method: files.some(f => f.mimeType === 'application/pdf') ? 'pdf' : 'photo' });
     }
     if (body.task === 'scan_pantry') {
       if (!body.imageBase64) throw new Error('Geen foto ontvangen');

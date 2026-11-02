@@ -99,7 +99,9 @@ const MEALS = [
 const TYPE_COMPOSE = 'Samenstellen';
 const TYPE_LEFTOVERS = 'Restjes';
 const TYPE_SKIP = 'Overslaan';
-const NO_RECIPE_TYPES = [TYPE_LEFTOVERS, TYPE_SKIP];
+// "Snel noteren": gewoon opschrijven wat je eet ("hamburger, wortel, patatjes"), zonder recept.
+const TYPE_FREE = 'Vrij';
+const NO_RECIPE_TYPES = [TYPE_LEFTOVERS, TYPE_SKIP, TYPE_FREE];
 const STAR_LABELS = {
   1: '± 1x per maand', 2: 'af en toe', 3: 'regelmatig', 4: 'graag vaak', 5: 'mag elke week',
 };
@@ -249,8 +251,15 @@ function slotMode(slot) {
   if (slot.category === TYPE_COMPOSE) return 'compose';
   if (slot.category === TYPE_LEFTOVERS) return 'leftovers';
   if (slot.category === TYPE_SKIP) return 'skip';
+  if (slot.category === TYPE_FREE) return 'free';
   if (slot.category) return 'recipe';
   return 'empty';
+}
+function capFirst(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
+// "hamburger, wortel en patatjes" → ['Hamburger', 'Wortel', 'Patatjes'] (voor de boodschappenlijst)
+function parseFreeItems(text) {
+  return [...new Set((text || '').split(/,|;|\+|\n|\s+en\s+|\s+met\s+|\s*&\s*/i)
+    .map(s => s.trim().replace(/[.!]+$/, '')).filter(Boolean).map(capFirst))];
 }
 function slotRecipes(slot, byId) {
   return [slot.recipeId, ...(slot.componentIds || [])].filter(Boolean).map(id => byId[id]).filter(Boolean);
@@ -263,6 +272,7 @@ function slotCarbs(slot, byId) {
 function slotIsPlanned(slot) {
   const mode = slotMode(slot);
   if (mode === 'skip' || mode === 'leftovers') return true;
+  if (mode === 'free') return !!(slot.notes || '').trim();
   if (mode === 'recipe') return !!slot.recipeId;
   if (mode === 'compose') return (slot.componentIds || []).length > 0;
   return false;
@@ -270,6 +280,7 @@ function slotIsPlanned(slot) {
 function slotSummary(slot, byId) {
   const mode = slotMode(slot);
   if (mode === 'skip') return 'Overgeslagen';
+  if (mode === 'free') return (slot.notes || '').trim() ? '✏️ ' + capFirst(slot.notes.trim()) : '';
   if (mode === 'leftovers') return '🍱 Restjes' + (slot.notes ? ': ' + slot.notes.split('\n')[0].replace(/^Restjes: /, '') : '');
   const titles = slotRecipes(slot, byId).map(r => r.title);
   if (titles.length) return titles.join(' + ');
@@ -280,18 +291,42 @@ function slotSummary(slot, byId) {
 
 // --- boodschappen: eenheden, hoeveelheden, afdelingen ---
 function normUnit(u) { const k = (u || '').trim().toLowerCase(); return UNIT_ALIASES[k] || k; }
-const FRACTION_CHARS = { 0.25: '¼', 0.5: '½', 0.75: '¾' };
-// Stuks rond je naar boven af op een kwart: "0,17 ui" wordt "¼ ui", "2,3 paprika" wordt "2½".
+// Wat je per stuk koopt, rond je naar boven af op een heel getal: 1,25 paprika → 2, 3,75 teentjes → 4.
+const COUNT_UNITS = { '': ['', ''], stuks: ['stuk', 'stuks'], teentje: ['teentje', 'teentjes'], blik: ['blik', 'blikken'], blikje: ['blikje', 'blikjes'],
+  pot: ['pot', 'potten'], bosje: ['bosje', 'bosjes'], zakje: ['zakje', 'zakjes'], pak: ['pak', 'pakken'], bol: ['bol', 'bollen'] };
 function fmtShopAmount(item) {
+  if (item.kind === 'free') return `voor ${item.persons} pers.`;
   if (!item.hasAmount) return item.unit || 'naar smaak';
   const unit = item.unit || '';
-  if (unit === 'stuks' || unit === '') {
-    const q = Math.ceil(item.amount * 4 - 1e-9) / 4;
-    const whole = Math.floor(q), frac = Math.round((q - whole) * 100) / 100;
-    const txt = (whole ? String(whole) : '') + (frac ? FRACTION_CHARS[frac] : '') || '0';
-    return `${txt}${unit ? ' ' + unit : ''}`;
+  if (COUNT_UNITS[unit]) {
+    const n = Math.max(1, Math.ceil(item.amount - 1e-9));
+    const [one, many] = COUNT_UNITS[unit];
+    return `${n}${unit ? ' ' + (n === 1 ? one : many) : ''}`;
   }
-  return `${fmtAmount(item.amount)} ${unit}`.trim();
+  // Gewicht/volume naar winkel-logische stappen: 188 g → 200 g, 1130 g → 1,2 kg
+  if (/^(g|gr|gram|ml|cl|l|kg)$/.test(unit)) {
+    const a = item.amount;
+    const step = a >= 1000 ? 100 : a >= 250 ? 50 : a >= 50 ? 25 : 5;
+    const r = Math.max(step, Math.ceil(a / step - 1e-9) * step);
+    if ((unit === 'g' || unit === 'gr' || unit === 'gram') && r >= 1000) return `${fmtAmount(r / 1000)} kg`;
+    if (unit === 'ml' && r >= 1000) return `${fmtAmount(r / 1000)} l`;
+    if (unit === 'kg' || unit === 'l') return `${fmtAmount(Math.round(a * 10) / 10)} ${unit}`;
+    return `${fmtAmount(r)} ${unit}`;
+  }
+  return `${fmtAmount(Math.round(item.amount))} ${unit}`.trim();
+}
+// Basisvoorraad: zout, peper, olie, kruiden, "naar smaak"… staat bijna altijd in huis en
+// hoort niet tussen de echte boodschappen. Enkel volledige woorden ("bloem" ≠ "bloemkool").
+const BASIC_WORDS = ['zout', 'zeezout', 'peper', 'olie', 'olijfolie', 'zonnebloemolie', 'kokosolie', 'arachideolie', 'boter', 'water', 'azijn',
+  'suiker', 'bloem', 'kruiden', 'italiaanse kruiden', 'provencaalse kruiden', 'mexicaanse kruiden', 'paprikapoeder', 'komijn', 'komijnpoeder',
+  'kurkuma', 'saffraan', 'kaneel', 'oregano', 'tijm', 'nootmuskaat', 'chilipoeder', 'chilivlokken', 'cayennepeper', 'knoflookpoeder',
+  'uienpoeder', 'kerrie', 'kerriepoeder', 'currypoeder', 'laurier', 'laurierblad', 'bakpoeder', 'korianderzaad', 'mosterdzaad'];
+const BASIC_UNITS = ['naar smaak', 'snufje', 'snuifje', 'scheutje', 'mespuntje', 'beetje'];
+function isBasicIngredient(item) {
+  if (item.kind !== 'recipe') return false;
+  if (!item.hasAmount || BASIC_UNITS.includes(normalize(item.unit))) return true;
+  const n = normalize(item.name);
+  return BASIC_WORDS.some(w => new RegExp(`(^|[^a-z])${escapeRe(w)}($|[^a-z])`).test(n));
 }
 const AISLES = ['Groenten & fruit', 'Brood', 'Vlees & vis', 'Zuivel & eieren', 'Kaas & charcuterie', 'Droge voeding',
   'Conserven & sauzen', 'Diepvries', 'Dranken & wijn', 'Huishouden', 'Overig'];
@@ -301,15 +336,19 @@ const AISLE_KEYWORDS = [
   ['Diepvries', ['diepvries', 'bevroren', 'ijs', 'ijsblokjes', 'frietjes', 'diepvriesgroenten']],
   ['Dranken & wijn', ['wijn', 'rode wijn', 'witte wijn', 'cava', 'bier', 'frisdrank', 'cola', 'spuitwater', 'bruiswater', 'plat water', 'fruitsap', 'sinaasappelsap', 'appelsap', 'koffie', 'thee', 'siroop']],
   ['Conserven & sauzen', ['passata', 'tomatensaus', 'tomatenpuree', 'tomatenblokjes', 'kokosmelk', 'kokosroom', 'mayonaise', 'ketchup', 'mosterd', 'azijn', 'balsamico', 'olijfolie', 'olie', 'kokosolie', 'sojasaus', 'tamari', 'pesto', 'kappertjes', 'olijven', 'bouillon', 'blik', 'kikkererwten', 'bonen in blik', 'kidneybonen', 'witte bonen', 'zwarte bonen', 'mais', 'augurk', 'tahin', 'tahini', 'currypasta', 'sambal', 'harissa', 'vissaus', 'worcester', 'tabasco', 'pindakaas', 'notenpasta', 'amandelpasta', 'sesampasta', 'confituur', 'tonijn']],
-  ['Kaas & charcuterie', ['kaas', 'mozzarella', 'mozarella', 'feta', 'parmezaan', 'parmezaanse', 'parmigiano', 'geitenkaas', 'halloumi', 'gruyere', 'cheddar', 'emmentaler', 'brie', 'ham', 'bacon', 'spek', 'spekjes', 'salami', 'chorizo', 'prosciutto', 'serrano', 'charcuterie', 'vegankaas']],
+  ['Kaas & charcuterie', ['kaas', 'mozzarella', 'mozarella', 'feta', 'parmezaan', 'parmezaanse', 'parmigiano', 'geitenkaas', 'halloumi', 'gruyere', 'cheddar', 'emmentaler', 'brie', 'ham', 'hesp', 'gekookte hesp', 'bacon', 'spek', 'spekjes', 'salami', 'chorizo', 'prosciutto', 'serrano', 'charcuterie', 'vegankaas']],
   ['Zuivel & eieren', ['ei', 'eieren', 'eiwit', 'eigeel', 'melk', 'amandelmelk', 'sojamelk', 'yoghurt', 'griekse yoghurt', 'skyr', 'kwark', 'platte kaas', 'room', 'slagroom', 'zure room', 'creme fraiche', 'boter', 'roomboter', 'ghee', 'mascarpone', 'ricotta', 'cottage', 'cottagecheese', 'hüttenkäse', 'huttenkase', 'sojayoghurt', 'cocosyoghurt', 'kokosyoghurt']],
-  ['Vlees & vis', ['kip', 'kipfilet', 'kippengehakt', 'kalkoen', 'rund', 'rundvlees', 'rundergehakt', 'varken', 'varkenshaas', 'gehakt', 'americain', 'lam', 'lamsvlees', 'steak', 'biefstuk', 'entrecote', 'worst', 'worstjes', 'braadworst', 'zalm', 'makreel', 'kabeljauw', 'vis', 'witte vis', 'zeebaars', 'dorade', 'garnalen', 'gamba', 'scampi', 'mosselen', 'inktvis', 'tofu', 'tempe', 'tempeh', 'quorn', 'seitan', 'vleesvervanger', 'filet']],
+  ['Vlees & vis', ['hamburger', 'hamburgers', 'burger', 'kip', 'kipfilet', 'kippengehakt', 'kalkoen', 'rund', 'rundvlees', 'rundergehakt', 'varken', 'varkenshaas', 'gehakt', 'americain', 'lam', 'lamsvlees', 'steak', 'biefstuk', 'entrecote', 'worst', 'worstjes', 'braadworst', 'zalm', 'makreel', 'kabeljauw', 'vis', 'witte vis', 'zeebaars', 'dorade', 'garnalen', 'gamba', 'scampi', 'mosselen', 'inktvis', 'tofu', 'tempe', 'tempeh', 'quorn', 'seitan', 'vleesvervanger', 'filet']],
   ['Brood', ['brood', 'pistolet', 'baguette', 'stokbrood', 'ciabatta', 'croissant', 'wrap', 'wraps', 'tortilla', 'pita', 'naan', 'beschuit', 'toast', 'koffiekoek']],
   ['Droge voeding', ['rijst', 'pasta', 'spaghetti', 'noedels', 'quinoa', 'couscous', 'bulgur', 'bloem', 'meel', 'amandelmeel', 'kokosmeel', 'havermout', 'granola', 'muesli', 'noten', 'amandel', 'amandelen', 'walnoten', 'cashew', 'pecan', 'hazelnoot', 'pinda', 'zaden', 'lijnzaad', 'chiazaad', 'sesam', 'pompoenpitten', 'zonnebloempitten', 'kruiden', 'italiaanse kruiden', 'provencaalse kruiden', 'komijn', 'paprikapoeder', 'kerrie', 'curry', 'kurkuma', 'kaneel', 'oregano', 'tijm', 'nootmuskaat', 'chilipoeder', 'cayenne', 'knoflookpoeder', 'uienpoeder', 'zout', 'zeezout', 'peper', 'suiker', 'honing', 'cacao', 'chocolade', 'bakpoeder', 'gist', 'vanille', 'rozijnen', 'kokosrasp', 'linzen', 'gedroogde', 'stevia', 'erythritol', 'psyllium']],
-  ['Groenten & fruit', ['ui', 'uien', 'rode ui', 'sjalot', 'look', 'knoflook', 'tomaat', 'tomaten', 'cherrytomaat', 'kerstomaat', 'courgette', 'paprika', 'wortel', 'wortelen', 'wortels', 'broccoli', 'bloemkool', 'spinazie', 'sla', 'kropsla', 'ijsbergsla', 'veldsla', 'rucola', 'komkommer', 'avocado', 'citroen', 'limoen', 'appel', 'peer', 'banaan', 'aardbei', 'aardbeien', 'bessen', 'blauwe bessen', 'frambozen', 'druiven', 'kiwi', 'mango', 'ananas', 'sinaasappel', 'champignon', 'champignons', 'portobello', 'shiitake', 'prei', 'selder', 'bleekselderij', 'venkel', 'kool', 'rode kool', 'witte kool', 'boerenkool', 'spruitjes', 'groene kool', 'aubergine', 'peterselie', 'basilicum', 'koriander', 'munt', 'dille', 'bieslook', 'rozemarijn', 'gember', 'chilipeper', 'pepers', 'aardappel', 'aardappelen', 'zoete aardappel', 'asperge', 'asperges', 'radijs', 'radijsjes', 'raap', 'raapjes', 'pompoen', 'biet', 'rode biet', 'bosui', 'lente-ui', 'postelein', 'kiemen', 'kiemscheuten', 'sperziebonen', 'boontjes', 'erwten', 'peultjes', 'papaya', 'vijgen', 'granaatappel', 'fruit', 'groenten', 'seizoensfruit']],
+  ['Groenten & fruit', ['patatten', 'krieltjes', 'ui', 'uien', 'rode ui', 'sjalot', 'look', 'knoflook', 'tomaat', 'tomaten', 'cherrytomaat', 'kerstomaat', 'courgette', 'paprika', 'wortel', 'wortelen', 'wortels', 'broccoli', 'bloemkool', 'spinazie', 'sla', 'kropsla', 'ijsbergsla', 'veldsla', 'rucola', 'komkommer', 'avocado', 'citroen', 'limoen', 'appel', 'peer', 'banaan', 'aardbei', 'aardbeien', 'bessen', 'blauwe bessen', 'frambozen', 'druiven', 'kiwi', 'mango', 'ananas', 'sinaasappel', 'champignon', 'champignons', 'portobello', 'shiitake', 'prei', 'selder', 'bleekselderij', 'venkel', 'kool', 'rode kool', 'witte kool', 'boerenkool', 'spruitjes', 'groene kool', 'aubergine', 'peterselie', 'basilicum', 'koriander', 'munt', 'dille', 'bieslook', 'rozemarijn', 'gember', 'chilipeper', 'pepers', 'aardappel', 'aardappelen', 'zoete aardappel', 'asperge', 'asperges', 'radijs', 'radijsjes', 'raap', 'raapjes', 'pompoen', 'biet', 'rode biet', 'bosui', 'lente-ui', 'postelein', 'kiemen', 'kiemscheuten', 'sperziebonen', 'boontjes', 'erwten', 'peultjes', 'papaya', 'vijgen', 'granaatappel', 'fruit', 'groenten', 'seizoensfruit']],
 ];
 function guessAisle(name) {
   const n = normalize(name);
+  // eerst een volledig woord ("hamburger" → vlees), pas daarna een woordbegin ("ham…" → charcuterie)
+  for (const [aisle, words] of AISLE_KEYWORDS) {
+    if (words.some(w => new RegExp(`(^|[^a-z0-9])${escapeRe(normalize(w))}($|[^a-z0-9])`).test(n))) return aisle;
+  }
   for (const [aisle, words] of AISLE_KEYWORDS) {
     for (const w of words) {
       const k = normalize(w);
@@ -1237,6 +1276,15 @@ function App() {
           map[k].uses.add(recipe.title);
         });
       });
+      // snel genoteerde maaltijd: elk onderdeel komt als los item op de lijst
+      if (slotMode(slot) === 'free') {
+        parseFreeItems(slot.notes).forEach(name => {
+          const k = `free:${name.toLowerCase()}`;
+          if (!map[k]) map[k] = { key: k, kind: 'free', name, unit: '', amount: 0, hasAmount: false, persons: 0, uses: new Set() };
+          map[k].persons += slot.persons || 1;
+          map[k].uses.add(`${DAY_SHORT[DAYS.indexOf(day)]} ${key.toLowerCase()}`);
+        });
+      }
     }));
     const stockNorm = pantryStock.filter(p => p.inStock).map(p => normalize(p.name));
     const validStore = (s) => (s && stores.includes(s) ? s : '');
@@ -1248,7 +1296,7 @@ function App() {
       ...extraRows.map(r => ({ key: `extra:${r.id}`, kind: 'extra', extraId: r.id, name: r.name, unit: '', amount: 0, hasAmount: false, uses: [],
         store: validStore(r.store), aisle: aisleOf(r.name, r.aisle), state: r.checked ? 'cart' : null })),
     ];
-    return list.map(i => ({ ...i, inKast: i.kind !== 'extra' && stockNorm.length > 0 && ingredientMatches(i.name, stockNorm) }))
+    return list.map(i => ({ ...i, basic: isBasicIngredient(i), inKast: i.kind !== 'extra' && stockNorm.length > 0 && ingredientMatches(i.name, stockNorm) }))
       .sort((a, b) => a.name.localeCompare(b.name));
   }, [weekmenu, recipesById, staples, extraRows, checks, itemStoreMap, itemAisleMap, pantryStock, stores]);
 
@@ -1382,7 +1430,7 @@ function App() {
 
   const myEmail = session.user && session.user.email;
   const aiTargetCount = aiWeekTargets(weekmenu).length;
-  const shoppingTodo = shoppingItems.filter(i => !i.state).length;
+  const shoppingTodo = shoppingItems.filter(i => !i.state && !i.basic).length;
   const openMealSlot = mealSheet ? weekmenu[mealSheet.day][mealSheet.meal] : null;
   const openRecipe = recipeSheet ? recipesById[recipeSheet.id] : null;
   const weekNav = {
@@ -1730,6 +1778,12 @@ function MealCard({ meal, slot, recipesById, members, onOpen, onToggleLock, onFe
           <div className="border-2 border-dashed border-line rounded-xl py-3 text-center text-sm font-extrabold text-sage">+ Plan deze maaltijd</div>
         )}
         {mode === 'skip' && <div className="text-sm font-semibold text-stone-400">⏭ Overgeslagen — niets te kopen</div>}
+        {mode === 'free' && (
+          <div>
+            <div className="text-[15px] font-extrabold text-ink leading-snug">✏️ {capFirst((slot.notes || '').trim()) || 'Nog niets genoteerd'}</div>
+            <div className="text-[11px] font-bold text-stone-500 mt-1">Snel genoteerd · staat op de boodschappenlijst</div>
+          </div>
+        )}
         {mode === 'leftovers' && (
           <div>
             <div className="text-sm font-bold text-ink">🍱 Restjes{slot.notes ? <span className="font-semibold text-stone-500"> · {slot.notes.split('\n')[0].replace(/^Restjes: /, '')}</span> : null}</div>
@@ -1911,6 +1965,73 @@ function DoubleCookBlock({ day, meal, slot, weekmenu, recipesById, onPick, onUnd
   );
 }
 
+// Lege maaltijd: één veld om een recept te zoeken óf gewoon te noteren wat jullie eten.
+// Tik op een recept = ingepland en klaar. Geen recept? "Noteer …" zet het als snelle notitie.
+function QuickPick({ recipes, meal, onPickRecipe, onSaveNote }) {
+  const [text, setText] = useState('');
+  const qn = normalize(text);
+  const prefer = meal === 'Ontbijt' ? ['Ontbijt'] : ['Hoofdmaaltijd', 'Salade'];
+  const list = useMemo(() => {
+    let l = qn
+      ? recipes.filter(r => normalize(r.title).includes(qn) || (qn.length >= 3 && (r.ingredients || []).some(i => normalize(i.name).includes(qn))))
+      : recipes.filter(r => prefer.includes(r.category));
+    return [...l].sort((a, b) => (qn ? (normalize(b.title).startsWith(qn) - normalize(a.title).startsWith(qn)) : 0)
+      || (b.stars || 0) - (a.stars || 0) || a.title.localeCompare(b.title)).slice(0, qn ? 8 : 5);
+  }, [recipes, qn, meal]); // eslint-disable-line
+  return (
+    <div className="space-y-2 mb-5">
+      <label htmlFor="quickpick" className="block text-base font-black text-deep">Wat eten jullie?</label>
+      <div className="relative">
+        <Icon name="search" size={17} className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-400" />
+        <input id="quickpick" value={text} onChange={(e) => setText(e.target.value)} enterKeyHint="done"
+          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); if (text.trim() && !list.length) onSaveNote(text); else e.target.blur(); } }}
+          placeholder="Zoek een recept, of typ bv. hamburger, wortel" className={cx(inputCls, 'pl-9 py-3 text-base')} />
+      </div>
+      <div className="rounded-2xl border border-line bg-white divide-y divide-line/70 overflow-hidden">
+        {!qn && list.length > 0 && <div className="px-3.5 pt-2.5 pb-1 text-[11px] font-extrabold uppercase tracking-wide text-stone-500">Vaak gekozen</div>}
+        {list.map(r => (
+          <button key={r.id} onClick={() => onPickRecipe(r)} className="w-full flex items-center gap-3 px-3.5 py-3 text-left active:bg-mist">
+            <span className="text-lg w-6 text-center">{catMeta(r.category).emoji}</span>
+            <span className="flex-1 min-w-0">
+              <span className="block text-[15px] font-bold text-ink truncate">{r.title}</span>
+              <span className="block text-[11px] text-stone-500">{catShort(r.category)}{r.stars ? ' · ' + '★'.repeat(r.stars) : ''}</span>
+            </span>
+            <span className="text-xs font-black text-forest bg-mint rounded-full px-3 py-1.5">Kies</span>
+          </button>
+        ))}
+        {qn && (
+          <button onClick={() => onSaveNote(text)} className="w-full flex items-center gap-3 px-3.5 py-3 text-left active:bg-mist">
+            <span className="text-lg w-6 text-center">✏️</span>
+            <span className="flex-1 min-w-0">
+              <span className="block text-[15px] font-bold text-ink truncate">Noteer "{text.trim()}"</span>
+              <span className="block text-[11px] text-stone-500">Zonder recept · elk deel komt op de boodschappenlijst</span>
+            </span>
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Eén veld om snel te noteren wat jullie eten. Bewaart bij Enter, bij "Noteren" en bij het verlaten van het veld.
+function QuickNote({ value, onSave }) {
+  const [text, setText] = useState(value || '');
+  const dirty = text.trim() !== (value || '').trim();
+  return (
+    <div className="rounded-2xl border border-line bg-white p-3.5 space-y-2">
+      <label htmlFor="quicknote" className="block text-sm font-extrabold text-deep">✏️ Wat eten jullie?</label>
+      <div className="flex gap-2">
+        <input id="quicknote" value={text} onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); onSave(text); e.target.blur(); } }}
+          onBlur={() => { if (dirty) onSave(text); }}
+          placeholder="bv. hamburger, wortel, patatjes" enterKeyHint="done" className={cx(inputCls, 'text-base')} />
+        <Btn onClick={() => onSave(text)} disabled={!text.trim() || !dirty} className="shrink-0">Noteren</Btn>
+      </div>
+      <div className="text-[11px] text-stone-500">Geen recept nodig. Scheid met komma's: elk deel komt op de boodschappenlijst.</div>
+    </div>
+  );
+}
+
 function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, aiBusy, members, onChange, onClear, onCookDouble, onUndoDouble, onAiFill, onOpenRecipe, onCreateRecipe, onClose }) {
   const mealDef = MEALS.find(m => m.key === meal);
   const mode = slotMode(slot);
@@ -1921,14 +2042,33 @@ function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, 
   function setMode(next) {
     if (next === mode) return;
     setOpenRow(null);
+    // een snelle notitie hoort niet mee te verhuizen naar een andere soort maaltijd
+    const base = mode === 'free' ? { ...reset, notes: '' } : reset;
     if (next === 'compose') {
       const ids = [...new Set([slot.recipeId, ...slot.componentIds].filter(Boolean))];
-      onChange({ ...reset, category: TYPE_COMPOSE, recipeId: '', componentIds: ids, locked: ids.length > 0 });
+      onChange({ ...base, category: TYPE_COMPOSE, recipeId: '', componentIds: ids, locked: ids.length > 0 });
     } else if (next === 'recipe') {
-      onChange({ ...reset, category: meal === 'Ontbijt' ? 'Ontbijt' : 'Hoofdmaaltijd', recipeId: '', locked: false });
+      onChange({ ...base, category: meal === 'Ontbijt' ? 'Ontbijt' : 'Hoofdmaaltijd', recipeId: '', locked: false });
       setChangingRecipe(true);
-    } else if (next === 'leftovers') onChange({ ...reset, category: TYPE_LEFTOVERS, recipeId: '', componentIds: [], locked: true });
-    else if (next === 'skip') onChange({ ...reset, category: TYPE_SKIP, recipeId: '', componentIds: [], notes: '', locked: true });
+    } else if (next === 'leftovers') onChange({ ...base, category: TYPE_LEFTOVERS, recipeId: '', componentIds: [], locked: true });
+    else if (next === 'skip') onChange({ ...base, category: TYPE_SKIP, recipeId: '', componentIds: [], notes: '', locked: true });
+    else if (next === 'free') onChange({ ...reset, category: TYPE_FREE, recipeId: '', componentIds: [], notes: '', locked: true });
+  }
+  function saveNote(text) {
+    const v = (text || '').trim();
+    if (!v && mode !== 'free') return;
+    onChange({ ...reset, category: TYPE_FREE, recipeId: '', componentIds: [], notes: v, locked: true });
+  }
+  function pickRecipe(r) {
+    if (isComponent(r.category)) onChange({ ...reset, category: TYPE_COMPOSE, recipeId: '', componentIds: [r.id], notes: '', locked: true });
+    else onChange({ ...reset, category: r.category || 'Hoofdmaaltijd', recipeId: r.id, componentIds: [], notes: '', locked: true });
+    onClose();
+  }
+  function noteToRecipe() {
+    const cat = meal === 'Ontbijt' ? 'Ontbijt' : 'Hoofdmaaltijd';
+    onCreateRecipe({ category: cat, title: capFirst((slot.notes || '').trim()),
+      ingredients: parseFreeItems(slot.notes).map(name => ({ name, amount: null, unit: '' })),
+      onCreated: (id) => onChange({ ...reset, category: cat, recipeId: id, componentIds: [], notes: '', locked: true }) });
   }
   // zelf kiezen = automatisch "vast", zodat de AI het niet overschrijft
   function setComponents(ids) { onChange({ ...reset, componentIds: ids, locked: ids.length > 0 }); }
@@ -1961,6 +2101,12 @@ function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, 
         </button>
       </div>
 
+      {mode === 'empty' && (
+        <>
+          <QuickPick recipes={recipes} meal={meal} onPickRecipe={pickRecipe} onSaveNote={(t) => { saveNote(t); onClose(); }} />
+          <div className="text-[11px] font-extrabold uppercase tracking-wide text-stone-500 mb-1.5">Of kies</div>
+        </>
+      )}
       <div className="grid grid-cols-4 gap-1.5 mb-5">
         {MODES.map(m => (
           <button key={m.value} onClick={() => setMode(m.value)}
@@ -1972,11 +2118,26 @@ function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, 
         ))}
       </div>
 
-      {mode === 'empty' && (
-        <div className="text-center text-sm text-stone-500 px-4 py-6">
-          Kies hierboven hoe je deze maaltijd wil plannen.<br />
-          <span className="text-xs">Tip: met <b>🧩 Samenstellen</b> combineer je bv. kip + broccoli + aardappelen.</span>
+
+      {mode === 'free' && (
+        <div className="space-y-3">
+          <QuickNote value={slot.notes || ''} onSave={saveNote} />
+          {parseFreeItems(slot.notes).length > 0 && (
+            <div className="rounded-2xl bg-mist px-3.5 py-3">
+              <div className="text-[11px] font-extrabold text-forest mb-1.5">🛒 Komt op de boodschappenlijst</div>
+              <div className="flex flex-wrap gap-1.5">
+                {parseFreeItems(slot.notes).map(n => <span key={n} className="rounded-full bg-white border border-line px-2.5 py-1 text-xs font-bold text-ink">{n}</span>)}
+              </div>
+              <div className="text-[11px] text-stone-500 mt-1.5">Heb je iets al in huis? Tik dan in de boodschappenlijst op "Heb ik al".</div>
+            </div>
+          )}
+          {(slot.notes || '').trim() && (
+            <Btn variant="secondary" className="w-full" icon="book" onClick={noteToRecipe}>Toch bewaren als recept</Btn>
+          )}
         </div>
+      )}
+      {(mode === 'recipe' || mode === 'compose') && (
+        <button onClick={() => setMode('free')} className="w-full -mt-3 mb-4 text-xs font-extrabold text-sage py-2">✏️ Gewoon noteren, zonder recept</button>
       )}
 
       {mode === 'compose' && (
@@ -2142,34 +2303,47 @@ function groupByAisle(items, order) {
   return groups.filter(g => g.items.length);
 }
 
+// Boodschappen — thuis: tik aan wat je al in huis hebt, de rest koop je.
+// In de winkel: "Ik ben in de winkel" (afvinken = in de kar). Winkel/afdeling aanpassen zit achter één knop.
 function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendingOps, onToggle, onSetHave, onAssignStore, onAssignAisle, onRemoveItem,
   onAddExtra, onStoreMode, onNewRound, onAddStore, onRenameStore, onRemoveStore, onSetAisleOrder, onAddStaple, onUpdateStaple, onDeleteStaple, showToast }) {
   const [extraName, setExtraName] = useState('');
-  const [extraStore, setExtraStore] = useState('');
   const [showStores, setShowStores] = useState(false);
   const [showStaples, setShowStaples] = useState(false);
   const [pickStore, setPickStore] = useState(false);
   const [editItem, setEditItem] = useState(null);
-  const [openDone, setOpenDone] = useState({});
+  const [arrange, setArrange] = useState(false);
+  const [open, setOpen] = useState({});
 
-  const groups = {};
-  [...stores, '__none__'].forEach(s => { groups[s] = []; });
-  items.forEach(i => { (i.store && groups[i.store] ? groups[i.store] : groups.__none__).push(i); });
-  const active = items.filter(i => i.state !== 'have');
-  const total = active.length;
-  const done = active.filter(i => i.state === 'cart').length;
+  const todo = items.filter(i => !i.state && !i.basic);
+  const have = items.filter(i => i.state === 'have');
+  const cart = items.filter(i => i.state === 'cart');
+  const basics = items.filter(i => i.basic && !i.state);
 
-  function addExtra() { if (onAddExtra(extraName, extraStore)) setExtraName(''); }
+  // te kopen: per winkel (enkel winkels met items), daarbinnen per afdeling
+  const byStore = {};
+  todo.forEach(i => { const k = i.store && stores.includes(i.store) ? i.store : '__none__'; (byStore[k] = byStore[k] || []).push(i); });
+  const storeKeys = [...stores.filter(s => byStore[s]), ...(byStore.__none__ ? ['__none__'] : [])];
+  const onlyNone = storeKeys.length === 1 && storeKeys[0] === '__none__';
+
+  function addExtra() { if (onAddExtra(extraName, '')) setExtraName(''); }
+  function tapItem(i) {
+    if (arrange && i.kind !== 'extra') { setEditItem(i); return; }
+    if (i.kind === 'extra') onToggle(i);            // los item: afgehandeld
+    else onSetHave(i, true);                        // heb ik al
+  }
+  function undo(i) { if (i.state === 'have') onSetHave(i, false); else onToggle(i); }
+  // basisvoorraad toch nodig? → komt als los item op de lijst
+  function needBasic(i) {
+    if (onAddExtra(i.name, i.store || '', i.aisle)) { onSetHave(i, true); showToast(`"${i.name}" staat op de lijst`); }
+  }
 
   async function share() {
     const lines = [`🛒 Boodschappen — week ${isoWeekNumber(nav.weekStart)}`];
-    [...stores, '__none__'].forEach(s => {
-      const todo = groups[s].filter(i => !i.state);
-      if (!todo.length) return;
-      lines.push('', `*${s === '__none__' ? 'Overige' : s}*`);
-      groupByAisle(todo, aisleOrderFor(s, storeAisles)).forEach(g => {
-        lines.push(`_${g.aisle}_`);
-        g.items.forEach(i => lines.push(`☐ ${i.name}${i.kind === 'recipe' ? ' — ' + fmtShopAmount(i) : ''}`));
+    storeKeys.forEach(s => {
+      lines.push('', `*${s === '__none__' ? (onlyNone ? 'Te kopen' : 'Zonder winkel') : s}*`);
+      groupByAisle(byStore[s], aisleOrderFor(s === '__none__' ? '' : s, storeAisles)).forEach(g => {
+        g.items.forEach(i => lines.push(`☐ ${i.name}${i.kind === 'recipe' || i.kind === 'free' ? ' — ' + fmtShopAmount(i) : ''}`));
       });
     });
     const text = lines.join('\n');
@@ -2179,104 +2353,117 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
     } catch (e) { /* delen geannuleerd */ }
   }
 
-  const storeCounts = {};
-  [...stores, '__none__'].forEach(s => { storeCounts[s] = groups[s].filter(i => !i.state).length; });
+  const Fold = ({ id, label, list, hint, onTap, action }) => list.length > 0 && (
+    <Card className="overflow-hidden">
+      <button onClick={() => setOpen({ ...open, [id]: !open[id] })} className="w-full px-4 py-3 flex items-center justify-between text-sm font-extrabold text-stone-600 bg-cream/60">
+        <span>{label} ({list.length})</span><Icon name="down" size={16} className={open[id] ? 'rotate-180' : ''} />
+      </button>
+      {open[id] && (
+        <>
+          {hint && <div className="px-4 pt-2 text-[12px] text-stone-500">{hint}</div>}
+          <div className="divide-y divide-line/70">
+            {list.map(i => (
+              <button key={i.key} onClick={() => onTap(i)} className="w-full px-4 py-3 flex items-center gap-3 text-left active:bg-mist">
+                <span className={cx('flex-1 min-w-0 text-[15px] font-semibold truncate', action ? 'text-ink' : 'text-stone-500 line-through')}>{i.name}</span>
+                <span className="shrink-0 text-xs font-extrabold text-forest bg-mint rounded-full px-3 py-1.5">{action || 'Terugzetten'}</span>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </Card>
+  );
 
   return (
     <div>
       <PageHeader eyebrow={`Week ${isoWeekNumber(nav.weekStart)} · ${fmtWeekRange(nav.weekStart)}`} title="Boodschappen"
-        right={<><IconBtn name="share" onClick={share} title="Delen" className="bg-white border border-line" /><IconBtn name="settings" onClick={() => setShowStores(true)} title="Winkels & afdelingen" className="bg-white border border-line" /></>} />
+        right={<><IconBtn name="share" onClick={share} title="Delen" className="bg-white border border-line w-11 h-11" /><IconBtn name="settings" onClick={() => setShowStores(true)} title="Winkels & afdelingen" className="bg-white border border-line w-11 h-11" /></>} />
 
-      {total > 0 && (
+      {todo.length > 0 && (
         <button onClick={() => setPickStore(true)}
           className="w-full mb-3 rounded-2xl bg-gradient-to-br from-deep to-forest text-white p-4 flex items-center gap-3 text-left shadow-card active:scale-[.99] transition">
           <div className="w-11 h-11 rounded-xl bg-white/10 flex items-center justify-center"><Icon name="cart" size={22} /></div>
           <div className="flex-1">
             <div className="text-[15px] font-black">Ik ben in de winkel</div>
-            <div className="text-[11px] text-white/70">Grote vinkjes, afdeling per afdeling — het scherm blijft aan.</div>
+            <div className="text-[12px] text-white/80">Afvinken wat in de kar ligt — het scherm blijft aan.</div>
           </div>
           <Icon name="right" size={18} className="text-white/60" />
         </button>
       )}
 
-      {total > 0 && (
-        <Card className="p-4 mb-3">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-sm font-extrabold text-deep">{done} van {total} in de kar</span>
-            <button onClick={onNewRound} className="text-xs font-extrabold text-sage flex items-center gap-1"><Icon name="refresh" size={13} />Nieuwe ronde</button>
-          </div>
-          <div className="h-2 rounded-full bg-mist overflow-hidden"><div className="h-full bg-sage rounded-full transition-all" style={{ width: `${total ? (done / total) * 100 : 0}%` }} /></div>
-          {(!online || pendingOps > 0) && <div className="text-[11px] font-bold text-amber-700 mt-2">{online ? '⏳ Wijzigingen worden verstuurd…' : '📴 Offline — wordt later gesynchroniseerd'}</div>}
-        </Card>
+      <Card className="p-2 mb-3 flex gap-1.5">
+        <input value={extraName} onChange={(e) => setExtraName(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') addExtra(); }}
+          placeholder="Iets toevoegen, bv. wc-papier" aria-label="Iets toevoegen aan de lijst"
+          className="flex-1 min-w-0 bg-transparent px-2 py-2.5 text-base placeholder:text-stone-400 border-0 focus:shadow-none" />
+        <button onClick={addExtra} aria-label="Toevoegen" className="w-11 h-11 rounded-xl bg-forest text-white flex items-center justify-center"><Icon name="plus" /></button>
+      </Card>
+
+      {(!online || pendingOps > 0) && <div className="text-[12px] font-bold text-amber-800 mb-3 px-1">{online ? '⏳ Wijzigingen worden verstuurd…' : '📴 Offline — wordt later gesynchroniseerd'}</div>}
+
+      {items.length === 0 && <EmptyState emoji="🧺" title="Je lijst is nog leeg" text="Plan maaltijden in de Planner — wat je nodig hebt, verschijnt hier vanzelf." />}
+
+      {todo.length > 0 && (
+        <div className="flex items-center justify-between gap-2 px-1 mb-2">
+          <div className="text-sm font-black text-deep">{todo.length} te kopen</div>
+          <button onClick={() => setArrange(!arrange)} className={cx('text-xs font-extrabold rounded-full px-3 py-2', arrange ? 'bg-forest text-white' : 'text-forest bg-mint')}>
+            {arrange ? '✓ Klaar met aanpassen' : 'Winkel of afdeling aanpassen'}
+          </button>
+        </div>
+      )}
+      {todo.length > 0 && (
+        <p className="text-[13px] text-stone-600 px-1 mb-3">
+          {arrange ? 'Tik op een item om de winkel of afdeling te kiezen. De app onthoudt dat.' : 'Tik aan wat je al in huis hebt. Wat overblijft, koop je.'}
+        </p>
       )}
 
-      <Card className="p-2 mb-2 flex gap-1.5">
-        <input value={extraName} onChange={(e) => setExtraName(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') addExtra(); }}
-          placeholder="Iets extra? bv. wc-papier" className="flex-1 min-w-0 bg-transparent px-2 py-2 text-sm placeholder:text-stone-300 border-0 focus:shadow-none" />
-        <select value={extraStore} onChange={(e) => setExtraStore(e.target.value)} className="bg-mist rounded-xl px-2 text-xs font-bold text-forest border-0 max-w-[6.5rem]">
-          <option value="">Winkel…</option>
-          {stores.map(s => <option key={s} value={s}>{s}</option>)}
-        </select>
-        <button onClick={addExtra} className="w-10 rounded-xl bg-forest text-white flex items-center justify-center"><Icon name="plus" /></button>
-      </Card>
-      <button onClick={() => setShowStaples(true)} className="w-full mb-4 flex items-center gap-2 px-3 py-2 text-xs font-extrabold text-forest">
-        <Icon name="pin" size={14} />Vaste items (elke week){staples.length ? ` · ${staples.filter(s => s.active).length} actief` : ''}<Icon name="right" size={14} className="ml-auto text-stone-300" />
-      </button>
-
-      {items.length === 0 && <EmptyState emoji="🧺" title="Je lijst is nog leeg" text="Plan maaltijden in de Planner — de ingrediënten verschijnen hier vanzelf, per winkel en afdeling." />}
-
       <div className="space-y-3">
-        {[...stores, '__none__'].map(s => {
-          const list = groups[s];
-          if (!list.length) return null;
-          const todo = list.filter(i => !i.state);
-          const cart = list.filter(i => i.state === 'cart');
-          const have = list.filter(i => i.state === 'have');
-          const isNone = s === '__none__';
-          const open = openDone[s] || {};
-          return (
-            <Card key={s} className="overflow-hidden">
-              <div className={cx('px-4 py-2.5 flex items-center justify-between', isNone ? 'bg-amber-50' : 'bg-mist')}>
-                <span className="text-sm font-black text-deep">{isNone ? 'Nog geen winkel' : s}</span>
-                <span className="text-[11px] font-bold text-stone-500">{todo.length ? `${todo.length} te halen` : 'alles binnen ✓'}</span>
+        {storeKeys.map(s => (
+          <Card key={s} className="overflow-hidden">
+            {!onlyNone && (
+              <div className="px-4 py-2.5 flex items-center justify-between bg-mist">
+                <span className="text-sm font-black text-deep">{s === '__none__' ? 'Zonder winkel' : s}</span>
+                <span className="text-[12px] font-bold text-stone-600">{byStore[s].length}</span>
               </div>
-              {groupByAisle(todo, aisleOrderFor(isNone ? '' : s, storeAisles)).map(g => (
-                <div key={g.aisle}>
-                  <div className="px-4 pt-2 pb-1 text-[10px] font-black uppercase tracking-wider text-stone-400">{g.aisle}</div>
-                  <div className="divide-y divide-line/70">
-                    {g.items.map(i => <ShoppingRow key={i.key} item={i} stores={stores} showAssign={isNone}
-                      onToggle={() => onToggle(i)} onAssign={(st) => onAssignStore(i, st)} onHave={() => onSetHave(i, true)} onEdit={() => setEditItem(i)} />)}
-                  </div>
+            )}
+            {groupByAisle(byStore[s], aisleOrderFor(s === '__none__' ? '' : s, storeAisles)).map(g => (
+              <div key={g.aisle}>
+                <div className="px-4 pt-2.5 pb-1 text-[11px] font-black uppercase tracking-wider text-stone-500">{g.aisle}</div>
+                <div className="divide-y divide-line/70">
+                  {g.items.map(i => <ShoppingRow key={i.key} item={i} arrange={arrange} onTap={() => tapItem(i)} onRemove={() => onRemoveItem(i)} />)}
                 </div>
-              ))}
-              {[['cart', cart, '🛒 In de kar'], ['have', have, '🥫 Heb ik al']].map(([k, arr, label]) => arr.length > 0 && (
-                <div key={k}>
-                  <button onClick={() => setOpenDone({ ...openDone, [s]: { ...open, [k]: !open[k] } })} className="w-full px-4 py-2 flex items-center justify-between text-[11px] font-extrabold text-stone-400 border-t border-line/70 bg-cream/60">
-                    <span>{label} ({arr.length})</span><Icon name="down" size={14} className={open[k] ? 'rotate-180' : ''} />
-                  </button>
-                  {open[k] && <div className="divide-y divide-line/70">{arr.map(i => <ShoppingRow key={i.key} item={i} stores={stores}
-                    onToggle={() => k === 'have' ? onSetHave(i, false) : onToggle(i)} onEdit={() => setEditItem(i)} />)}</div>}
-                </div>
-              ))}
-            </Card>
-          );
-        })}
+              </div>
+            ))}
+          </Card>
+        ))}
+
+        <Fold id="have" label="🏠 Al in huis" list={have} hint="Tik om terug op de lijst te zetten." onTap={undo} />
+        <Fold id="basics" label="🧂 Meestal in huis" list={basics} hint="Zout, peper, olie, kruiden… Tik als je het toch moet kopen." onTap={needBasic} action="Toch kopen" />
+        <Fold id="cart" label="🛒 In de kar" list={cart} hint="Tik om terug op de lijst te zetten." onTap={undo} />
+      </div>
+
+      <div className="mt-5 flex flex-wrap gap-2 justify-between items-center px-1">
+        <button onClick={() => setShowStaples(true)} className="flex items-center gap-1.5 text-[13px] font-extrabold text-forest py-2">
+          <Icon name="pin" size={15} />Vaste items{staples.length ? ` (${staples.filter(s => s.active).length})` : ''}
+        </button>
+        {(cart.length > 0 || have.length > 0) && (
+          <button onClick={onNewRound} className="flex items-center gap-1.5 text-[13px] font-extrabold text-forest py-2"><Icon name="refresh" size={15} />Nieuwe ronde</button>
+        )}
       </div>
 
       {pickStore && (
-        <Sheet title="In welke winkel ben je?" subtitle="Je ziet enkel wat je daar moet halen (plus items zonder winkel)" onClose={() => setPickStore(false)}>
+        <Sheet title="In welke winkel ben je?" subtitle="Je ziet wat je daar moet halen, plus wat nog geen winkel heeft" onClose={() => setPickStore(false)}>
           <div className="space-y-2">
-            {stores.map(s => (
+            {stores.filter(s => byStore[s]).map(s => (
               <button key={s} onClick={() => { setPickStore(false); onStoreMode(s); }}
                 className="w-full flex items-center justify-between rounded-2xl border border-line bg-white px-4 py-3.5 text-left active:bg-mist">
                 <span className="text-[15px] font-extrabold text-deep">{s}</span>
-                <span className="text-xs font-bold text-stone-400">{storeCounts[s] + storeCounts.__none__} te halen</span>
+                <span className="text-xs font-bold text-stone-500">{byStore[s].length + (byStore.__none__ || []).length} te halen</span>
               </button>
             ))}
             <button onClick={() => { setPickStore(false); onStoreMode('__all__'); }}
               className="w-full flex items-center justify-between rounded-2xl border-2 border-dashed border-line px-4 py-3.5 text-left active:bg-mist">
-              <span className="text-[15px] font-extrabold text-forest">Alles (alle winkels)</span>
-              <span className="text-xs font-bold text-stone-400">{Object.values(storeCounts).reduce((a, b) => a + b, 0)} te halen</span>
+              <span className="text-[15px] font-extrabold text-forest">Alles in één lijst</span>
+              <span className="text-xs font-bold text-stone-500">{todo.length} te halen</span>
             </button>
           </div>
         </Sheet>
@@ -2284,7 +2471,7 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
       {editItem && (
         <ItemEditSheet item={items.find(i => i.key === editItem.key) || editItem} stores={stores}
           onAssignStore={(st) => onAssignStore(editItem, st)} onAssignAisle={(a) => onAssignAisle(editItem, a)}
-          onRemove={editItem.kind !== 'recipe' ? () => { onRemoveItem(editItem); setEditItem(null); } : null}
+          onRemove={(editItem.kind === 'extra' || editItem.kind === 'staple') ? () => { onRemoveItem(editItem); setEditItem(null); } : null}
           onClose={() => setEditItem(null)} />
       )}
       {showStores && <StoresSheet stores={stores} storeAisles={storeAisles} onAdd={onAddStore} onRename={onRenameStore} onRemove={onRemoveStore}
@@ -2294,34 +2481,25 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
   );
 }
 
-function ShoppingRow({ item, stores, showAssign, onToggle, onAssign, onHave, onEdit }) {
-  const checked = !!item.state;
+// Eén rij: naam, hoeveelheid, waarvoor. De hele rij is de knop.
+function ShoppingRow({ item, arrange, onTap, onRemove }) {
+  const sub = item.kind === 'extra' ? 'zelf toegevoegd' : item.kind === 'staple' ? 'vast item' : fmtShopAmount(item);
+  const uses = (item.kind === 'recipe' || item.kind === 'free') && item.uses && item.uses.length ? item.uses.join(', ') : '';
   return (
-    <div className="px-3 py-2.5 flex items-center gap-3">
-      <button onClick={onToggle} aria-label="Afvinken"
-        className={cx('w-6 h-6 shrink-0 rounded-full border-2 flex items-center justify-center transition', checked ? 'bg-sage border-sage text-white' : 'border-stone-300')}>
-        {checked && <Icon name="check" size={14} stroke={3} />}
+    <div className="flex items-center">
+      <button onClick={onTap} className="flex-1 min-w-0 flex items-center gap-3 px-4 py-3 text-left active:bg-mist">
+        <span className={cx('w-6 h-6 shrink-0 rounded-full border-2 flex items-center justify-center', arrange ? 'border-forest text-forest' : 'border-stone-300')}>
+          {arrange && <Icon name="pencil" size={12} />}
+        </span>
+        <span className="flex-1 min-w-0">
+          <span className="block text-[15px] font-bold text-ink">{item.name}{item.kind === 'staple' ? ' 📌' : ''}</span>
+          <span className="block text-[12px] text-stone-600 truncate">{sub}{uses ? ` · ${uses}` : ''}{arrange ? ` · ${item.store || 'geen winkel'} › ${item.aisle}` : ''}</span>
+        </span>
+        {!arrange && item.inKast && <span className="shrink-0 text-[11px] font-black text-leaf bg-mint rounded-full px-2 py-1">in kast</span>}
       </button>
-      <button onClick={onToggle} className="flex-1 min-w-0 text-left">
-        <div className={cx('text-sm font-bold', checked ? 'line-through text-stone-300' : 'text-ink')}>
-          {item.name}
-          {item.kind === 'staple' && <span className="ml-1.5 text-[10px] font-black text-stone-400 align-middle">📌</span>}
-        </div>
-        <div className="text-[11px] text-stone-400 truncate">
-          {item.kind === 'extra' ? 'los item' : item.kind === 'staple' ? 'vast item' : fmtShopAmount(item)}
-          {item.kind === 'recipe' && item.uses && item.uses.length ? ` · ${item.uses.join(', ')}` : ''}
-        </div>
-      </button>
-      {item.inKast && !checked && onHave && (
-        <button onClick={onHave} className="shrink-0 text-[11px] font-black text-leaf bg-mint rounded-lg px-2 py-1.5" title="Staat in je kast — niet kopen">🥫 Heb ik al</button>
+      {item.kind === 'extra' && !arrange && (
+        <button onClick={onRemove} className="w-11 h-11 mr-1 shrink-0 flex items-center justify-center text-stone-400" aria-label={`${item.name} verwijderen`}><Icon name="x" size={16} /></button>
       )}
-      {showAssign && !checked && (
-        <select onChange={(e) => onAssign(e.target.value)} defaultValue="" className="text-xs font-bold bg-amber-50 text-amber-800 rounded-lg px-1.5 py-1.5 border-0 max-w-[5.5rem]">
-          <option value="" disabled>Winkel…</option>
-          {stores.map(s => <option key={s} value={s}>{s}</option>)}
-        </select>
-      )}
-      {onEdit && <IconBtn name="pencil" size={14} title="Winkel / afdeling" onClick={onEdit} className="w-8 h-8 text-stone-300" />}
     </div>
   );
 }
@@ -2447,7 +2625,7 @@ function StoreMode({ storeKey, weekLabel, items, storeAisles, online, pendingOps
     return () => { document.body.style.overflow = prev; };
   }, []);
   const all = storeKey === '__all__';
-  const mine = items.filter(i => i.state !== 'have' && (all || i.store === storeKey || !i.store));
+  const mine = items.filter(i => i.state !== 'have' && !(i.basic && !i.state) && (all || i.store === storeKey || !i.store));
   const todo = mine.filter(i => i.state !== 'cart');
   const cart = mine.filter(i => i.state === 'cart');
   const order = aisleOrderFor(all ? '' : storeKey, storeAisles);
@@ -2487,9 +2665,9 @@ function StoreMode({ storeKey, weekLabel, items, storeAisles, online, pendingOps
                       <span className="w-7 h-7 rounded-full border-2 border-stone-300 shrink-0" />
                       <span className="flex-1 min-w-0">
                         <span className="block text-[17px] font-bold text-ink leading-snug">{i.name}</span>
-                        {(i.kind === 'recipe' || (all && i.store) || (!all && !i.store)) && (
+                        {(i.kind === 'recipe' || i.kind === 'free' || (all && i.store) || (!all && !i.store)) && (
                           <span className="block text-xs text-stone-400">
-                            {i.kind === 'recipe' ? fmtShopAmount(i) : ''}{all && i.store ? `${i.kind === 'recipe' ? ' · ' : ''}${i.store}` : ''}{!all && !i.store ? `${i.kind === 'recipe' ? ' · ' : ''}geen winkel gekozen` : ''}
+                            {(i.kind === 'recipe' || i.kind === 'free') ? fmtShopAmount(i) : ''}{all && i.store ? `${(i.kind === 'recipe' || i.kind === 'free') ? ' · ' : ''}${i.store}` : ''}{!all && !i.store ? `${(i.kind === 'recipe' || i.kind === 'free') ? ' · ' : ''}geen winkel gekozen` : ''}
                           </span>
                         )}
                       </span>
@@ -2832,7 +3010,7 @@ function RecipeSheet({ recipe, startInEdit, householdSize, onUpdate, onDelete, o
 
 function AddRecipeSheet({ preset, onSave, onClose }) {
   const [mode, setMode] = useState(preset.category || preset.title ? 'manual' : 'url');
-  const [draft, setDraft] = useState({ ...recipeToDraft({ title: preset.title || '', category: preset.category || '', basePortions: 1 }) });
+  const [draft, setDraft] = useState({ ...recipeToDraft({ title: preset.title || '', category: preset.category || '', basePortions: 1, ingredients: preset.ingredients || [] }) });
   const [url, setUrl] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -2866,20 +3044,43 @@ function AddRecipeSheet({ preset, onSave, onClose }) {
     applyImport({ ingredients: parseLines(pasteIng).map(parseIngredientLine).filter(Boolean), steps: parseLines(pasteSteps), portions: origPortions });
   }
   const photoRef = useRef(null);
-  async function importPhoto(e) {
-    const file = e.target.files && e.target.files[0];
-    e.target.value = '';
-    if (!file) return;
-    setBusy(true); setError('');
+  const fileRef = useRef(null);
+  const [fileNames, setFileNames] = useState([]);
+  function readAsBase64(file) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onerror = () => reject(new Error('Bestand lezen mislukt'));
+      r.onload = () => resolve(String(r.result).split(',')[1]);
+      r.readAsDataURL(file);
+    });
+  }
+  // Camerafoto, screenshot(s) of PDF → AI leest het recept. Meerdere bestanden = één recept
+  // (bv. ingrediënten op screenshot 1, bereiding op screenshot 2).
+  async function importFiles(fileList, fromCamera) {
+    const files = Array.from(fileList || []).slice(0, 5);
+    if (!files.length) return;
+    setBusy(true); setError(''); setFileNames(files.map(f => f.name || 'foto'));
     try {
-      const dataUrl = await resizeImageFile(file);
-      setDraft(d => ({ ...d, image: dataUrl }));
-      const base64 = dataUrl.split(',')[1];
-      const data = await invokeAi({ task: 'import_photo', imageBase64: base64, mimeType: 'image/jpeg' });
+      const parts = [];
+      for (const f of files) {
+        const isPdf = f.type === 'application/pdf' || /\.pdf$/i.test(f.name || '');
+        if (isPdf) {
+          if (f.size > 10 * 1024 * 1024) throw new Error(`"${f.name}" is te groot (max 10 MB)`);
+          parts.push({ data: await readAsBase64(f), mimeType: 'application/pdf' });
+        } else if ((f.type || '').startsWith('image/') || /\.(jpe?g|png|webp|heic|gif)$/i.test(f.name || '')) {
+          const dataUrl = await resizeImageFile(f, fromCamera ? 1600 : 2400, 0.85);
+          if (fromCamera) setDraft(d => ({ ...d, image: dataUrl }));
+          parts.push({ data: dataUrl.split(',')[1], mimeType: 'image/jpeg' });
+        } else throw new Error(`"${f.name}" is geen foto of PDF`);
+      }
+      const data = await invokeAi({ task: 'import_photo', files: parts, imageBase64: parts[0].data, mimeType: parts[0].mimeType });
+      if (!data || (!data.title && !(data.ingredients || []).length)) throw new Error('Geen recept gevonden in dit bestand');
       applyImport({ title: data.title, category: data.category, ingredients: data.ingredients, steps: data.steps, portions: data.basePortions || 2 });
     } catch (e) { setError(e.message + ' — vul de rest eventueel zelf aan.'); }
     finally { setBusy(false); }
   }
+  function importPhoto(e) { const fl = Array.from(e.target.files || []); e.target.value = ''; importFiles(fl, true); }
+  function importPicked(e) { const fl = Array.from(e.target.files || []); e.target.value = ''; importFiles(fl, false); }
   async function save() {
     if (!draft.title.trim()) { window.alert('Geef het recept een titel.'); return; }
     if (!draft.category) { window.alert('Kies een categorie.'); return; }
@@ -2893,26 +3094,26 @@ function AddRecipeSheet({ preset, onSave, onClose }) {
   }
 
   return (
-    <Sheet z={60} full title="Nieuw recept" subtitle={preset.category ? `Categorie: ${catMeta(preset.category).label}` : 'Van een website, een foto, geplakte tekst of zelf ingevuld'} onClose={onClose}
+    <Sheet z={60} full title="Nieuw recept" subtitle={preset.category ? `Categorie: ${catMeta(preset.category).label}` : 'Van een website, foto, screenshot, PDF, geplakte tekst of zelf ingevuld'} onClose={onClose}
       footer={<Btn size="lg" className="w-full" icon="check" disabled={busy} onClick={save}>Recept opslaan</Btn>}>
       <Segmented className="mb-4" value={mode} onChange={setMode}
-        options={[{ value: 'url', label: 'Van URL', icon: 'link' }, { value: 'photo', label: 'Foto', icon: 'camera' }, { value: 'paste', label: 'Plak tekst' }, { value: 'manual', label: 'Zelf', icon: 'pencil' }]} />
+        options={[{ value: 'url', label: 'Van URL', icon: 'link' }, { value: 'photo', label: 'Foto/PDF', icon: 'camera' }, { value: 'paste', label: 'Plak tekst' }, { value: 'manual', label: 'Zelf', icon: 'pencil' }]} />
 
       {mode === 'photo' && (
         <Card className="p-3.5 mb-4 space-y-2">
           <input ref={photoRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={importPhoto} />
-          {draft.image ? (
+          <input ref={fileRef} type="file" accept="image/*,application/pdf,.pdf" multiple className="hidden" onChange={importPicked} />
+          {draft.image && (
             <div className="relative rounded-2xl overflow-hidden border border-line">
               <img src={draft.image} alt="" className="w-full h-40 object-cover" />
-              <div className="absolute top-2 right-2">
-                <IconBtn name="camera" title="Andere foto" onClick={() => photoRef.current.click()} className="bg-white/90 backdrop-blur w-9 h-9" />
-              </div>
-              {busy && <div className="absolute inset-0 bg-white/70 flex items-center justify-center text-sm font-extrabold text-deep">Recept wordt gelezen…</div>}
             </div>
-          ) : (
-            <Btn className="w-full" icon="camera" disabled={busy} onClick={() => photoRef.current.click()}>{busy ? '…' : 'Foto nemen van recept'}</Btn>
           )}
-          <p className="text-[11px] text-stone-400">Bv. een receptenkaart, kookboekpagina of tijdschriftknipsel. De AI leest de tekst en vult het recept hieronder in — de foto wordt meteen als receptfoto bewaard.</p>
+          <div className="grid grid-cols-2 gap-2">
+            <Btn icon="camera" disabled={busy} onClick={() => photoRef.current.click()}>Foto nemen</Btn>
+            <Btn variant="soft" disabled={busy} onClick={() => fileRef.current.click()}>Screenshot/PDF</Btn>
+          </div>
+          {busy && <div className="text-sm font-extrabold text-deep bg-mist rounded-xl px-3 py-2">Recept wordt gelezen… <span className="font-semibold text-stone-500">{fileNames.join(', ')}</span></div>}
+          <p className="text-[11px] text-stone-400">Foto van een kookboek of receptenkaart, een screenshot (bv. van Instagram of een website) of een PDF. Staat het recept op meerdere screenshots, kies ze samen. De AI vult het recept hieronder in; een camerafoto wordt ook de receptfoto.</p>
           {error && <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2">{error}</p>}
         </Card>
       )}
