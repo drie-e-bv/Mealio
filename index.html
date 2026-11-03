@@ -1568,7 +1568,8 @@ function App() {
         return { state: 'buy', note: `${fmtPantryQty(p)} in voorraad`, amount: restInItemUnit != null ? restInItemUnit : i.amount };
       }
       if (i.basic) return exact ? { state: 'buy', note: 'op in de voorraad' } : { state: 'have', note: 'basis, meestal in huis' };
-      const fuzzy = !exact && inStockList.find(x => ingredientMatches(i.name, [normalize(x.name)]));
+      // twijfel enkel als de voorraadnaam als volledig woord in de productnaam staat ("paprika" ↔ "rode paprika", niet "olijfolie" ↔ "olijf")
+      const fuzzy = !exact && inStockList.find(x => { const k = canonIngredient(x.name); return k.length >= 3 && new RegExp(`(^|[^a-z])${escapeRe(k)}($|[^a-z])`).test(i.name); });
       if (fuzzy) return { state: null, note: `misschien in voorraad: ${fuzzy.name}` };
       return { state: 'buy' };
     }
