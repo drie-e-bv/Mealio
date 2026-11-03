@@ -1494,7 +1494,7 @@ function App() {
   }
   // Opnieuw beginnen: de lijst wordt opnieuw opgebouwd uit de maaltijden van deze week
   function newShoppingRound() {
-    if (!window.confirm('Opnieuw beginnen? De lijst wordt opnieuw opgebouwd uit de maaltijden van deze week; alle keuzes (kast, winkelmandje, gekocht, gewist) en losse items van deze week vervallen.')) return;
+    if (!window.confirm('Lijst opnieuw opbouwen? De lijst wordt opnieuw opgebouwd uit de maaltijden van deze week; alle keuzes (kast, winkelmandje, gekocht, gewist) en losse items van deze week vervallen.')) return;
     const ws = weekStartRef.current;
     setChecks({});
     enqueue({ t: 'checks_reset', ws });
@@ -2528,6 +2528,7 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
   const basket = items.filter(i => i.state === 'buy');
   const have = items.filter(i => i.state === 'have');
   const bought = items.filter(i => i.state === 'cart');
+  const visibleAll = items.filter(i => i.state !== 'hidden');
 
   const byStore = {};
   basket.forEach(i => { const k = i.store && stores.includes(i.store) ? i.store : '__none__'; (byStore[k] = byStore[k] || []).push(i); });
@@ -2734,12 +2735,23 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
         <Fold id="have" label="🏠 In kast / niet nodig" list={have} onTap={(i) => choose(i, null)} action="Terug" />
       </div>
 
+      {visibleAll.length > 0 && (
+        <button onClick={() => { if (window.confirm(`Boodschappen gedaan en gekookt? De hele lijst (${visibleAll.length} items) wordt leeggemaakt. Plan je daarna nog iets, dan komt alleen dat op de lijst.`)) onBulkState(visibleAll, 'hidden'); }}
+          className="mt-4 w-full rounded-2xl border-2 border-dashed border-line bg-white/60 px-4 py-3 flex items-center gap-3 text-left active:bg-mist">
+          <span className="text-2xl">🧹</span>
+          <span className="flex-1">
+            <span className="block text-[14px] font-black text-forest">Alles leegmaken</span>
+            <span className="block text-[12px] text-stone-500">Gekocht en gekookt? Maak de hele lijst in één keer leeg.</span>
+          </span>
+        </button>
+      )}
+
       <div className="mt-5 flex flex-wrap gap-2 justify-between items-center px-1">
         <button onClick={() => setShowStaples(true)} className="flex items-center gap-1.5 text-[13px] font-extrabold text-forest py-2">
           <Icon name="pin" size={15} />Vaste items{staples.length ? ` (${staples.filter(s => s.active).length})` : ''}
         </button>
         {items.some(i => i.state) && (
-          <button onClick={onNewRound} className="flex items-center gap-1.5 text-[13px] font-extrabold text-forest py-2"><Icon name="refresh" size={15} />Opnieuw beginnen</button>
+          <button onClick={onNewRound} className="flex items-center gap-1.5 text-[13px] font-extrabold text-forest py-2"><Icon name="refresh" size={15} />Lijst opnieuw opbouwen</button>
         )}
       </div>
 
