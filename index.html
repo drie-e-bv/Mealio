@@ -731,7 +731,7 @@ function Sheet({ title, subtitle, onClose, children, footer, z = 40, full }) {
 // 5. App (data + navigatie)
 // =================================================================
 const DEFAULT_STORES = ['Colruyt', 'Okay', 'Slager', 'Bakker'];
-const SETTINGS_DB_KEYS = { stores: 'stores', itemStoreMap: 'item_store_map', householdSize: 'household_size', storeAisles: 'store_aisles', itemAisleMap: 'item_aisle_map' };
+const SETTINGS_DB_KEYS = { shoppingEnabled: 'shopping_enabled', stores: 'stores', itemStoreMap: 'item_store_map', householdSize: 'household_size', storeAisles: 'store_aisles', itemAisleMap: 'item_aisle_map' };
 // Als de database nog niet bijgewerkt is (migratie-mealio-v2.sql), werkt de planner
 // gewoon verder zonder de "kook dubbel"-kolommen.
 let HAS_V2_COLUMNS = true;
@@ -771,6 +771,7 @@ function App() {
   const [pantryStock, setPantryStock] = useState([]);
   const [aiSuggestions, setAiSuggestions] = useState([]);
   const [householdSize, setHouseholdSize] = useState(5);
+  const [shoppingEnabled, setShoppingEnabled] = useState(true);   // boodschappenlijst gebruiken (gedeeld)
   const [migrationMissing, setMigrationMissing] = useState(false);
   const [pendingOps, setPendingOps] = useState(QUEUE.length);
   const [online, setOnline] = useState(typeof navigator === 'undefined' ? true : navigator.onLine);
@@ -867,6 +868,7 @@ function App() {
     setItemStoreMap(byKey.item_store_map || {});
     setStoreAisles(byKey.store_aisles || {});
     setItemAisleMap(byKey.item_aisle_map || {});
+    setShoppingEnabled(byKey.shopping_enabled !== false);
     HOUSEHOLD_SIZE = Number(byKey.household_size) || 5;
     setHouseholdSize(HOUSEHOLD_SIZE);
   }, []);
@@ -1355,6 +1357,21 @@ function App() {
     if (item.kind === 'extra') delExtra(item.extraId);
     else if (item.kind === 'staple') updateStaple(item.stapleId, { active: false });
   }
+  // Boodschappen gedaan zonder de app: alles wat nog te kopen is in één keer op "gekocht"
+  function markAllBought() {
+    const todo = shoppingItems.filter(i => !i.state && !i.basic);
+    if (!todo.length) return;
+    todo.forEach(i => {
+      if (i.kind === 'extra') { const r = extraRows.find(x => x.id === i.extraId); if (r) putExtra({ ...r, checked: true }); }
+      else setCheck(i.key, 'cart');
+    });
+    showToast(`✓ ${todo.length} items op gekocht gezet`, { label: 'Ongedaan', onClick: () => {
+      todo.forEach(i => {
+        if (i.kind === 'extra') { const r = extraRows.find(x => x.id === i.extraId); if (r) putExtra({ ...r, checked: false }); }
+        else setCheck(i.key, null);
+      });
+    } });
+  }
   function newShoppingRound() {
     if (!window.confirm('Nieuwe ronde: alles uit "In de kar" van deze week terug op de lijst zetten en afgevinkte losse items verwijderen?')) return;
     const ws = weekStartRef.current;
@@ -1497,6 +1514,7 @@ function App() {
             </span>
           )}
           <UserMenu email={myEmail} onSignOut={() => sb.auth.signOut()} household={householdSize} onHousehold={changeHousehold}
+            shoppingEnabled={shoppingEnabled} onShoppingEnabled={(v) => { persistSetting('shoppingEnabled', setShoppingEnabled, v); if (!v) { setStoreMode(null); if (tab === 'shopping') setTab('planner'); } showToast(v ? 'Boodschappenlijst staat aan' : 'Boodschappenlijst staat uit — weer aanzetten via de letter rechtsboven'); }}
             onOpenFamily={() => setFamilyOpen(true)} onOpenAccess={() => setAccessOpen(true)} />
         </div>
       </header>
@@ -1515,11 +1533,11 @@ function App() {
             onFeedback={giveMealFeedback} aiTargetCount={aiTargetCount} aiBusy={aiBusy} onAiFill={aiFillWeek}
             onCopyPrev={copyPreviousWeek} showToast={showToast} />
         )}
-        {tab === 'shopping' && (
+        {tab === 'shopping' && shoppingEnabled && (
           <ShoppingPage nav={weekNav} items={shoppingItems} stores={stores} storeAisles={storeAisles} staples={staples}
             online={online} pendingOps={pendingOps}
             onToggle={toggleCart} onSetHave={setHave} onAssignStore={assignStore} onAssignAisle={assignAisle} onRemoveItem={removeItem}
-            onAddExtra={addExtraItem} onStoreMode={(s) => setStoreMode(s)} onNewRound={newShoppingRound}
+            onAddExtra={addExtraItem} onStoreMode={(s) => setStoreMode(s)} onNewRound={newShoppingRound} onMarkAllBought={markAllBought}
             onAddStore={(name) => persistSetting('stores', setStores, [...stores, name])} onRenameStore={renameStore} onRemoveStore={removeStore}
             onSetAisleOrder={(store, order) => persistSetting('storeAisles', setStoreAisles, { ...storeAisles, [store]: order })}
             onAddStaple={addStaple} onUpdateStaple={updateStaple} onDeleteStaple={deleteStaple} showToast={showToast} />
@@ -1530,19 +1548,19 @@ function App() {
         )}
         {tab === 'kast' && (
           <KastPage pantryStock={pantryStock} recipes={recipes} onAdd={addPantryStockItem} onToggle={togglePantryStockItem}
-            onRemove={removePantryStockItem} onAddToShopping={(name) => { if (addExtraItem(name)) showToast(`🛒 "${name}" op je boodschappenlijst`); }}
+            onRemove={removePantryStockItem} onAddToShopping={shoppingEnabled ? (name) => { if (addExtraItem(name)) showToast(`🛒 "${name}" op je boodschappenlijst`); } : null}
             onOpenRecipe={(id) => setRecipeSheet({ id })} onAiSuggest={aiSuggestFromPantry} aiSuggesting={aiSuggesting} showToast={showToast} />
         )}
       </main>
 
       <nav className="fixed bottom-0 inset-x-0 z-30 bg-white/95 backdrop-blur border-t border-line pb-safe">
-        <div className="max-w-lg mx-auto grid grid-cols-4 px-2 pt-1.5">
+        <div className={cx('max-w-lg mx-auto grid px-2 pt-1.5', shoppingEnabled ? 'grid-cols-4' : 'grid-cols-3')}>
           {[
             { id: 'planner', label: 'Planner', icon: 'calendar' },
-            { id: 'shopping', label: 'Boodschappen', icon: 'cart', badge: shoppingTodo },
+            shoppingEnabled && { id: 'shopping', label: 'Boodschappen', icon: 'cart', badge: shoppingTodo },
             { id: 'recipes', label: 'Recepten', icon: 'book', badge: aiSuggestions.length, badgeTone: 'amber' },
             { id: 'kast', label: 'Kast', icon: 'box' },
-          ].map(t => {
+          ].filter(Boolean).map(t => {
             const active = tab === t.id;
             return (
               <button key={t.id} onClick={() => switchTab(t.id)} className="flex flex-col items-center gap-0.5 pb-1">
@@ -1600,7 +1618,7 @@ function App() {
         <FamilySheet members={members} onAdd={addMember} onUpdate={updateMember} onDelete={deleteMember} onClose={() => setFamilyOpen(false)} />
       )}
       {accessOpen && <AccessSheet myEmail={myEmail} onClose={() => setAccessOpen(false)} />}
-      {storeMode && (
+      {storeMode && shoppingEnabled && (
         <StoreMode storeKey={storeMode} weekLabel={`Week ${isoWeekNumber(weekStart)}`} items={shoppingItems} storeAisles={storeAisles}
           online={online} pendingOps={pendingOps} onToggle={toggleCart}
           onAddExtra={(name) => addExtraItem(name, storeMode === '__all__' ? '' : storeMode)}
@@ -1619,7 +1637,7 @@ function App() {
   );
 }
 
-function UserMenu({ email, onSignOut, household, onHousehold, onOpenFamily, onOpenAccess }) {
+function UserMenu({ email, onSignOut, household, onHousehold, onOpenFamily, onOpenAccess, shoppingEnabled, onShoppingEnabled }) {
   const [open, setOpen] = useState(false);
   const initial = (email || '?').slice(0, 1).toUpperCase();
   const item = 'w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-bold text-deep active:bg-mist text-left';
@@ -1641,6 +1659,15 @@ function UserMenu({ email, onSignOut, household, onHousehold, onOpenFamily, onOp
                 <span className="text-[11px] text-stone-400 leading-tight">Standaard voor nieuwe maaltijden</span>
                 <Stepper value={household || 5} min={1} onChange={onHousehold} />
               </div>
+            </div>
+            <div className="px-3 py-2 border-t border-line/70">
+              <label className="flex items-center justify-between gap-2 cursor-pointer">
+                <span>
+                  <span className="block text-xs font-extrabold text-deep">🛒 Boodschappenlijst gebruiken</span>
+                  <span className="block text-[11px] text-stone-400 leading-tight">Uit = enkel plannen en recepten (voor jullie allebei)</span>
+                </span>
+                <input type="checkbox" checked={shoppingEnabled} onChange={(e) => onShoppingEnabled(e.target.checked)} className="w-5 h-5 accent-forest shrink-0" aria-label="Boodschappenlijst gebruiken" />
+              </label>
             </div>
             <button onClick={onSignOut} className="w-full flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm font-bold text-red-600 active:bg-red-50 border-t border-line/70"><Icon name="logout" size={16} />Uitloggen</button>
           </div>
@@ -2183,7 +2210,7 @@ function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, 
               <div className="flex flex-wrap gap-1.5">
                 {parseFreeItems(slot.notes).map(n => <span key={n} className="rounded-full bg-white border border-line px-2.5 py-1 text-xs font-bold text-ink">{n}</span>)}
               </div>
-              <div className="text-[11px] text-stone-500 mt-1.5">Heb je iets al in huis? Tik dan in de boodschappenlijst op "Heb ik al".</div>
+              <div className="text-[11px] text-stone-500 mt-1.5">Heb je iets al in huis? Tik dan in de boodschappenlijst op "🏠 Heb ik".</div>
             </div>
           )}
           {(slot.notes || '').trim() && (
@@ -2361,7 +2388,7 @@ function groupByAisle(items, order) {
 // Boodschappen — thuis: tik aan wat je al in huis hebt, de rest koop je.
 // In de winkel: "Ik ben in de winkel" (afvinken = in de kar). Winkel/afdeling aanpassen zit achter één knop.
 function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendingOps, onToggle, onSetHave, onAssignStore, onAssignAisle, onRemoveItem,
-  onAddExtra, onStoreMode, onNewRound, onAddStore, onRenameStore, onRemoveStore, onSetAisleOrder, onAddStaple, onUpdateStaple, onDeleteStaple, showToast }) {
+  onAddExtra, onStoreMode, onNewRound, onMarkAllBought, onAddStore, onRenameStore, onRemoveStore, onSetAisleOrder, onAddStaple, onUpdateStaple, onDeleteStaple, showToast }) {
   const [extraName, setExtraName] = useState('');
   const [showStores, setShowStores] = useState(false);
   const [showStaples, setShowStaples] = useState(false);
@@ -2501,6 +2528,13 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
         <Fold id="cart" label="🛒 In de kar" list={cart} hint="Tik om terug op de lijst te zetten." onTap={undo} />
       </div>
 
+      {todo.length > 0 && (
+        <button onClick={() => { if (window.confirm(`Boodschappen al gedaan? Alle ${todo.length} items worden op "gekocht" gezet.`)) onMarkAllBought(); }}
+          className="mt-4 w-full rounded-2xl border-2 border-dashed border-line bg-white/60 px-4 py-3 text-left active:bg-mist">
+          <div className="text-[14px] font-black text-forest">✓ Alles al gekocht</div>
+          <div className="text-[12px] text-stone-500">Boodschappen gedaan zonder de app? Zet de hele lijst in één keer op gekocht.</div>
+        </button>
+      )}
       <div className="mt-5 flex flex-wrap gap-2 justify-between items-center px-1">
         <button onClick={() => setShowStaples(true)} className="flex items-center gap-1.5 text-[13px] font-extrabold text-forest py-2">
           <Icon name="pin" size={15} />Vaste items{staples.length ? ` (${staples.filter(s => s.active).length})` : ''}
@@ -3296,7 +3330,7 @@ function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onAddToShop
                   <div key={p.id} className="flex items-center gap-2 px-3 py-2.5">
                     <button onClick={() => onToggle(p.id)} className="w-6 h-6 rounded-full border-2 border-stone-300 shrink-0" aria-label="Weer in huis" />
                     <span className="flex-1 text-sm font-semibold text-stone-400">{p.name}</span>
-                    <button onClick={() => onAddToShopping(p.name)} className="flex items-center gap-1 text-[11px] font-extrabold text-forest bg-mist rounded-lg px-2 py-1"><Icon name="cart" size={12} />Op lijst</button>
+                    {onAddToShopping && <button onClick={() => onAddToShopping(p.name)} className="flex items-center gap-1 text-[11px] font-extrabold text-forest bg-mist rounded-lg px-2 py-1"><Icon name="cart" size={12} />Op lijst</button>}
                     <IconBtn name="trash" size={14} title="Verwijderen" onClick={() => onRemove(p.id)} className="w-8 h-8 text-stone-300" />
                   </div>
                 ))}
