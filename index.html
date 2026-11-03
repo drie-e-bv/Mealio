@@ -1411,6 +1411,8 @@ function App() {
       return;
     }
     setCheck(item.key, st || null);
+    // "🏠 Kast" in de boodschappenlijst = het staat in huis → ook in de Kast zetten
+    if (st === 'have' && !pantryStock.some(p => p.inStock && normalize(p.name) === normalize(item.name))) addPantryStockItem(item.name.toLowerCase());
   }
   function bulkState(list, st) {
     list.forEach(i => setItemState(i, st));
@@ -3446,7 +3448,26 @@ function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onAddToShop
   const sources = [...inStock.map(p => p.name), ...extra];
   const results = useMemo(() => matchRecipesToPantry(recipes, sources, matchMode), [recipes, sources.join('|'), matchMode]); // eslint-disable-line
 
-  function add() { input.split(',').map(s => s.trim()).filter(Boolean).forEach(onAdd); setInput(''); }
+  function add() { input.split(',').map(s => s.trim()).filter(Boolean).forEach(onAdd); setInput(''); if (inputRef.current) inputRef.current.focus(); }
+  function addOne(name) { onAdd(name); setInput(''); if (inputRef.current) inputRef.current.focus(); }
+  const inputRef = useRef(null);
+  // ingrediënten uit je recepten, meest gebruikt eerst — om met één tik toe te voegen
+  const known = useMemo(() => {
+    const m = {};
+    recipes.forEach(r => (r.ingredients || []).forEach(ing => {
+      const n = (ing.name || '').trim(); if (!n || n.length > 30) return;
+      const k = normalize(n); if (!m[k]) m[k] = { name: n.toLowerCase(), count: 0 }; m[k].count++;
+    }));
+    return Object.values(m).sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+  }, [recipes]);
+  const inStockSet = new Set(inStock.map(p => normalize(p.name)));
+  const q = normalize(input.split(',').pop().trim());
+  const suggestions = q.length >= 2 ? [
+    ...outStock.map(p => p.name).filter(n => normalize(n).split(/[^a-z0-9]+/).some(w => w.startsWith(q)) || normalize(n).startsWith(q)),
+    ...known.map(k => k.name).filter(n => !inStockSet.has(normalize(n)) && (normalize(n).split(/[^a-z0-9]+/).some(w => w.startsWith(q)))),
+  ].filter((n, i, a) => a.findIndex(x => normalize(x) === normalize(n)) === i).slice(0, 8) : [];
+  const quick = known.filter(k => !inStockSet.has(normalize(k.name)) && !outStock.some(p => normalize(p.name) === normalize(k.name))).slice(0, 24);
+  const [showQuick, setShowQuick] = useState(false);
   function addExtra() {
     const parts = extraInput.split(',').map(s => s.trim()).filter(Boolean);
     setExtra([...extra, ...parts.filter(p => !sources.some(s => normalize(s) === normalize(p)))]); setExtraInput('');
@@ -3460,11 +3481,39 @@ function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onAddToShop
 
       {view === 'voorraad' ? (
         <div className="space-y-4">
-          <Card className="p-2 flex gap-1.5">
-            <input value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') add(); }}
-              placeholder="Toevoegen: eieren, rijst, passata…" className="flex-1 min-w-0 bg-transparent px-2 py-2 text-sm placeholder:text-stone-300 border-0 focus:shadow-none" />
-            <button onClick={add} className="w-10 rounded-xl bg-forest text-white flex items-center justify-center"><Icon name="plus" /></button>
+          <Card className="overflow-hidden">
+            <div className="p-2 flex gap-1.5">
+              <input ref={inputRef} value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') add(); }}
+                placeholder="Wat heb je in huis? bv. eieren" aria-label="Toevoegen aan de kast" enterKeyHint="done"
+                className="flex-1 min-w-0 bg-transparent px-2 py-2.5 text-base placeholder:text-stone-400 border-0 focus:shadow-none" />
+              <button onClick={add} aria-label="Toevoegen" className="w-11 h-11 rounded-xl bg-forest text-white flex items-center justify-center shrink-0"><Icon name="plus" /></button>
+            </div>
+            {suggestions.length > 0 && (
+              <div className="border-t border-line/70 divide-y divide-line/60">
+                {suggestions.map(n => (
+                  <button key={n} onClick={() => addOne(n)} className="w-full px-4 py-2.5 flex items-center gap-2 text-left active:bg-mist">
+                    <Icon name="plus" size={14} className="text-forest" /><span className="text-[15px] font-bold text-ink">{n}</span>
+                  </button>
+                ))}
+              </div>
+            )}
           </Card>
+
+          {quick.length > 0 && (
+            <div>
+              <button onClick={() => setShowQuick(!showQuick)} className="w-full flex items-center justify-between px-1 text-[12px] font-extrabold text-forest">
+                <span>⚡ Snel aantikken — vaak in je recepten</span><Icon name="down" size={14} className={showQuick ? 'rotate-180' : ''} />
+              </button>
+              {showQuick && (
+                <div className="flex flex-wrap gap-1.5 mt-2">
+                  {quick.map(k => (
+                    <button key={k.name} onClick={() => { onAdd(k.name); showToast(`🏠 ${k.name} in de kast`); }}
+                      className="h-9 px-3 rounded-full bg-white border border-line text-[13px] font-bold text-deep active:bg-mint active:scale-95 transition">+ {k.name}</button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           <input ref={scanRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={scanPhoto} />
           <Btn variant="secondary" className="w-full" icon="camera" disabled={scanning} onClick={() => scanRef.current.click()}>
@@ -3503,8 +3552,10 @@ function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onAddToShop
               <Card className="divide-y divide-line/70 overflow-hidden">
                 {outStock.map(p => (
                   <div key={p.id} className="flex items-center gap-2 px-3 py-2.5">
-                    <button onClick={() => onToggle(p.id)} className="w-6 h-6 rounded-full border-2 border-stone-300 shrink-0" aria-label="Weer in huis" />
-                    <span className="flex-1 text-sm font-semibold text-stone-400">{p.name}</span>
+                    <button onClick={() => onToggle(p.id)} className="flex-1 min-w-0 flex items-center gap-2.5 py-0.5 text-left" aria-label={`${p.name} weer in huis`}>
+                      <span className="w-6 h-6 rounded-full border-2 border-stone-300 shrink-0" />
+                      <span className="text-sm font-semibold text-stone-400 truncate">{p.name}</span>
+                    </button>
                     {onAddToShopping && <button onClick={() => onAddToShopping(p.name)} className="flex items-center gap-1 text-[11px] font-extrabold text-forest bg-mist rounded-lg px-2 py-1"><Icon name="cart" size={12} />Op lijst</button>}
                     <IconBtn name="trash" size={14} title="Verwijderen" onClick={() => onRemove(p.id)} className="w-8 h-8 text-stone-300" />
                   </div>
