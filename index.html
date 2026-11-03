@@ -905,7 +905,14 @@ function App() {
   const [pendingOps, setPendingOps] = useState(QUEUE.length);
   const [online, setOnline] = useState(typeof navigator === 'undefined' ? true : navigator.onLine);
 
-  const [tab, setTab] = useState(['planner', 'shopping', 'winkel', 'recipes', 'kast'].includes(UI_SAVED.tab) ? UI_SAVED.tab : 'planner');
+  const [tab, setTab] = useState(() => {
+    const t = UI_SAVED.tab === 'recipes' || UI_SAVED.tab === 'kast' ? 'keuken' : UI_SAVED.tab;   // oude tabbladen → Keuken
+    return ['planner', 'shopping', 'winkel', 'keuken'].includes(t) ? t : 'planner';
+  });
+  const [keukenView, setKeukenView] = useState(UI_SAVED.keuken === 'voorraad' || UI_SAVED.tab === 'kast' ? 'voorraad' : 'recepten');
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [storesOpen, setStoresOpen] = useState(false);
+  const [staplesOpen, setStaplesOpen] = useState(false);
   const [selectedDay, setSelectedDay] = useState(DAYS.includes(UI_SAVED.day) ? UI_SAVED.day : DAYS[dayIndexOf(todayISO())]);
   const [toast, setToast] = useState(null);
   const [mealSheet, setMealSheet] = useState(null);        // { day, meal }
@@ -939,6 +946,7 @@ function App() {
   // terugknop vanuit een ander tabblad → terug naar de planner (vanuit de planner = app verlaten)
   useBackClose(tab !== 'planner', () => setTab('planner'));
   // ---------- plaats onthouden (zie UI_KEY) ----------
+  useEffect(() => { saveUi({ keuken: keukenView }); }, [keukenView]);
   useEffect(() => { saveUi({ tab, day: selectedDay, weekStart, storeMode: storeMode || null, recipeId: recipeSheet && !recipeSheet.edit ? recipeSheet.id : null }); },
     [tab, selectedDay, weekStart, storeMode, recipeSheet]);
   useEffect(() => {
@@ -1094,9 +1102,11 @@ function App() {
     await Promise.all([loadWeek(ws), loadShopping(ws)]);
     setWeekLoading(false);
   }
-  function switchTab(id) {
+  function switchTab(id, view) {
+    if (id === 'recipes' || id === 'kast') { view = id === 'kast' ? 'voorraad' : 'recepten'; id = 'keuken'; }
     setTab(id);
-    if (id === 'recipes') loadRecipes();
+    if (view) setKeukenView(view);
+    if (id === 'keuken' && (view || keukenView) === 'recepten') loadRecipes();
   }
 
   // ---------- offline-wachtrij ----------
@@ -1700,7 +1710,7 @@ function App() {
         ingredients: s.ingredients || [], steps: s.steps || [], based_on_ingredients: pantryItems, status: 'pending' }));
       const created = throwIfError(await sb.from('ai_recipe_suggestions').insert(rows).select());
       setAiSuggestions(prev => [...(created || []).map(suggestionOut), ...prev]);
-      showToast(`✨ ${suggestions.length} voorstel(len) klaar`, { label: 'Bekijk', onClick: () => switchTab('recipes') });
+      showToast(`✨ ${suggestions.length} voorstel(len) klaar`, { label: 'Bekijk', onClick: () => switchTab('keuken', 'recepten') });
     } catch (e) { showToast(e.message); }
     finally { setAiSuggesting(false); }
   }
@@ -1780,9 +1790,8 @@ function App() {
               {online ? `${pendingOps} te versturen` : 'offline'}
             </span>
           )}
-          <UserMenu email={myEmail} onSignOut={() => sb.auth.signOut()} household={householdSize} onHousehold={changeHousehold}
-            shoppingEnabled={shoppingEnabled} onShoppingEnabled={(v) => { persistSetting('shoppingEnabled', setShoppingEnabled, v); if (!v) { setStoreMode(null); if (tab === 'shopping' || tab === 'winkel') setTab('planner'); } showToast(v ? 'Boodschappenlijst staat aan' : 'Boodschappenlijst staat uit — weer aanzetten via de letter rechtsboven'); }}
-            onOpenFamily={() => setFamilyOpen(true)} onOpenAccess={() => setAccessOpen(true)} />
+          <button onClick={() => setSettingsOpen(true)} aria-label="Instellingen" title="Instellingen"
+            className="w-9 h-9 rounded-full bg-forest text-white font-black text-sm">{(myEmail || '?').slice(0, 1).toUpperCase()}</button>
         </div>
       </header>
 
@@ -1797,7 +1806,9 @@ function App() {
             selectedDay={selectedDay} setSelectedDay={setSelectedDay}
             onOpenMeal={(day, meal) => setMealSheet({ day, meal })}
             onToggleLock={(day, meal) => updateMealSlot(day, meal, { locked: !weekmenu[day][meal].locked })}
-            onFeedback={giveMealFeedback} onEaten={markEaten} aiTargetCount={aiTargetCount} aiBusy={aiBusy} onAiFill={aiFillWeek}
+            onFeedback={giveMealFeedback} onEaten={markEaten} onEatenRate={async (d, m, v) => { await markEaten(d, m, true); await giveMealFeedback(d, m, v); }}
+            todo={{ basket: shoppingEnabled ? basketTodo : 0, choose: shoppingEnabled ? shoppingTodo : 0, out: pantryStock.filter(p => !p.inStock).length }}
+            onGo={(t, v) => switchTab(t, v)} aiTargetCount={aiTargetCount} aiBusy={aiBusy} onAiFill={aiFillWeek}
             onCopyPrev={copyPreviousWeek} showToast={showToast} />
         )}
         {tab === 'winkel' && shoppingEnabled && (
@@ -1812,11 +1823,15 @@ function App() {
             onSetAisleOrder={setStoreAisleList} onRenameAisle={renameStoreAisle} onRemoveAisle={removeStoreAisle} onResetAisles={resetStoreAisles}
             onAddStaple={addStaple} onUpdateStaple={updateStaple} onDeleteStaple={deleteStaple} showToast={showToast} />
         )}
-        {tab === 'recipes' && (
+        {tab === 'keuken' && (
+          <Segmented className="mb-4" value={keukenView} onChange={(v) => switchTab('keuken', v)}
+            options={[{ value: 'recepten', label: 'Recepten', icon: 'book' }, { value: 'voorraad', label: 'Voorraad', icon: 'box' }]} />
+        )}
+        {tab === 'keuken' && keukenView === 'recepten' && (
           <RecipesPage recipes={recipes} suggestions={aiSuggestions} onApprove={approveSuggestion} onReject={rejectSuggestion}
             onOpenRecipe={(id) => setRecipeSheet({ id })} onAdd={() => openAdd({})} />
         )}
-        {tab === 'kast' && (
+        {tab === 'keuken' && keukenView === 'voorraad' && (
           <KastPage pantryStock={pantryStock} recipes={recipes} onAdd={addPantryStockItem} onToggle={togglePantryStockItem} onUpdate={updatePantryItem}
             onRemove={removePantryStockItem} onAddToShopping={shoppingEnabled ? (name) => { if (addExtraItem(name)) showToast(`🛒 "${name}" op je boodschappenlijst`); } : null}
             onOpenRecipe={(id) => setRecipeSheet({ id })} onAiSuggest={aiSuggestFromPantry} aiSuggesting={aiSuggesting} showToast={showToast} />
@@ -1824,18 +1839,17 @@ function App() {
       </main>
 
       <nav className="fixed bottom-0 inset-x-0 z-30 bg-white/95 backdrop-blur border-t border-line pb-safe">
-        <div className={cx('max-w-lg mx-auto grid px-1 pt-1.5', shoppingEnabled ? 'grid-cols-5' : 'grid-cols-3')}>
+        <div className={cx('max-w-lg mx-auto grid px-1 pt-1.5', shoppingEnabled ? 'grid-cols-4' : 'grid-cols-2')}>
           {[
-            { id: 'planner', label: 'Planner', icon: 'calendar' },
+            { id: 'planner', label: 'Week', icon: 'calendar' },
             shoppingEnabled && { id: 'shopping', label: 'Lijst', icon: 'list', badge: shoppingTodo },
             shoppingEnabled && { id: 'winkel', label: 'Winkelen', icon: 'cart', badge: basketTodo },
-            { id: 'recipes', label: 'Recepten', icon: 'book', badge: aiSuggestions.length, badgeTone: 'amber' },
-            { id: 'kast', label: 'Kast', icon: 'box' },
+            { id: 'keuken', label: 'Keuken', icon: 'book', badge: aiSuggestions.length, badgeTone: 'amber' },
           ].filter(Boolean).map(t => {
             const active = tab === t.id;
             return (
               <button key={t.id} onClick={() => switchTab(t.id)} className="flex flex-col items-center gap-0.5 pb-1">
-                <span className={cx('relative py-1.5 rounded-full transition', shoppingEnabled ? 'px-3.5' : 'px-5', active ? 'bg-mint text-forest' : 'text-stone-400')}>
+                <span className={cx('relative py-1.5 rounded-full transition', 'px-5', active ? 'bg-mint text-forest' : 'text-stone-400')}>
                   <Icon name={t.icon} size={21} stroke={active ? 2.3 : 2} />
                   {t.badge ? <span className={cx('absolute -top-0.5 right-1.5 min-w-[18px] h-[18px] px-1 rounded-full text-[10px] font-black text-white flex items-center justify-center border-2 border-white', t.badgeTone === 'amber' ? 'bg-amber-500' : 'bg-forest')}>{t.badge > 99 ? '99+' : t.badge}</span> : null}
                 </span>
@@ -1885,6 +1899,17 @@ function App() {
         <PlanSheet recipe={recipesById[planSheetId]} nav={weekNav} weekmenu={weekmenu} recipesById={recipesById}
           onPick={(day, meal) => planRecipe(planSheetId, day, meal)} onClose={() => setPlanSheetId(null)} />
       )}
+      {settingsOpen && (
+        <SettingsSheet email={myEmail} household={householdSize} onHousehold={changeHousehold} shoppingEnabled={shoppingEnabled}
+          membersCount={members.length} storesCount={stores.length} staplesCount={staples.filter(x => x.active).length}
+          onShoppingEnabled={(v) => { persistSetting('shoppingEnabled', setShoppingEnabled, v); if (!v) { setStoreMode(null); if (tab === 'shopping' || tab === 'winkel') setTab('planner'); } showToast(v ? 'Boodschappenlijst staat aan' : 'Boodschappenlijst staat uit'); }}
+          onOpenFamily={() => setFamilyOpen(true)} onOpenAccess={() => setAccessOpen(true)}
+          onOpenStores={() => setStoresOpen(true)} onOpenStaples={() => setStaplesOpen(true)}
+          onSignOut={() => sb.auth.signOut()} onClose={() => setSettingsOpen(false)} />
+      )}
+      {storesOpen && <StoresSheet stores={stores} storeAisles={storeAisles} onAdd={(name) => persistSetting('stores', setStores, [...stores, name])} onRename={renameStore} onRemove={removeStore}
+        onSetAisleOrder={setStoreAisleList} onRenameAisle={renameStoreAisle} onRemoveAisle={removeStoreAisle} onResetAisles={resetStoreAisles} onClose={() => setStoresOpen(false)} />}
+      {staplesOpen && <StaplesSheet staples={staples} stores={stores} onAdd={addStaple} onUpdate={updateStaple} onDelete={deleteStaple} onClose={() => setStaplesOpen(false)} />}
       {familyOpen && (
         <FamilySheet members={members} onAdd={addMember} onUpdate={updateMember} onDelete={deleteMember} onClose={() => setFamilyOpen(false)} />
       )}
@@ -1908,44 +1933,44 @@ function App() {
   );
 }
 
-function UserMenu({ email, onSignOut, household, onHousehold, onOpenFamily, onOpenAccess, shoppingEnabled, onShoppingEnabled }) {
-  const [open, setOpen] = useState(false);
-  useBackClose(open, () => setOpen(false));
-  const initial = (email || '?').slice(0, 1).toUpperCase();
-  const item = 'w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-bold text-deep active:bg-mist text-left';
+// Alle instellingen op één plek (letter rechtsboven)
+function SettingsSheet({ email, household, onHousehold, shoppingEnabled, onShoppingEnabled, membersCount, storesCount, staplesCount,
+  onOpenFamily, onOpenAccess, onOpenStores, onOpenStaples, onSignOut, onClose }) {
+  const Row = ({ emoji, label, sub, onClick }) => (
+    <button onClick={onClick} className="w-full flex items-center gap-3 px-4 py-3.5 text-left active:bg-mist">
+      <span className="text-xl w-7 text-center">{emoji}</span>
+      <span className="flex-1 min-w-0"><span className="block text-[15px] font-extrabold text-deep">{label}</span>{sub && <span className="block text-[12px] text-stone-500">{sub}</span>}</span>
+      <Icon name="right" size={16} className="text-stone-300" />
+    </button>
+  );
   return (
-    <div className="relative">
-      <button onClick={() => setOpen(!open)} className="w-9 h-9 rounded-full bg-forest text-white font-black text-sm">{initial}</button>
-      {open && (
-        <>
-          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
-          <div className="absolute right-0 top-11 z-50 w-72 bg-white rounded-2xl border border-line shadow-lift p-2">
-            <div className="px-3 py-2 text-xs text-stone-500 truncate">Ingelogd als<br /><span className="font-bold text-deep">{email}</span></div>
-            <div className="border-t border-line/70 pt-1">
-              <button className={item} onClick={() => { setOpen(false); onOpenFamily(); }}><span className="text-base w-5 text-center">👨‍👩‍👧‍👦</span>Gezin &amp; voorkeuren</button>
-              <button className={item} onClick={() => { setOpen(false); onOpenAccess(); }}><span className="text-base w-5 text-center">🔐</span>Toegang beheren</button>
-            </div>
-            <div className="px-3 py-2 border-t border-line/70">
-              <div className="text-xs font-extrabold text-deep mb-1.5">Aantal personen in huis</div>
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-[11px] text-stone-400 leading-tight">Standaard voor nieuwe maaltijden</span>
-                <Stepper value={household || 5} min={1} onChange={onHousehold} />
-              </div>
-            </div>
-            <div className="px-3 py-2 border-t border-line/70">
-              <label className="flex items-center justify-between gap-2 cursor-pointer">
-                <span>
-                  <span className="block text-xs font-extrabold text-deep">🛒 Boodschappenlijst gebruiken</span>
-                  <span className="block text-[11px] text-stone-400 leading-tight">Uit = enkel plannen en recepten (voor jullie allebei)</span>
-                </span>
-                <input type="checkbox" checked={shoppingEnabled} onChange={(e) => onShoppingEnabled(e.target.checked)} className="w-5 h-5 accent-forest shrink-0" aria-label="Boodschappenlijst gebruiken" />
-              </label>
-            </div>
-            <button onClick={onSignOut} className="w-full flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm font-bold text-red-600 active:bg-red-50 border-t border-line/70"><Icon name="logout" size={16} />Uitloggen</button>
+    <Sheet title="Instellingen" subtitle={`Ingelogd als ${email || '—'}`} onClose={onClose}>
+      <div className="space-y-4">
+        <Card className="divide-y divide-line/70 overflow-hidden">
+          <Row emoji="👨‍👩‍👧‍👦" label="Gezin & voorkeuren" sub={membersCount ? `${membersCount} gezinsleden · allergieën en wat ze niet lusten` : 'Allergieën en wat iemand niet lust'} onClick={onOpenFamily} />
+          <div className="flex items-center gap-3 px-4 py-3">
+            <span className="text-xl w-7 text-center">🍽️</span>
+            <span className="flex-1 min-w-0"><span className="block text-[15px] font-extrabold text-deep">Personen in huis</span><span className="block text-[12px] text-stone-500">Standaard voor nieuwe maaltijden</span></span>
+            <Stepper value={household || 5} min={1} onChange={onHousehold} />
           </div>
-        </>
-      )}
-    </div>
+        </Card>
+        <Card className="divide-y divide-line/70 overflow-hidden">
+          <label className="flex items-center gap-3 px-4 py-3.5 cursor-pointer">
+            <span className="text-xl w-7 text-center">🛒</span>
+            <span className="flex-1 min-w-0"><span className="block text-[15px] font-extrabold text-deep">Boodschappenlijst gebruiken</span><span className="block text-[12px] text-stone-500">Uit = enkel plannen en recepten (voor jullie allebei)</span></span>
+            <input type="checkbox" checked={shoppingEnabled} onChange={(e) => onShoppingEnabled(e.target.checked)} className="w-5 h-5 accent-forest shrink-0" aria-label="Boodschappenlijst gebruiken" />
+          </label>
+          {shoppingEnabled && <Row emoji="🏪" label="Winkels & afdelingen" sub={`${storesCount} winkels · volgorde van je looproute`} onClick={onOpenStores} />}
+          {shoppingEnabled && <Row emoji="📌" label="Vaste boodschappen" sub={staplesCount ? `${staplesCount} items komen elke week op de lijst` : 'Melk, brood… elke week op de lijst'} onClick={onOpenStaples} />}
+        </Card>
+        <Card className="divide-y divide-line/70 overflow-hidden">
+          <Row emoji="🔐" label="Wie mag inloggen" sub="Google-adressen met toegang" onClick={onOpenAccess} />
+          <button onClick={onSignOut} className="w-full flex items-center gap-3 px-4 py-3.5 text-left text-red-600 active:bg-red-50">
+            <span className="w-7 flex justify-center"><Icon name="logout" size={18} /></span><span className="text-[15px] font-extrabold">Uitloggen</span>
+          </button>
+        </Card>
+      </div>
+    </Sheet>
   );
 }
 
@@ -1986,7 +2011,59 @@ function MoreMenu({ items }) {
   );
 }
 
-function PlannerPage({ nav, weekmenu, recipesById, weekLoading, members, selectedDay, setSelectedDay, onOpenMeal, onToggleLock, onFeedback, onEaten, aiTargetCount, aiBusy, onAiFill, onCopyPrev, showToast }) {
+// Vandaag-balk bovenaan de week: wat eten we vandaag, gegeten aanvinken (+ oordeel), en wat er nog te doen is.
+function TodayBar({ weekStart, weekmenu, recipesById, todo, onOpenMeal, onEaten, onEatenRate, onGo }) {
+  const day = DAYS[dayIndexOf(todayISO())];
+  const rows = MEALS.map(m => {
+    const slot = weekmenu[day][m.key];
+    const rs = slotRecipes(slot, recipesById);
+    const name = slotSummary(slot, recipesById);
+    return { m, slot, rs, name, past: mealIsPast(weekStart, day, m.key) };
+  });
+  const chips = [
+    todo.basket > 0 && { label: `🛒 ${todo.basket} te halen`, go: ['winkel'] },
+    todo.choose > 0 && { label: `📝 ${todo.choose} te kiezen`, go: ['shopping'] },
+    todo.out > 0 && { label: `🥫 ${todo.out} op in de voorraad`, go: ['keuken', 'voorraad'] },
+  ].filter(Boolean);
+  return (
+    <Card className="mb-4 overflow-hidden">
+      <div className="px-4 pt-3 pb-1 flex items-baseline justify-between">
+        <span className="text-[15px] font-black text-deep">Vandaag</span>
+        <span className="text-[12px] font-bold text-stone-500">{fmtDayLong(weekStart, DAYS.indexOf(day))}</span>
+      </div>
+      <div className="divide-y divide-line/60">
+        {rows.map(({ m, slot, rs, name, past }) => {
+          const empty = slotMode(slot) === 'empty';
+          const ask = past && rs.length > 0 && !slot.eatenAt;
+          return (
+            <div key={m.key} className="flex items-center gap-2 px-4 py-2">
+              <span className="w-6 text-center">{m.emoji}</span>
+              <button onClick={() => onOpenMeal(day, m.key)} className="flex-1 min-w-0 text-left">
+                <span className="block text-[11px] font-extrabold text-stone-500 uppercase tracking-wide">{m.label}</span>
+                <span className={cx('block text-[14px] font-bold truncate', empty ? 'text-sage' : 'text-ink')}>{empty ? '+ Plan deze maaltijd' : name}</span>
+              </button>
+              {ask && (
+                <span className="flex items-center gap-1 shrink-0">
+                  <button onClick={() => onEatenRate(day, m.key, 'up')} aria-label={`${m.label} gegeten, lekker`} className="h-9 px-2.5 rounded-xl bg-mint text-forest text-[13px] font-black">👍</button>
+                  <button onClick={() => onEatenRate(day, m.key, 'down')} aria-label={`${m.label} gegeten, minder lekker`} className="h-9 px-2.5 rounded-xl bg-mint text-forest text-[13px] font-black">👎</button>
+                  <button onClick={() => onEaten(day, m.key, true)} aria-label={`${m.label} gegeten`} className="h-9 px-2.5 rounded-xl bg-forest text-white text-[12px] font-black">✓ Gegeten</button>
+                </span>
+              )}
+              {slot.eatenAt && <button onClick={() => onEaten(day, m.key, false)} aria-label={`${m.label}: niet gegeten`} className="text-[12px] font-extrabold text-leaf shrink-0">✓ gegeten{slot.feedback === 'up' ? ' 👍' : slot.feedback === 'down' ? ' 👎' : ''}</button>}
+            </div>
+          );
+        })}
+      </div>
+      {chips.length > 0 && (
+        <div className="flex flex-wrap gap-1.5 px-4 pb-3 pt-1">
+          {chips.map(c => <button key={c.label} onClick={() => onGo(...c.go)} className="h-8 px-3 rounded-full bg-cream border border-line text-[12px] font-extrabold text-deep active:bg-mint">{c.label} ›</button>)}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function PlannerPage({ nav, weekmenu, recipesById, weekLoading, members, selectedDay, setSelectedDay, onOpenMeal, onToggleLock, onFeedback, onEaten, onEatenRate, todo, onGo, aiTargetCount, aiBusy, onAiFill, onCopyPrev, showToast }) {
   const [view, setView] = useState('day');
   const swipeRef = useRef(null);
   const today = todayISO();
@@ -2018,6 +2095,9 @@ function PlannerPage({ nav, weekmenu, recipesById, weekLoading, members, selecte
           { emoji: '📤', label: 'Weekoverzicht delen (coach)', onClick: shareWeekSummary },
           { emoji: '📋', label: 'Kopieer vorige week', onClick: onCopyPrev },
         ]} /></>} />
+
+      {nav.isCurrent && <TodayBar weekStart={nav.weekStart} weekmenu={weekmenu} recipesById={recipesById} todo={todo}
+        onOpenMeal={onOpenMeal} onEaten={onEaten} onEatenRate={onEatenRate} onGo={onGo} />}
 
       <div className="grid grid-cols-7 gap-1.5 mb-3">
         {DAYS.map((day, i) => {
@@ -2833,8 +2913,8 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
 
   return (
     <div>
-      <PageHeader eyebrow={`Week ${isoWeekNumber(nav.weekStart)} · ${fmtWeekRange(nav.weekStart)}`} title="Boodschappen"
-        right={<><IconBtn name="share" onClick={share} title="Delen" className="bg-white border border-line w-11 h-11" /><IconBtn name="settings" onClick={() => setShowStores(true)} title="Winkels & afdelingen" className="bg-white border border-line w-11 h-11" /></>} />
+      <PageHeader eyebrow={`Week ${isoWeekNumber(nav.weekStart)} · ${fmtWeekRange(nav.weekStart)}`} title="Lijst"
+        right={<IconBtn name="share" onClick={share} title="Delen" className="bg-white border border-line w-11 h-11" />} />
 
       <Card className="p-2 mb-3 flex gap-1.5">
         <input value={extraName} onChange={(e) => setExtraName(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') addExtra(); }}
@@ -2917,9 +2997,7 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
       )}
 
       <div className="mt-5 flex flex-wrap gap-2 justify-between items-center px-1">
-        <button onClick={() => setShowStaples(true)} className="flex items-center gap-1.5 text-[13px] font-extrabold text-forest py-2">
-          <Icon name="pin" size={15} />Vaste items{staples.length ? ` (${staples.filter(s => s.active).length})` : ''}
-        </button>
+        <span className="text-[12px] text-stone-400">Winkels en vaste boodschappen: letter rechtsboven</span>
         {items.some(i => i.state) && (
           <button onClick={onNewRound} className="flex items-center gap-1.5 text-[13px] font-extrabold text-forest py-2"><Icon name="refresh" size={15} />Lijst opnieuw opbouwen</button>
         )}
@@ -3738,9 +3816,14 @@ function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onUpdate, o
 
   return (
     <div>
-      <PageHeader eyebrow={`${inStock.length} items in huis`} title="Kast" />
-      <Segmented className="mb-4" value={view} onChange={setView}
-        options={[{ value: 'voorraad', label: 'Voorraad', icon: 'box' }, { value: 'maken', label: 'Wat kan ik maken?', icon: 'search' }]} />
+      <PageHeader eyebrow={`${inStock.length} items in huis`} title="Voorraad" />
+      {view === 'voorraad'
+        ? <button onClick={() => setView('maken')} className="w-full mb-4 flex items-center gap-3 rounded-2xl border border-line bg-white px-4 py-3 text-left active:bg-mist">
+            <Icon name="search" size={18} className="text-forest" />
+            <span className="flex-1 text-[14px] font-extrabold text-deep">Wat kan ik maken met wat ik in huis heb?</span>
+            <Icon name="right" size={16} className="text-stone-300" />
+          </button>
+        : <button onClick={() => setView('voorraad')} className="mb-4 text-[13px] font-extrabold text-forest">← Terug naar de voorraad</button>}
 
       {view === 'voorraad' ? (
         <div className="space-y-4">
