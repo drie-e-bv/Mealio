@@ -858,7 +858,7 @@ function Sheet({ title, subtitle, onClose, children, footer, z = 40, full }) {
 // 5. App (data + navigatie)
 // =================================================================
 const DEFAULT_STORES = ['Colruyt', 'Okay', 'Slager', 'Bakker'];
-const SETTINGS_DB_KEYS = { shoppingEnabled: 'shopping_enabled', stores: 'stores', itemStoreMap: 'item_store_map', householdSize: 'household_size', storeAisles: 'store_aisles', itemAisleMap: 'item_aisle_map', itemStoreAisleMap: 'item_store_aisle_map', storeAisleAlias: 'store_aisle_alias' };
+const SETTINGS_DB_KEYS = { shoppingEnabled: 'shopping_enabled', stores: 'stores', itemStoreMap: 'item_store_map', householdSize: 'household_size', storeAisles: 'store_aisles', itemAisleMap: 'item_aisle_map', itemStoreAisleMap: 'item_store_aisle_map', storeAisleAlias: 'store_aisle_alias', mainStore: 'main_store' };
 // Als de database nog niet bijgewerkt is (migratie-mealio-v2.sql), werkt de planner
 // gewoon verder zonder de "kook dubbel"-kolommen.
 let HAS_V2_COLUMNS = true;
@@ -892,6 +892,7 @@ function App() {
   const [storeAisles, setStoreAisles] = useState({});
   const [itemAisleMap, setItemAisleMap] = useState({});
   const [itemStoreAisleMap, setItemStoreAisleMap] = useState({});
+  const [mainStore, setMainStore] = useState('');                  // hoofdwinkel: standaard voor producten zonder winkel
   const [storeAisleAlias, setStoreAisleAlias] = useState({});       // { winkel: { eigenNaam: standaardafdeling } }   // { winkel: { product: afdeling } }
   const [checks, setChecks] = useState({});          // item_key -> 'cart' | 'have' (huidige week)
   const [extraRows, setExtraRows] = useState([]);    // losse items
@@ -1010,6 +1011,7 @@ function App() {
     setItemAisleMap(byKey.item_aisle_map || {});
     setItemStoreAisleMap(byKey.item_store_aisle_map || {});
     setStoreAisleAlias(byKey.store_aisle_alias || {});
+    setMainStore(typeof byKey.main_store === 'string' ? byKey.main_store : '');
     setShoppingEnabled(byKey.shopping_enabled !== false);
     HOUSEHOLD_SIZE = Number(byKey.household_size) || 5;
     setHouseholdSize(HOUSEHOLD_SIZE);
@@ -1494,12 +1496,42 @@ function App() {
       ...extraRows.map(r => ({ key: `extra:${r.id}`, kind: 'extra', extraId: r.id, name: r.name, unit: '', amount: 0, hasAmount: false, uses: [],
         store: validStore(r.store), aisle: aisleOf(r.name, r.aisle), state: r.checked ? 'cart' : 'buy' })),
     ];
+    // Automatisch invullen vanuit de voorraad (enkel als je zelf nog niets koos):
+    //   genoeg in voorraad of aantal onbekend → in huis · te weinig → kopen · basis (zout, olie…) → in huis tenzij op
+    //   twijfel (gelijkaardige naam, andere eenheid) → "controleer even"
+    const byName = {}; pantryStock.forEach(p => { byName[normalize(p.name)] = p; });
+    const inStockList = pantryStock.filter(p => p.inStock);
+    const main = validStore(mainStore) || stores[0] || '';
+    function auto(i) {
+      if (i.kind === 'extra' || i.kind === 'staple') return { state: 'buy' };
+      const exact = byName[normalize(i.name)];
+      const p = exact && exact.inStock ? exact : null;
+      if (p) {
+        if (p.qty == null || !i.hasAmount) return { state: 'have', note: 'in voorraad' };
+        const need = convertQty(i.amount, i.unit, p.unit);
+        if (need == null) return { state: null, note: `voorraad: ${fmtPantryQty(p)}` };
+        if (p.qty >= need - 1e-6) return { state: 'have', note: `voorraad: ${fmtPantryQty(p)}` };
+        // te weinig: enkel wat ontbreekt kopen
+        const restInItemUnit = convertQty(need - p.qty, p.unit, i.unit);
+        return { state: 'buy', note: `${fmtPantryQty(p)} in voorraad`, amount: restInItemUnit != null ? restInItemUnit : i.amount };
+      }
+      if (i.basic) return exact ? { state: 'buy', note: 'op in de voorraad' } : { state: 'have', note: 'basis, meestal in huis' };
+      const fuzzy = !exact && inStockList.find(x => ingredientMatches(i.name, [normalize(x.name)]));
+      if (fuzzy) return { state: null, note: `misschien in voorraad: ${fuzzy.name}` };
+      return { state: 'buy' };
+    }
     return list.map(i => {
+      const basic = isBasicIngredient(i);
+      const ownStore = i.store;
+      const store = ownStore || main;
       const baseAisle = i.aisle;
       const aisleFor = (st) => (st ? resolveAisle(i.name, baseAisle, st, storeAisles, itemStoreAisleMap, storeAisleAlias) : baseAisle);
-      return { ...i, baseAisle, aisle: aisleFor(i.store), aisleFor, basic: isBasicIngredient(i), inKast: i.kind !== 'extra' && stockNorm.length > 0 && ingredientMatches(i.name, stockNorm) };
+      const a = i.state ? null : auto({ ...i, basic });
+      return { ...i, basic, store, storeAuto: !ownStore && !!main, baseAisle, aisle: aisleFor(store), aisleFor,
+        state: i.state || a.state, auto: !!a, autoNote: a ? a.note || '' : '', amount: a && a.amount != null ? a.amount : i.amount,
+        inKast: i.kind !== 'extra' && stockNorm.length > 0 && ingredientMatches(i.name, stockNorm) };
     }).sort((a, b) => a.name.localeCompare(b.name));
-  }, [weekmenu, recipesById, staples, extraRows, checks, itemStoreMap, itemAisleMap, itemStoreAisleMap, storeAisleAlias, storeAisles, pantryStock, stores]);
+  }, [weekmenu, recipesById, staples, extraRows, checks, itemStoreMap, itemAisleMap, itemStoreAisleMap, storeAisleAlias, storeAisles, pantryStock, stores, mainStore]);
 
   // toestanden: null = nog kiezen · 'have' = in kast · 'buy' = winkelmandje · 'cart' = gekocht
   function setItemState(item, st) {
@@ -1514,7 +1546,7 @@ function App() {
   }
   function bulkState(list, st) {
     list.forEach(i => setItemState(i, st));
-    showToast(`${list.length} items ${st === 'buy' ? 'in het winkelmandje' : st === 'hidden' || st === 'cart' ? 'van de lijst gehaald' : 'in de kast'}`, { label: 'Ongedaan', onClick: () => list.forEach(i => setItemState(i, i.state)) });
+    showToast(`${list.length} items ${st === 'buy' ? 'in het winkelmandje' : st === 'hidden' || st === 'cart' ? 'van de lijst gehaald' : 'in de kast'}`, { label: 'Ongedaan', onClick: () => list.forEach(i => setItemState(i, i.auto ? null : i.state)) });
   }
   // Winkelen afronden: alles wat afgevinkt is gaat (met hoeveelheid) naar de kast en verdwijnt van de lijst
   async function finishShopping() {
@@ -1616,7 +1648,7 @@ function App() {
     const todo = shoppingItems.filter(i => (!i.state && !i.basic) || i.state === 'buy');
     if (!todo.length) return;
     todo.forEach(i => setItemState(i, 'cart'));
-    showToast(`✓ ${todo.length} items op gekocht gezet`, { label: 'Ongedaan', onClick: () => todo.forEach(i => setItemState(i, i.state)) });
+    showToast(`✓ ${todo.length} items op gekocht gezet`, { label: 'Ongedaan', onClick: () => todo.forEach(i => setItemState(i, i.auto ? null : i.state)) });
   }
   // Opnieuw beginnen: de lijst wordt opnieuw opgebouwd uit de maaltijden van deze week
   function newShoppingRound() {
@@ -1758,7 +1790,7 @@ function App() {
 
   const myEmail = session.user && session.user.email;
   const aiTargetCount = aiWeekTargets(weekmenu).length;
-  const shoppingTodo = shoppingItems.filter(i => !i.state && !i.basic).length;     // lijst: nog te kiezen
+  const shoppingTodo = shoppingItems.filter(i => !i.state).length;                 // lijst: nog te controleren
   const basketTodo = shoppingItems.filter(i => i.state === 'buy').length;            // winkelen: nog te halen
   const openMealSlot = mealSheet ? weekmenu[mealSheet.day][mealSheet.meal] : null;
   const openRecipe = recipeSheet ? recipesById[recipeSheet.id] : null;
@@ -1815,13 +1847,10 @@ function App() {
           <WinkelPage items={shoppingItems} stores={stores} onStoreMode={(s) => setStoreMode(s)} onGoList={() => switchTab('shopping')} />
         )}
         {tab === 'shopping' && shoppingEnabled && (
-          <ShoppingPage nav={weekNav} items={shoppingItems} stores={stores} storeAisles={storeAisles} staples={staples}
+          <ShoppingPage nav={weekNav} items={shoppingItems} stores={stores} storeAisles={storeAisles}
             online={online} pendingOps={pendingOps}
             onSetState={setItemState} onBulkState={bulkState} onAssignStore={assignStore} onAssignAisle={assignAisle} onRemoveItem={removeItem}
-            onAddExtra={addExtraItem} onStoreMode={(s) => setStoreMode(s)} onNewRound={newShoppingRound} onMarkAllBought={markAllBought}
-            onAddStore={(name) => persistSetting('stores', setStores, [...stores, name])} onRenameStore={renameStore} onRemoveStore={removeStore}
-            onSetAisleOrder={setStoreAisleList} onRenameAisle={renameStoreAisle} onRemoveAisle={removeStoreAisle} onResetAisles={resetStoreAisles}
-            onAddStaple={addStaple} onUpdateStaple={updateStaple} onDeleteStaple={deleteStaple} showToast={showToast} />
+            onAddExtra={addExtraItem} onNewRound={newShoppingRound} onGoShop={() => switchTab('winkel')} showToast={showToast} />
         )}
         {tab === 'keuken' && (
           <Segmented className="mb-4" value={keukenView} onChange={(v) => switchTab('keuken', v)}
@@ -1907,7 +1936,7 @@ function App() {
           onOpenStores={() => setStoresOpen(true)} onOpenStaples={() => setStaplesOpen(true)}
           onSignOut={() => sb.auth.signOut()} onClose={() => setSettingsOpen(false)} />
       )}
-      {storesOpen && <StoresSheet stores={stores} storeAisles={storeAisles} onAdd={(name) => persistSetting('stores', setStores, [...stores, name])} onRename={renameStore} onRemove={removeStore}
+      {storesOpen && <StoresSheet stores={stores} storeAisles={storeAisles} mainStore={mainStore} onSetMain={(st) => persistSetting('mainStore', setMainStore, st)} onAdd={(name) => persistSetting('stores', setStores, [...stores, name])} onRename={renameStore} onRemove={removeStore}
         onSetAisleOrder={setStoreAisleList} onRenameAisle={renameStoreAisle} onRemoveAisle={removeStoreAisle} onResetAisles={resetStoreAisles} onClose={() => setStoresOpen(false)} />}
       {staplesOpen && <StaplesSheet staples={staples} stores={stores} onAdd={addStaple} onUpdate={updateStaple} onDelete={deleteStaple} onClose={() => setStaplesOpen(false)} />}
       {familyOpen && (
@@ -2768,22 +2797,17 @@ function groupByAisle(items, order, aisleOf = (i) => i.aisle) {
   return groups.filter(g => g.items.length);
 }
 
-// Boodschappen in twee stappen:
-//   1. Wat heb je nodig?  → per item "🏠 In kast" of "🛒 Kopen"
-//   2. Winkelmandje       → per item de winkel kiezen (wordt onthouden voor volgende weken)
-// In de winkel: "Ik ben in de winkel" (afvinken = gekocht).
-function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendingOps, onSetState, onBulkState, onAssignStore, onAssignAisle, onRemoveItem,
-  onAddExtra, onStoreMode, onNewRound, onMarkAllBought, onAddStore, onRenameStore, onRemoveStore, onSetAisleOrder, onRenameAisle, onRemoveAisle, onResetAisles, onAddStaple, onUpdateStaple, onDeleteStaple, showToast }) {
+// Lijst — vult zichzelf in vanuit de voorraad:
+//   "Controleer even" = enkel twijfelgevallen · "Te kopen" per winkel (hoofdwinkel als standaard) · "In huis" ingeklapt
+// Afvinken gebeurt in Winkelen.
+function ShoppingPage({ nav, items, stores, storeAisles, online, pendingOps, onSetState, onBulkState, onAssignStore, onAssignAisle, onRemoveItem,
+  onAddExtra, onNewRound, onGoShop, showToast }) {
   const [extraName, setExtraName] = useState('');
-  const [showStores, setShowStores] = useState(false);
-  const [showStaples, setShowStaples] = useState(false);
-  const [pickStore, setPickStore] = useState(false);
   const [editItem, setEditItem] = useState(null);
   const [expanded, setExpanded] = useState(null);
   const [open, setOpen] = useState({});
 
-  const undecided = items.filter(i => !i.state && !i.basic);
-  const basics = items.filter(i => !i.state && i.basic);
+  const check = items.filter(i => !i.state);
   const basket = items.filter(i => i.state === 'buy');
   const have = items.filter(i => i.state === 'have');
   const bought = items.filter(i => i.state === 'cart');
@@ -2791,33 +2815,28 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
 
   const byStore = {};
   basket.forEach(i => { const k = i.store && stores.includes(i.store) ? i.store : '__none__'; (byStore[k] = byStore[k] || []).push(i); });
-  const noStore = byStore.__none__ || [];
-  const storeKeys = stores.filter(s => byStore[s]);
-  // in het mandje: per winkel, in winkelvolgorde (afdeling), gekochte onderaan
-  const boughtBy = {};
-  bought.forEach(i => { const k = i.store && stores.includes(i.store) ? i.store : '__none__'; (boughtBy[k] = boughtBy[k] || []).push(i); });
-  const basketStores = [...(noStore.length ? ['__none__'] : []), ...storeKeys];
+  const storeKeys = [...stores.filter(s => byStore[s]), ...(byStore.__none__ ? ['__none__'] : [])];
   const sortedFor = (s) => {
     const order = aisleOrderFor(s === '__none__' ? '' : s, storeAisles);
     const ai = (i) => { const k = order.indexOf(s === '__none__' ? i.baseAisle : i.aisleFor(s)); return k < 0 ? 999 : k; };
-    const by = (a, b) => ai(a) - ai(b) || a.name.localeCompare(b.name);
-    return (byStore[s] || []).sort(by);
+    return [...byStore[s]].sort((a, b) => ai(a) - ai(b) || a.name.localeCompare(b.name));
   };
-  function clearStep(list, label, st) {
-    if (!list.length) return;
-    if (window.confirm(`${label}: ${list.length} items helemaal van de lijst halen? (bv. boodschappen gedaan zonder de app)`)) onBulkState(list, st);
-  }
 
   function addExtra() { if (onAddExtra(extraName, '')) setExtraName(''); }
-  function choose(i, st) { onSetState(i, st); }
-  function pickStoreFor(i, s) { onAssignStore(i, s); setExpanded(null); }
+  function choose(i, st, msg) {
+    onSetState(i, st);
+    if (msg) showToast(msg, { label: 'Ongedaan', onClick: () => onSetState(i, i.auto ? null : i.state) });
+  }
+  function clearAll() {
+    if (!visibleAll.length) return;
+    onBulkState(visibleAll, 'hidden');
+  }
 
   async function share() {
     const lines = [`🛒 Boodschappen — week ${isoWeekNumber(nav.weekStart)}`];
-    [...storeKeys, ...(noStore.length ? ['__none__'] : [])].forEach(s => {
-      lines.push('', `*${s === '__none__' ? 'Nog geen winkel' : s}*`);
-      groupByAisle(byStore[s], aisleOrderFor(s === '__none__' ? '' : s, storeAisles), i => (s === '__none__' ? i.baseAisle : i.aisleFor(s)))
-        .forEach(g => g.items.forEach(i => lines.push(`☐ ${i.name}${i.kind === 'recipe' || i.kind === 'free' ? ' — ' + fmtShopAmount(i) : ''}`)));
+    storeKeys.forEach(s => {
+      lines.push('', `*${s === '__none__' ? 'Zonder winkel' : s}*`);
+      sortedFor(s).forEach(i => lines.push(`☐ ${i.name}${i.kind === 'recipe' || i.kind === 'free' ? ' — ' + fmtShopAmount(i) : ''}`));
     });
     const text = lines.join('\n');
     try {
@@ -2827,93 +2846,25 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
   }
 
   const sub = (i) => {
-    const s = i.kind === 'extra' ? 'zelf toegevoegd' : i.kind === 'staple' ? 'vast item' : fmtShopAmount(i);
+    const s = i.kind === 'extra' ? 'zelf toegevoegd' : i.kind === 'staple' ? 'vaste boodschap' : fmtShopAmount(i);
     const uses = (i.kind === 'recipe' || i.kind === 'free') && i.uses && i.uses.length ? ` · ${i.uses.join(', ')}` : '';
-    return <>{i.isExtra ? <b className="text-amber-700">extra erbij · </b> : null}{i.inKast ? <b className="text-leaf">in kast · </b> : null}{s}{uses}</>;
+    return <>{i.isExtra ? <b className="text-amber-700">extra erbij · </b> : null}{s}{uses}{i.autoNote ? <span className="text-leaf font-bold"> · {i.autoNote}</span> : null}</>;
   };
   const pill = 'h-10 px-3 rounded-xl text-[13px] font-black flex items-center gap-1 active:scale-95 transition shrink-0';
 
-  // stap 1: kast of kopen
-  const ChooseRow = ({ i }) => (
-    <div className="flex items-center gap-2 px-3.5 py-2.5">
-      <div className="flex-1 min-w-0">
-        <div className="text-[15px] font-bold text-ink truncate">{i.name}{i.kind === 'staple' ? ' 📌' : ''}</div>
-        <div className="text-[12px] text-stone-500 truncate">{sub(i)}</div>
-      </div>
-      <button onClick={() => choose(i, 'have')} aria-label={`${i.name}: in kast`} className={cx(pill, 'bg-cream border border-line text-stone-600')}>🏠 Kast</button>
-      <button onClick={() => choose(i, 'buy')} aria-label={`${i.name}: kopen`} className={cx(pill, 'bg-forest text-white')}>🛒 Kopen</button>
-    </div>
-  );
-  // stap 2: winkelmandje = afvinklijst (zoals Google Keep). Tik = gekocht, nog eens = terug.
   const StoreChips = ({ i }) => (
-    <div className="flex flex-wrap gap-1.5 pt-2 pl-10">
+    <div className="flex flex-wrap gap-1.5 pt-2">
       {stores.map(s => (
-        <button key={s} onClick={() => pickStoreFor(i, s)} aria-label={`${i.name} in ${s}`}
+        <button key={s} onClick={() => { onAssignStore(i, s); setExpanded(null); }} aria-label={`${i.name} in ${s}`}
           className={cx('h-9 px-3 rounded-xl text-[13px] font-extrabold border active:scale-95 transition', i.store === s ? 'bg-forest text-white border-forest' : 'bg-white text-deep border-line')}>{s}</button>
       ))}
       <button onClick={() => { setEditItem(i); setExpanded(null); }} className="h-9 px-2 text-[12px] font-extrabold text-stone-500">Afdeling: {i.aisle} ›</button>
     </div>
   );
-  const BasketRow = ({ i }) => {
-    const done = i.state === 'cart';
-    const needStore = !done && !i.store;
-    return (
-      <div className={cx('px-3 py-2', done && 'bg-cream/50')}>
-        <div className="flex items-center gap-2">
-          <button onClick={() => (done ? choose(i, 'buy') : setExpanded(expanded === i.key ? null : i.key))} aria-label={done ? `${i.name}: terug in winkelmandje` : `${i.name}: winkel kiezen`} className="flex-1 min-w-0 flex items-center gap-3 text-left py-1">
-            {done && <span className="w-7 h-7 rounded-full shrink-0 flex items-center justify-center bg-sage text-white"><Icon name="check" size={15} stroke={3} /></span>}
-            <span className="min-w-0">
-              <span className={cx('block text-[15px] font-bold truncate', done ? 'text-stone-400 line-through' : 'text-ink')}>{i.name}{i.kind === 'staple' ? ' 📌' : ''}</span>
-              {!done && <span className="block text-[12px] text-stone-500 truncate">{sub(i)}</span>}
-            </span>
-          </button>
-          {!done && (
-            <button onClick={() => setExpanded(expanded === i.key ? null : i.key)} aria-label={`Winkel voor ${i.name}`}
-              className={cx('h-9 px-2.5 rounded-xl text-[12px] font-extrabold shrink-0 border', needStore ? 'bg-amber-50 border-amber-300 text-amber-800' : 'bg-white border-line text-forest')}>
-              {i.store || 'Winkel?'} ▾
-            </button>
-          )}
-          <button onClick={() => (i.kind === 'extra' ? onRemoveItem(i) : choose(i, 'have'))} aria-label={`${i.name} van de lijst halen`}
-            className="w-9 h-9 shrink-0 flex items-center justify-center text-stone-400"><Icon name="x" size={16} /></button>
-        </div>
-        {!done && (needStore || expanded === i.key) && <StoreChips i={i} />}
-      </div>
-    );
-  };
-
-  const Fold = ({ id, label, list, onTap, action }) => list.length > 0 && (
-    <Card className="overflow-hidden">
-      <div className="flex items-center bg-cream/60">
-        <button onClick={() => setOpen({ ...open, [id]: !open[id] })} className="flex-1 px-4 py-3 flex items-center justify-between text-sm font-extrabold text-stone-600">
-          <span>{label} ({list.length})</span><Icon name="down" size={16} className={open[id] ? 'rotate-180' : ''} />
-        </button>
-        <button onClick={() => clearStep(list, `${label} leegmaken`, 'hidden')} aria-label={`${label} leegmaken`} title="Leegmaken"
-          className="w-9 h-9 mr-2 shrink-0 text-[13px] text-stone-500 bg-white rounded-full border border-line flex items-center justify-center">🗑</button>
-      </div>
-      {open[id] && (
-        <div className="divide-y divide-line/70">
-          {list.map(i => (
-            <button key={i.key} onClick={() => onTap(i)} className="w-full px-4 py-3 flex items-center gap-3 text-left active:bg-mist">
-              <span className="flex-1 min-w-0 text-[15px] font-semibold truncate text-stone-500">{i.name}</span>
-              <span className="shrink-0 text-xs font-extrabold text-forest bg-mint rounded-full px-3 py-1.5">{action}</span>
-            </button>
-          ))}
-        </div>
-      )}
-    </Card>
-  );
-
-  const StepHead = ({ n, title, count, right }) => (  // eslint-disable-line
-    <div className="px-4 py-3 flex items-center gap-2.5 bg-mist">
-      <span className="w-6 h-6 rounded-full bg-forest text-white text-[12px] font-black flex items-center justify-center shrink-0">{n}</span>
-      <span className="flex-1 text-[15px] font-black text-deep">{title} <span className="text-stone-500 font-bold">({count})</span></span>
-      {right}
-    </div>
-  );
 
   return (
     <div>
-      <PageHeader eyebrow={`Week ${isoWeekNumber(nav.weekStart)} · ${fmtWeekRange(nav.weekStart)}`} title="Lijst"
+      <PageHeader eyebrow={`Week ${isoWeekNumber(nav.weekStart)} · ${basket.length} te kopen`} title="Lijst"
         right={<IconBtn name="share" onClick={share} title="Delen" className="bg-white border border-line w-11 h-11" />} />
 
       <Card className="p-2 mb-3 flex gap-1.5">
@@ -2924,112 +2875,119 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
       </Card>
 
       {(!online || pendingOps > 0) && <div className="text-[12px] font-bold text-amber-800 mb-3 px-1">{online ? '⏳ Wijzigingen worden verstuurd…' : '📴 Offline — wordt later gesynchroniseerd'}</div>}
-      {items.length === 0 && <EmptyState emoji="🧺" title="Je lijst is nog leeg" text="Plan maaltijden in de Planner — wat je nodig hebt, verschijnt hier vanzelf." />}
+      {visibleAll.length === 0 && <EmptyState emoji="🧺" title="Je lijst is leeg" text="Plan maaltijden in de week — wat je nodig hebt en niet in de voorraad staat, komt hier vanzelf." />}
 
       <div className="space-y-3">
-        {(undecided.length > 0 || basics.length > 0) && (
-          <Card className="overflow-hidden">
-            <StepHead n="1" title="Wat heb je nodig?" count={undecided.length + basics.length}
-              right={<div className="flex gap-1.5">
-                {undecided.length > 1 && <button onClick={() => onBulkState(undecided, 'buy')} className="text-[12px] font-extrabold text-forest bg-white rounded-full px-3 py-1.5 border border-line">Alles kopen</button>}
-                <button onClick={() => clearStep([...undecided, ...basics], 'Stap 1 leegmaken', 'hidden')} aria-label="Stap 1 leegmaken" title="Leegmaken" className="w-8 h-8 text-[13px] text-stone-500 bg-white rounded-full border border-line flex items-center justify-center">🗑</button>
-              </div>} />
-            <div className="divide-y divide-line/70">
-              {undecided.map(i => <ChooseRow key={i.key} i={i} />)}
+        {check.length > 0 && (
+          <Card className="overflow-hidden border-amber-300">
+            <div className="px-4 py-3 bg-amber-50 flex items-center justify-between gap-2">
+              <span className="text-[15px] font-black text-amber-900">Controleer even ({check.length})</span>
+              {check.length > 1 && <button onClick={() => onBulkState(check, 'buy')} className="text-[12px] font-extrabold text-forest bg-white rounded-full px-3 py-1.5 border border-line">Alles kopen</button>}
             </div>
-            {basics.length > 0 && (
-              <>
-                <div className="px-4 pt-3 pb-1 flex items-center justify-between border-t border-line/70">
-                  <span className="text-[11px] font-black uppercase tracking-wider text-stone-500">🧂 Meestal in huis</span>
-                  <button onClick={() => onBulkState(basics, 'have')} className="text-[12px] font-extrabold text-stone-600">Alles in kast</button>
+            <div className="divide-y divide-line/70">
+              {check.map(i => (
+                <div key={i.key} className="flex items-center gap-2 px-3.5 py-2.5">
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[15px] font-bold text-ink truncate">{i.name}</div>
+                    <div className="text-[12px] text-stone-500 truncate">{sub(i)}</div>
+                  </div>
+                  <button onClick={() => choose(i, 'have')} aria-label={`${i.name}: heb ik`} className={cx(pill, 'bg-cream border border-line text-stone-600')}>🏠 Heb ik</button>
+                  <button onClick={() => choose(i, 'buy')} aria-label={`${i.name}: kopen`} className={cx(pill, 'bg-forest text-white')}>🛒 Kopen</button>
                 </div>
-                <div className="divide-y divide-line/70">{basics.map(i => <ChooseRow key={i.key} i={i} />)}</div>
-              </>
-            )}
+              ))}
+            </div>
           </Card>
         )}
 
-        {(basket.length > 0 || bought.length > 0) && (
+        {basket.length > 0 && (
           <Card className="overflow-hidden">
-            <StepHead n="2" title="Winkelmandje" count={basket.length}
-              right={basket.length > 0 && <button onClick={() => clearStep(basket, 'Winkelmandje leegmaken', 'hidden')} aria-label="Winkelmandje leegmaken" title="Leegmaken" className="w-8 h-8 text-[13px] text-stone-500 bg-white rounded-full border border-line flex items-center justify-center">🗑</button>} />
-            {basket.length > 0 && <div className="px-4 pt-2 text-[12px] text-stone-500">{noStore.length ? 'Kies een winkel bij de oranje items — dat wordt onthouden. ' : ''}Klaar? Ga naar <b>🛒 Winkelen</b> onderaan.</div>}
-            {basketStores.map(s => (
-              <div key={s} className="border-t border-line/70 mt-2 first:mt-1">
+            <div className="px-4 py-3 bg-mist flex items-center justify-between gap-2">
+              <span className="text-[15px] font-black text-deep">Te kopen ({basket.length})</span>
+              <button onClick={onGoShop} className="text-[12px] font-extrabold text-white bg-forest rounded-full px-3 py-1.5">🛒 Winkelen ›</button>
+            </div>
+            {storeKeys.map(s => (
+              <div key={s} className="border-t border-line/70 first:border-t-0">
                 <div className="px-4 pt-2.5 pb-0.5 flex items-center justify-between">
-                  <span className={cx('text-[13px] font-black', s === '__none__' ? 'text-amber-800' : 'text-deep')}>{s === '__none__' ? 'Nog geen winkel' : `🏪 ${s}`}</span>
-                  <span className="text-[12px] font-bold text-stone-500">{(byStore[s] || []).length} te halen</span>
+                  <span className="text-[13px] font-black text-deep">{s === '__none__' ? 'Zonder winkel' : `🏪 ${s}`}</span>
+                  <span className="text-[12px] font-bold text-stone-500">{byStore[s].length}</span>
                 </div>
-                <div className="divide-y divide-line/60">{sortedFor(s).map(i => <BasketRow key={i.key} i={i} />)}</div>
+                <div className="divide-y divide-line/60">
+                  {sortedFor(s).map(i => (
+                    <div key={i.key} className="px-3.5 py-2">
+                      <div className="flex items-center gap-2">
+                        <button onClick={() => setExpanded(expanded === i.key ? null : i.key)} aria-label={`${i.name}: winkel kiezen`} className="flex-1 min-w-0 text-left py-0.5">
+                          <span className="block text-[15px] font-bold text-ink truncate">{i.name}{i.kind === 'staple' ? ' 📌' : ''}</span>
+                          <span className="block text-[12px] text-stone-500 truncate">{sub(i)}</span>
+                        </button>
+                        <button onClick={() => setExpanded(expanded === i.key ? null : i.key)} aria-label={`Winkel voor ${i.name}`}
+                          className="h-9 px-2.5 rounded-xl text-[12px] font-extrabold shrink-0 border bg-white border-line text-forest">{i.store || 'Winkel?'} ▾</button>
+                        <button onClick={() => (i.kind === 'extra' ? onRemoveItem(i) : choose(i, 'have', `🏠 ${i.name}: heb ik`))} aria-label={`${i.name}: heb ik al`}
+                          className="w-9 h-9 shrink-0 flex items-center justify-center text-stone-400"><Icon name="x" size={16} /></button>
+                      </div>
+                      {expanded === i.key && <StoreChips i={i} />}
+                    </div>
+                  ))}
+                </div>
               </div>
             ))}
-            {bought.length > 0 && (
-              <div className="border-t border-line/70">
-                <div className="flex items-center">
-                  <button onClick={() => setOpen({ ...open, cart: !open.cart })} className="flex-1 px-4 py-2.5 flex items-center justify-between text-[13px] font-extrabold text-stone-500">
-                    <span>✓ Afgevinkt in de winkel ({bought.length})</span><Icon name="down" size={15} className={open.cart ? 'rotate-180' : ''} />
-                  </button>
-                  <button onClick={() => clearStep(bought, 'Gekocht leegmaken', 'hidden')} aria-label="Gekocht leegmaken" title="Leegmaken"
-                    className="w-8 h-8 mr-3 shrink-0 text-[12px] text-stone-500 bg-white rounded-full border border-line flex items-center justify-center">🗑</button>
-                </div>
-                {open.cart && <div className="divide-y divide-line/60 pb-1">{bought.map(i => <BasketRow key={i.key} i={i} />)}</div>}
+          </Card>
+        )}
+
+        {have.length > 0 && (
+          <Card className="overflow-hidden">
+            <button onClick={() => setOpen({ ...open, have: !open.have })} className="w-full px-4 py-3 flex items-center justify-between text-sm font-extrabold text-stone-600 bg-cream/60">
+              <span>🏠 In huis ({have.length})</span><Icon name="down" size={16} className={open.have ? 'rotate-180' : ''} />
+            </button>
+            {open.have && (
+              <div className="divide-y divide-line/70">
+                {have.map(i => (
+                  <div key={i.key} className="flex items-center gap-3 px-4 py-2.5">
+                    <span className="flex-1 min-w-0">
+                      <span className="block text-[15px] font-semibold truncate text-stone-600">{i.name}</span>
+                      <span className="block text-[12px] text-stone-400 truncate">{i.auto ? (i.autoNote || 'in voorraad') : 'zelf aangeduid'}</span>
+                    </span>
+                    <button onClick={() => choose(i, 'buy', `🛒 ${i.name} op de lijst`)} className="shrink-0 text-xs font-extrabold text-forest bg-mint rounded-full px-3 py-1.5">Toch kopen</button>
+                  </div>
+                ))}
               </div>
             )}
           </Card>
         )}
 
-        {undecided.length === 0 && basics.length === 0 && basket.length === 0 && items.length > 0 && (
-          <div className="text-center py-6"><div className="text-4xl">🎉</div><div className="font-black text-deep mt-2">Alles geregeld voor deze week</div></div>
+        {bought.length > 0 && (
+          <Card className="overflow-hidden">
+            <button onClick={() => setOpen({ ...open, cart: !open.cart })} className="w-full px-4 py-3 flex items-center justify-between text-sm font-extrabold text-stone-600 bg-cream/60">
+              <span>✓ Afgevinkt in de winkel ({bought.length})</span><Icon name="down" size={16} className={open.cart ? 'rotate-180' : ''} />
+            </button>
+            {open.cart && (
+              <div className="divide-y divide-line/70">
+                {bought.map(i => (
+                  <div key={i.key} className="flex items-center gap-3 px-4 py-2.5">
+                    <span className="flex-1 min-w-0 text-[15px] font-semibold truncate text-stone-400 line-through">{i.name}</span>
+                    <button onClick={() => choose(i, 'buy')} className="shrink-0 text-xs font-extrabold text-forest bg-mint rounded-full px-3 py-1.5">Terug</button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
         )}
-
-        <Fold id="have" label="🏠 In kast / niet nodig" list={have} onTap={(i) => choose(i, null)} action="Terug" />
       </div>
-
-      {visibleAll.length > 0 && (
-        <button onClick={() => { if (window.confirm(`Boodschappen gedaan en gekookt? De hele lijst (${visibleAll.length} items) wordt leeggemaakt. Plan je daarna nog iets, dan komt alleen dat op de lijst.`)) onBulkState(visibleAll, 'hidden'); }}
-          className="mt-4 w-full rounded-2xl border-2 border-dashed border-line bg-white/60 px-4 py-3 flex items-center gap-3 text-left active:bg-mist">
-          <span className="text-2xl">🧹</span>
-          <span className="flex-1">
-            <span className="block text-[14px] font-black text-forest">Alles leegmaken</span>
-            <span className="block text-[12px] text-stone-500">Gekocht en gekookt? Maak de hele lijst in één keer leeg.</span>
-          </span>
-        </button>
-      )}
 
       <div className="mt-5 flex flex-wrap gap-2 justify-between items-center px-1">
-        <span className="text-[12px] text-stone-400">Winkels en vaste boodschappen: letter rechtsboven</span>
-        {items.some(i => i.state) && (
-          <button onClick={onNewRound} className="flex items-center gap-1.5 text-[13px] font-extrabold text-forest py-2"><Icon name="refresh" size={15} />Lijst opnieuw opbouwen</button>
+        {visibleAll.length > 0
+          ? <button onClick={clearAll} className="flex items-center gap-1.5 text-[13px] font-extrabold text-stone-600 py-2">🧹 Lijst leegmaken</button>
+          : <span />}
+        {items.some(i => !i.auto && i.state) && (
+          <button onClick={onNewRound} className="flex items-center gap-1.5 text-[13px] font-extrabold text-forest py-2"><Icon name="refresh" size={15} />Opnieuw opbouwen</button>
         )}
       </div>
 
-      {pickStore && (
-        <Sheet title="In welke winkel ben je?" subtitle="Je ziet wat je daar moet halen, plus wat nog geen winkel heeft" onClose={() => setPickStore(false)}>
-          <div className="space-y-2">
-            {storeKeys.map(s => (
-              <button key={s} onClick={() => { setPickStore(false); onStoreMode(s); }}
-                className="w-full flex items-center justify-between rounded-2xl border border-line bg-white px-4 py-3.5 text-left active:bg-mist">
-                <span className="text-[15px] font-extrabold text-deep">{s}</span>
-                <span className="text-xs font-bold text-stone-500">{byStore[s].length + noStore.length} te halen</span>
-              </button>
-            ))}
-            <button onClick={() => { setPickStore(false); onStoreMode('__all__'); }}
-              className="w-full flex items-center justify-between rounded-2xl border-2 border-dashed border-line px-4 py-3.5 text-left active:bg-mist">
-              <span className="text-[15px] font-extrabold text-forest">Alles in één lijst</span>
-              <span className="text-xs font-bold text-stone-500">{basket.length} te halen</span>
-            </button>
-          </div>
-        </Sheet>
-      )}
       {editItem && (
         <ItemEditSheet item={items.find(i => i.key === editItem.key) || editItem} stores={stores} storeAisles={storeAisles}
           onAssignStore={(st) => onAssignStore(editItem, st)} onAssignAisle={(a) => onAssignAisle(editItem, a)}
           onRemove={(editItem.kind === 'extra' || editItem.kind === 'staple') ? () => { onRemoveItem(editItem); setEditItem(null); } : null}
           onClose={() => setEditItem(null)} />
       )}
-      {showStores && <StoresSheet stores={stores} storeAisles={storeAisles} onAdd={onAddStore} onRename={onRenameStore} onRemove={onRemoveStore}
-        onSetAisleOrder={onSetAisleOrder} onRenameAisle={onRenameAisle} onRemoveAisle={onRemoveAisle} onResetAisles={onResetAisles} onClose={() => setShowStores(false)} />}
-      {showStaples && <StaplesSheet staples={staples} stores={stores} onAdd={onAddStaple} onUpdate={onUpdateStaple} onDelete={onDeleteStaple} onClose={() => setShowStaples(false)} />}
     </div>
   );
 }
@@ -3098,14 +3056,15 @@ function AisleEditor({ store, order, isCustom, onChange, onRename, onRemove, onR
   );
 }
 
-function StoresSheet({ stores, storeAisles, onAdd, onRename, onRemove, onSetAisleOrder, onRenameAisle, onRemoveAisle, onResetAisles, onClose }) {
+function StoresSheet({ stores, storeAisles, mainStore, onSetMain, onAdd, onRename, onRemove, onSetAisleOrder, onRenameAisle, onRemoveAisle, onResetAisles, onClose }) {
+  const main = stores.includes(mainStore) ? mainStore : stores[0];
   const [names, setNames] = useState({});
   const [newStore, setNewStore] = useState('');
   const [openAisles, setOpenAisles] = useState(null);
   const commit = (old) => { const v = names[old]; if (v !== undefined && v.trim() && v.trim() !== old) onRename(old, v.trim()); };
   const add = () => { if (newStore.trim() && !stores.includes(newStore.trim())) { onAdd(newStore.trim()); setNewStore(''); } };
   return (
-    <Sheet title="Winkels & afdelingen" subtitle="Per winkel: eigen afdelingen, in de volgorde waarin je door de winkel loopt" onClose={onClose}>
+    <Sheet title="Winkels & afdelingen" subtitle="Hoofdwinkel = waar producten zonder winkel naartoe gaan. Per winkel: eigen afdelingen in de volgorde van je looproute" onClose={onClose}>
       <div className="space-y-2.5">
         {stores.map(s => (
           <Card key={s} className="p-2.5">
@@ -3114,6 +3073,10 @@ function StoresSheet({ stores, storeAisles, onAdd, onRename, onRemove, onSetAisl
                 onBlur={() => commit(s)} onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }} className={inputCls} />
               <IconBtn name="trash" title="Verwijderen" onClick={() => { if (window.confirm(`Winkel "${s}" verwijderen?`)) onRemove(s); }} />
             </div>
+            <button onClick={() => onSetMain(s)} aria-pressed={main === s}
+              className={cx('mt-2 text-[12px] font-extrabold rounded-full px-3 py-1.5', main === s ? 'bg-forest text-white' : 'bg-cream text-stone-600 border border-line')}>
+              {main === s ? '⭐ Hoofdwinkel' : '☆ Maak hoofdwinkel'}
+            </button>
             <button onClick={() => setOpenAisles(openAisles === s ? null : s)} className="mt-2 w-full flex items-center justify-between px-1 text-xs font-extrabold text-forest">
               <span>Afdelingen ({aisleOrderFor(s, storeAisles).length}){storeAisles[s] && storeAisles[s].some(a => !AISLES.includes(a)) ? ' · eigen indeling' : ''}</span><Icon name="down" size={14} className={openAisles === s ? 'rotate-180' : ''} />
             </button>
