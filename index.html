@@ -3906,7 +3906,7 @@ function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onRemoveMan
               <div className="flex items-center justify-between mb-1.5 px-1">
                 <span className="text-[11px] font-extrabold uppercase tracking-wide text-stone-400">In huis ({inStock.length})</span>
                 <button onClick={() => setTidy(!tidy)} className={cx('text-[12px] font-extrabold rounded-full px-3 py-1.5', tidy ? 'bg-forest text-white' : 'bg-mint text-forest')}>
-                  {tidy ? '✓ Klaar met opruimen' : '🧹 Opruimen & aantallen'}
+                  {tidy ? '✓ Klaar' : '✏️ Aantallen invullen'}
                 </button>
               </div>
               {tidy && <p className="text-[12px] text-stone-500 px-1 mb-2">Pas aan wat er écht nog is: − en +, of tik op het getal. Op 0 = op.</p>}
@@ -3933,8 +3933,11 @@ function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onRemoveMan
                   <div key={p.id} className="flex items-center gap-3 px-3 py-2.5">
                     <button onClick={() => onToggle(p.id)} className="w-6 h-6 rounded-full bg-sage text-white flex items-center justify-center shrink-0" aria-label="Markeer als op"><Icon name="check" size={14} stroke={3} /></button>
                     <span className="flex-1 min-w-0 text-sm font-bold text-ink truncate">{p.name}</span>
-                    {p.qty != null && <span className="text-[12px] font-extrabold text-leaf bg-mint rounded-full px-2 py-0.5 shrink-0">{fmtPantryQty(p)}</span>}
-                    <button onClick={() => onToggle(p.id)} className="text-[11px] font-extrabold text-stone-400 px-2 py-1 rounded-lg active:bg-mist">Op</button>
+                    <span className="flex items-center gap-1 shrink-0">
+                      <button onClick={() => bump(p, -1)} aria-label={`${p.name} minder`} className="w-8 h-8 rounded-lg bg-cream border border-line text-base font-black text-deep">−</button>
+                      <span className="min-w-[3.2rem] text-center text-[12px] font-extrabold text-leaf">{p.qty != null ? fmtPantryQty(p) : 'in huis'}</span>
+                      <button onClick={() => bump(p, 1)} aria-label={`${p.name} meer`} className="w-8 h-8 rounded-lg bg-cream border border-line text-base font-black text-deep">+</button>
+                    </span>
                   </div>
                 ))}
               </Card>
