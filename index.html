@@ -1277,10 +1277,10 @@ function App() {
     prev = prev.filter(e => slotIsPlanned(entryToSlot(e)));
     if (!prev.length) { showToast('Vorige week is leeg — niets om te kopiëren'); return; }
     const wm = buildWeekmenu(entriesRef.current);
-    const todo = prev.filter(e => !wm[e.day][e.meal].locked);
+    const todo = prev.filter(e => !slotIsPlanned(wm[e.day][e.meal]));   // enkel lege maaltijden invullen
     const kept = prev.length - todo.length;
-    if (!todo.length) { showToast('Alles van deze week staat vast 🔒 — niets gekopieerd'); return; }
-    if (!window.confirm(`${todo.length} maaltijd(en) van vorige week overnemen?${kept ? `\n${kept} vaste maaltijd(en) van deze week blijven staan.` : ''}`)) return;
+    if (!todo.length) { showToast('Deze week is al volledig gepland — niets gekopieerd'); return; }
+    if (!window.confirm(`${todo.length} lege maaltijd(en) invullen met vorige week?${kept ? `\n${kept} maaltijd(en) die je al koos, blijven staan.` : ''}`)) return;
     for (const e of todo) {
       await updateMealSlot(e.day, e.meal, { persons: e.persons, category: e.type, recipeId: e.recipeId, componentIds: e.componentIds, notes: e.notes,
         locked: true, aiGenerated: false, feedback: null, doubleFor: e.doubleFor || null, leftoverFrom: e.leftoverFrom || null });
@@ -1344,7 +1344,7 @@ function App() {
     const t = [];
     DAYS.forEach(day => MEALS.forEach(({ key }) => {
       const s = wm[day][key];
-      if (NO_RECIPE_TYPES.includes(s.category) || s.locked) return;
+      if (NO_RECIPE_TYPES.includes(s.category) || slotIsPlanned(s)) return;   // wat gekozen is, blijft
       // lege slots krijgen het standaardtype van die maaltijd, zodat "Vul de week" ze ook invult
       t.push({ day, meal: key, type: s.category || defaultTypeFor(key), keep: [], filled: slotIsPlanned(s) });
     }));
@@ -1352,9 +1352,7 @@ function App() {
   }
   async function aiFillWeek() {
     const targets = aiWeekTargets(buildWeekmenu(entriesRef.current));
-    if (!targets.length) { showToast('Alle maaltijden van deze week staan vast of zijn overgeslagen — niets om in te vullen.'); return; }
-    const filled = targets.filter(t => t.filled).length;
-    if (filled && !window.confirm(`${filled} ingevulde maaltijd(en) staan niet vast 🔒 en worden opnieuw gekozen. Doorgaan?`)) return;
+    if (!targets.length) { showToast('Alle maaltijden van deze week zijn al gepland — niets om in te vullen.'); return; }
     const n = await runAiPlan(targets.map(({ day, meal, type }) => ({ day, meal, type, keep: [] })));
     if (n) showToast(`✨ ${n} maaltijd(en) ingevuld`);
   }
@@ -2185,7 +2183,7 @@ function PlannerPage({ nav, weekmenu, recipesById, weekLoading, members, selecte
             <MealCard key={m.key} meal={m} slot={weekmenu[selectedDay][m.key]} recipesById={recipesById} members={members}
               onOpen={() => onOpenMeal(selectedDay, m.key)} onToggleLock={() => onToggleLock(selectedDay, m.key)}
               onFeedback={(v) => onFeedback(selectedDay, m.key, v)}
-              canEat={mealIsPast(nav.weekStart, selectedDay, m.key)} onEaten={(v) => onEaten(selectedDay, m.key, v)} />
+              canEat={mealIsPast(nav.weekStart, selectedDay, m.key)} onEaten={(v) => onEaten(selectedDay, m.key, v)} onEatenRate={(v) => onEatenRate(selectedDay, m.key, v)} />
           ))}
         </div>
       ) : (
@@ -2205,7 +2203,7 @@ function PlannerPage({ nav, weekmenu, recipesById, weekLoading, members, selecte
                     <span className={cx('flex-1 text-[13px] truncate', summary ? 'font-semibold text-ink' : 'text-stone-300')}>{summary || 'Nog niets'}</span>
                     {s.doubleFor && <span className="text-[10px]" title="Dubbel koken">🍲</span>}
                     {s.aiGenerated && <span className="text-[10px]">✨</span>}
-                    {s.locked && <Icon name="lock" size={12} className="text-sage" />}
+                    {s.eatenAt && <Icon name="check" size={12} className="text-sage" />}
                   </button>
                 );
               })}
@@ -2217,7 +2215,7 @@ function PlannerPage({ nav, weekmenu, recipesById, weekLoading, members, selecte
   );
 }
 
-function MealCard({ meal, slot, recipesById, members, onOpen, onToggleLock, onFeedback, canEat, onEaten }) {
+function MealCard({ meal, slot, recipesById, members, onOpen, onFeedback, canEat, onEaten, onEatenRate }) {
   const mode = slotMode(slot);
   const rs = slotRecipes(slot, recipesById);
   const hits = restrictionHits(rs, members);
@@ -2234,8 +2232,7 @@ function MealCard({ meal, slot, recipesById, members, onOpen, onToggleLock, onFe
         <span className="text-[11px] text-stone-400 font-bold flex items-center gap-1"><Icon name="users" size={12} />{slot.persons}</span>
         {slot.aiGenerated && <span className="text-[10px] font-black text-sage bg-mist rounded-full px-2 py-0.5">✨ AI</span>}
         <div className="flex-1" />
-        <IconBtn name={slot.locked ? 'lock' : 'unlock'} onClick={onToggleLock} active={slot.locked} size={15}
-          title={slot.locked ? 'Vast — de AI laat dit staan' : 'Open — de AI mag dit (her)invullen'} />
+
       </div>
 
       <button onClick={onOpen} className="w-full text-left px-4 pb-3 pt-1 active:bg-mist/50">
@@ -2294,24 +2291,24 @@ function MealCard({ meal, slot, recipesById, members, onOpen, onToggleLock, onFe
       </button>
 
       {rs.length > 0 && (canEat || slot.eatenAt) && (
-        <button onClick={() => onEaten(!slot.eatenAt)} aria-label={slot.eatenAt ? `${meal.label}: niet gegeten` : `${meal.label}: gegeten`}
-          className={cx('w-full flex items-center gap-2.5 px-4 py-2.5 border-t border-line/70 text-left active:bg-mist', slot.eatenAt ? 'bg-mint/60' : 'bg-white')}>
-          <span className={cx('w-6 h-6 rounded-full shrink-0 flex items-center justify-center border-2', slot.eatenAt ? 'bg-sage border-sage text-white' : 'border-forest')}>
-            {slot.eatenAt && <Icon name="check" size={14} stroke={3} />}
-          </span>
-          <span className="flex-1 text-[13px] font-extrabold text-deep">{slot.eatenAt ? 'Gegeten — uit de kast gehaald' : 'Gegeten? Vink aan — gebruikte ingrediënten gaan uit de kast'}</span>
-        </button>
-      )}
-      {rs.length > 0 && (
-        <div className="flex items-center justify-between pl-4 pr-2 py-1.5 bg-mist/70 border-t border-line/70">
-          <span className="text-[11px] font-bold text-stone-500">{carbs != null ? `≈ ${Math.round(carbs)} g koolhydraten` : 'Hoe was het?'}</span>
-          <div className="flex items-center">
-            <IconBtn name="up" size={15} active={slot.feedback === 'up'} title="Lekker! Vaker"
-              onClick={() => onFeedback(slot.feedback === 'up' ? null : 'up')} />
-            <IconBtn name="thumbdown" size={15} active={slot.feedback === 'down'} title="Minder vaak"
-              onClick={() => onFeedback(slot.feedback === 'down' ? null : 'down')} />
-          </div>
+        <div className={cx('flex items-center gap-2 px-4 py-2 border-t border-line/70', slot.eatenAt ? 'bg-mint/60' : 'bg-mist/70')}>
+          {slot.eatenAt ? (
+            <button onClick={() => onEaten(false)} aria-label={`${meal.label}: niet gegeten`} className="flex-1 flex items-center gap-2 text-left">
+              <span className="w-6 h-6 rounded-full bg-sage text-white flex items-center justify-center shrink-0"><Icon name="check" size={14} stroke={3} /></span>
+              <span className="text-[13px] font-extrabold text-deep">Gegeten{slot.feedback === 'up' ? ' · 👍 lekker' : slot.feedback === 'down' ? ' · 👎 minder' : ''}</span>
+            </button>
+          ) : (
+            <>
+              <span className="flex-1 text-[13px] font-extrabold text-deep">Gegeten?</span>
+              <button onClick={() => onEatenRate('up')} aria-label={`${meal.label} gegeten, lekker`} className="h-9 px-2.5 rounded-xl bg-white border border-line text-[13px] font-black">👍</button>
+              <button onClick={() => onEatenRate('down')} aria-label={`${meal.label} gegeten, minder lekker`} className="h-9 px-2.5 rounded-xl bg-white border border-line text-[13px] font-black">👎</button>
+              <button onClick={() => onEaten(true)} aria-label={`${meal.label}: gegeten`} className="h-9 px-2.5 rounded-xl bg-forest text-white text-[12px] font-black">✓</button>
+            </>
+          )}
         </div>
+      )}
+      {rs.length > 0 && !(canEat || slot.eatenAt) && carbs != null && (
+        <div className="px-4 py-1.5 bg-mist/70 border-t border-line/70 text-[11px] font-bold text-stone-500">≈ {Math.round(carbs)} g koolhydraten</div>
       )}
     </Card>
   );
@@ -2530,10 +2527,11 @@ function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, 
   const mealDef = MEALS.find(m => m.key === meal);
   const mode = slotMode(slot);
   const [openRow, setOpenRow] = useState(null);
-  const [changingRecipe, setChangingRecipe] = useState(false);
+  const [changing, setChanging] = useState(false);   // "iets anders kiezen" vanuit een ingevulde maaltijd
   const reset = { aiGenerated: false, feedback: null };
 
   function setMode(next) {
+    setChanging(false);
     if (next === mode) return;
     setOpenRow(null);
     // een snelle notitie hoort niet mee te verhuizen naar een andere soort maaltijd
@@ -2541,9 +2539,6 @@ function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, 
     if (next === 'compose') {
       const ids = [...new Set([slot.recipeId, ...slot.componentIds].filter(Boolean))];
       onChange({ ...base, category: TYPE_COMPOSE, recipeId: '', componentIds: ids, locked: ids.length > 0 });
-    } else if (next === 'recipe') {
-      onChange({ ...base, category: meal === 'Ontbijt' ? 'Ontbijt' : 'Hoofdmaaltijd', recipeId: '', locked: false });
-      setChangingRecipe(true);
     } else if (next === 'leftovers') onChange({ ...base, category: TYPE_LEFTOVERS, recipeId: '', componentIds: [], locked: true });
     else if (next === 'skip') onChange({ ...base, category: TYPE_SKIP, recipeId: '', componentIds: [], notes: '', locked: true });
     else if (next === 'free') onChange({ ...reset, category: TYPE_FREE, recipeId: '', componentIds: [], notes: '', locked: true });
@@ -2556,7 +2551,13 @@ function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, 
   function pickRecipe(r) {
     if (isComponent(r.category)) onChange({ ...reset, category: TYPE_COMPOSE, recipeId: '', componentIds: [r.id], notes: '', locked: true });
     else onChange({ ...reset, category: r.category || 'Hoofdmaaltijd', recipeId: r.id, componentIds: [], notes: '', locked: true });
+    setChanging(false);
     onClose();
+  }
+  // lege maaltijd: AI kiest een recept van het gewone type
+  function aiPick() {
+    onChange({ ...reset, category: defaultTypeFor(meal), recipeId: '', componentIds: [], notes: '' });
+    setTimeout(onAiFill, 0);
   }
   function noteToRecipe() {
     const cat = meal === 'Ontbijt' ? 'Ontbijt' : 'Hoofdmaaltijd';
@@ -2589,52 +2590,38 @@ function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, 
       }>
       <div className="flex items-center justify-between gap-3 mb-4">
         <Stepper value={slot.persons} onChange={(v) => onChange({ persons: v })} label="pers." />
-        <button onClick={() => onChange({ locked: !slot.locked })}
-          className={cx('flex items-center gap-1.5 rounded-xl px-3 py-2 text-xs font-black', slot.locked ? 'bg-mint text-forest' : 'bg-white border border-line text-stone-500')}>
-          <Icon name={slot.locked ? 'lock' : 'unlock'} size={14} />{slot.locked ? 'Vast' : 'AI mag kiezen'}
-        </button>
+        {slot.aiGenerated && mode !== 'empty' && <span className="text-[11px] font-black text-sage bg-mist rounded-full px-2.5 py-1">✨ door AI gekozen</span>}
       </div>
 
-      {mode === 'empty' && (
+      {(mode === 'empty' || changing) ? (
         <>
-          <QuickPick recipes={recipes} meal={meal} onPickRecipe={pickRecipe} onSaveNote={(t) => { saveNote(t); onClose(); }} />
-          <div className="text-[11px] font-extrabold uppercase tracking-wide text-stone-500 mb-1.5">Of kies</div>
+          <QuickPick recipes={recipes} meal={meal} onPickRecipe={pickRecipe} onSaveNote={(t) => { saveNote(t); setChanging(false); onClose(); }} />
+          <div className="text-[11px] font-extrabold uppercase tracking-wide text-stone-500 mb-1.5">Of</div>
+          <div className="flex flex-wrap gap-1.5 mb-4">
+            {[
+              { v: 'compose', label: '🧩 Samenstellen', on: () => setMode('compose') },
+              { v: 'leftovers', label: '🍱 Restjes', on: () => setMode('leftovers') },
+              { v: 'skip', label: '⏭ Overslaan', on: () => { setMode('skip'); onClose(); } },
+              mode === 'empty' && { v: 'ai', label: aiBusy ? '✨ AI is bezig…' : '✨ Laat AI kiezen', on: aiPick },
+            ].filter(Boolean).map(o => (
+              <button key={o.v} onClick={o.on} disabled={o.v === 'ai' && aiBusy}
+                className="h-10 px-3.5 rounded-full bg-white border border-line text-[13px] font-extrabold text-deep active:bg-mint disabled:opacity-50">{o.label}</button>
+            ))}
+          </div>
+          {changing && <Btn variant="ghost" size="sm" onClick={() => setChanging(false)}>Annuleren</Btn>}
         </>
-      )}
-      <div className="grid grid-cols-4 gap-1.5 mb-5">
-        {MODES.map(m => (
-          <button key={m.value} onClick={() => setMode(m.value)}
-            className={cx('rounded-2xl py-2.5 flex flex-col items-center gap-1 border transition',
-              mode === m.value ? 'bg-forest border-forest text-white shadow-card' : 'bg-white border-line text-deep')}>
-            <span className="text-xl leading-none">{m.emoji}</span>
-            <span className="text-[11px] font-extrabold">{m.label}</span>
-          </button>
-        ))}
-      </div>
+      ) : null}
 
-
-      {mode === 'free' && (
+      {!changing && mode === 'free' && (
         <div className="space-y-3">
           <QuickNote value={slot.notes || ''} onSave={saveNote} />
-          {parseFreeItems(slot.notes).length > 0 && (
-            <div className="rounded-2xl bg-mist px-3.5 py-3">
-              <div className="text-[11px] font-extrabold text-forest mb-1.5">🛒 Komt op de boodschappenlijst</div>
-              <div className="flex flex-wrap gap-1.5">
-                {parseFreeItems(slot.notes).map(n => <span key={n} className="rounded-full bg-white border border-line px-2.5 py-1 text-xs font-bold text-ink">{n}</span>)}
-              </div>
-              <div className="text-[11px] text-stone-500 mt-1.5">In de boodschappenlijst kies je per item: 🏠 Kast of 🛒 Kopen.</div>
-            </div>
-          )}
           {(slot.notes || '').trim() && (
             <Btn variant="secondary" className="w-full" icon="book" onClick={noteToRecipe}>Toch bewaren als recept</Btn>
           )}
         </div>
       )}
-      {(mode === 'recipe' || mode === 'compose') && (
-        <button onClick={() => setMode('free')} className="w-full -mt-3 mb-4 text-xs font-extrabold text-sage py-2">✏️ Gewoon noteren, zonder recept</button>
-      )}
 
-      {mode === 'compose' && (
+      {!changing && mode === 'compose' && (
         <div className="space-y-2.5">
           <p className="text-xs text-stone-500 -mt-1 mb-1">Kies per onderdeel een recept. Leeg laten mag — de AI kan het aanvullen.</p>
           {COMPOSE_ROWS.map(row => (
@@ -2645,17 +2632,9 @@ function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, 
         </div>
       )}
 
-      {mode === 'recipe' && (
+      {!changing && mode === 'recipe' && (
         <div className="space-y-3">
-          <div className="flex gap-1.5 overflow-x-auto no-scrollbar -mx-5 px-5">
-            {DISH_CATEGORIES.map(c => (
-              <button key={c} onClick={() => { if (c !== slot.category) { onChange({ ...reset, category: c, recipeId: main && main.category === c ? slot.recipeId : '', locked: false }); setChangingRecipe(true); } }}
-                className={cx('shrink-0 rounded-full px-3 py-1.5 text-xs font-extrabold border', slot.category === c ? 'bg-forest text-white border-forest' : 'bg-white text-deep border-line')}>
-                {catMeta(c).emoji} {c}
-              </button>
-            ))}
-          </div>
-          {main && !changingRecipe ? (
+          {main ? (
             <Card className="p-3.5">
               <div className="flex items-start gap-3">
                 <div className="w-11 h-11 rounded-xl bg-mist flex items-center justify-center text-xl">{catMeta(main.category).emoji}</div>
@@ -2663,19 +2642,11 @@ function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, 
                   <div className="font-extrabold text-ink leading-snug">{main.title}</div>
                   <div className="flex items-center gap-2 mt-1"><Stars value={main.stars} />{main.carbsPerPortion != null && <span className="text-[11px] font-bold text-stone-400">{fmtAmount(main.carbsPerPortion)} g koolh./pers.</span>}</div>
                 </div>
-              </div>
-              <div className="flex gap-2 mt-3">
-                <Btn variant="soft" size="sm" icon="book" onClick={() => onOpenRecipe(main.id)}>Bekijk / bewerk</Btn>
-                <Btn variant="secondary" size="sm" icon="refresh" onClick={() => setChangingRecipe(true)}>Ander recept</Btn>
+                <Btn variant="soft" size="sm" icon="book" onClick={() => onOpenRecipe(main.id)}>Bekijk</Btn>
               </div>
             </Card>
           ) : (
-            <Card className="p-3">
-              <RecipePicker recipes={recipes} categories={[slot.category]}
-                onPick={(id) => { onChange({ ...reset, recipeId: id, locked: true }); setChangingRecipe(false); }}
-                onCreate={(q) => onCreateRecipe({ category: slot.category, title: q, onCreated: (id) => { onChange({ ...reset, recipeId: id, locked: true }); setChangingRecipe(false); } })} />
-              {main && <Btn variant="ghost" size="sm" className="mt-1" onClick={() => setChangingRecipe(false)}>Annuleren</Btn>}
-            </Card>
+            <Card className="p-3.5 text-sm font-bold text-stone-500">{catMeta(slot.category).emoji} {catMeta(slot.category).label} — nog geen recept. Tik op "Iets anders kiezen" of laat de AI kiezen.</Card>
           )}
           <ComposeRow row={{ key: 'Erbij', label: 'Erbij (groenten, saus, …)', emoji: '➕', categories: COMPONENT_CATEGORIES }}
             ids={slot.componentIds || []} recipes={recipes} recipesById={recipesById}
@@ -2684,7 +2655,7 @@ function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, 
         </div>
       )}
 
-      {mode === 'leftovers' && slot.leftoverFrom && (
+      {!changing && mode === 'leftovers' && slot.leftoverFrom && (
         <Card className="p-3.5 mb-3 flex items-center gap-3">
           <span className="text-2xl">🍲</span>
           <div className="flex-1 min-w-0">
@@ -2694,10 +2665,15 @@ function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, 
           <Btn variant="secondary" size="sm" onClick={onUndoDouble}>Opheffen</Btn>
         </Card>
       )}
-      {mode === 'leftovers' && <RestjesBlock slot={slot} onChange={onChange} />}
-      {mode === 'skip' && <div className="text-center text-sm text-stone-500 py-6">⏭ Geen maaltijd gepland — hiervoor wordt niets ingekocht.</div>}
+      {!changing && mode === 'leftovers' && <RestjesBlock slot={slot} onChange={onChange} />}
+      {!changing && mode === 'skip' && <div className="text-center text-sm text-stone-500 py-6">⏭ Geen maaltijd gepland — hiervoor wordt niets ingekocht.</div>}
+      {!changing && mode !== 'empty' && (
+        <button onClick={() => setChanging(true)} className="w-full mt-3 flex items-center justify-center gap-1.5 rounded-2xl border border-line bg-white py-2.5 text-[13px] font-extrabold text-forest active:bg-mist">
+          <Icon name="refresh" size={15} />Iets anders kiezen
+        </button>
+      )}
 
-      {(mode === 'compose' || mode === 'recipe') && slotRecipes(slot, recipesById).length > 0 && (() => {
+      {!changing && (mode === 'compose' || mode === 'recipe') && slotRecipes(slot, recipesById).length > 0 && (() => {
         const hits = restrictionHits(slotRecipes(slot, recipesById), members);
         return (
           <div className="mt-5 space-y-3">
@@ -2711,11 +2687,11 @@ function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, 
         );
       })()}
 
-      {(mode === 'compose' || mode === 'recipe') && (
+      {!changing && (mode === 'compose' || mode === 'recipe') && (
         <div className="mt-5 space-y-3">
           {carbs != null &&<div className="text-center text-xs font-bold text-stone-400">≈ {Math.round(carbs)} g koolhydraten voor {slot.persons} personen</div>}
           <Btn variant="secondary" className="w-full" icon="sparkles" disabled={aiBusy} onClick={onAiFill}>
-            {aiBusy ? 'AI is bezig…' : mode === 'compose' ? (slot.componentIds.length ? 'Vul ontbrekende onderdelen aan met AI' : 'Laat AI dit bord samenstellen') : `Laat AI een ${slot.category.toLowerCase()} kiezen`}
+            {aiBusy ? 'AI is bezig…' : mode === 'compose' ? (slot.componentIds.length ? 'Vul ontbrekende onderdelen aan met AI' : 'Laat AI dit bord samenstellen') : (main ? '✨ Laat AI iets anders kiezen' : `Laat AI een ${slot.category.toLowerCase()} kiezen`)}
           </Btn>
         </div>
       )}
