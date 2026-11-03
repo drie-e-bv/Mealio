@@ -1391,7 +1391,7 @@ function App() {
       ...staples.filter(s => s.active).map(s => ({ key: `staple:${s.id}`, kind: 'staple', stapleId: s.id, name: s.name, unit: '', amount: 0, hasAmount: false, uses: [],
         store: validStore(s.store), aisle: aisleOf(s.name, s.aisle), state: checks[`staple:${s.id}`] || null })),
       ...extraRows.map(r => ({ key: `extra:${r.id}`, kind: 'extra', extraId: r.id, name: r.name, unit: '', amount: 0, hasAmount: false, uses: [],
-        store: validStore(r.store), aisle: aisleOf(r.name, r.aisle), state: r.checked ? 'cart' : null })),
+        store: validStore(r.store), aisle: aisleOf(r.name, r.aisle), state: r.checked ? 'cart' : 'buy' })),
     ];
     return list.map(i => {
       const baseAisle = i.aisle;
@@ -1400,11 +1400,21 @@ function App() {
     }).sort((a, b) => a.name.localeCompare(b.name));
   }, [weekmenu, recipesById, staples, extraRows, checks, itemStoreMap, itemAisleMap, itemStoreAisleMap, storeAisleAlias, storeAisles, pantryStock, stores]);
 
-  function toggleCart(item) {
-    if (item.kind === 'extra') { const r = extraRows.find(x => x.id === item.extraId); if (r) putExtra({ ...r, checked: !r.checked }); return; }
-    setCheck(item.key, item.state === 'cart' ? null : 'cart');
+  // toestanden: null = nog kiezen · 'have' = in kast · 'buy' = winkelmandje · 'cart' = gekocht
+  function setItemState(item, st) {
+    if (item.kind === 'extra') {
+      const r = extraRows.find(x => x.id === item.extraId); if (!r) return;
+      if (st === 'have') delExtra(r.id); else putExtra({ ...r, checked: st === 'cart' });
+      return;
+    }
+    setCheck(item.key, st || null);
   }
-  function setHave(item, have) { if (item.kind !== 'extra') setCheck(item.key, have ? 'have' : null); }
+  function bulkState(list, st) {
+    list.forEach(i => setItemState(i, st));
+    showToast(`${list.length} items ${st === 'buy' ? 'in het winkelmandje' : 'in de kast'}`, { label: 'Ongedaan', onClick: () => list.forEach(i => setItemState(i, i.state)) });
+  }
+  // winkelmodus: afvinken = gekocht, nog eens tikken = terug in het winkelmandje
+  function toggleCart(item) { setItemState(item, item.state === 'cart' ? 'buy' : 'cart'); }
   function assignStore(item, store) {
     if (item.kind === 'extra') { const r = extraRows.find(x => x.id === item.extraId); if (r) putExtra({ ...r, store: store || null }); }
     else if (item.kind === 'staple') updateStaple(item.stapleId, { store: store || null });
@@ -1451,21 +1461,13 @@ function App() {
   }
   // Boodschappen gedaan zonder de app: alles wat nog te kopen is in één keer op "gekocht"
   function markAllBought() {
-    const todo = shoppingItems.filter(i => !i.state && !i.basic);
+    const todo = shoppingItems.filter(i => (!i.state && !i.basic) || i.state === 'buy');
     if (!todo.length) return;
-    todo.forEach(i => {
-      if (i.kind === 'extra') { const r = extraRows.find(x => x.id === i.extraId); if (r) putExtra({ ...r, checked: true }); }
-      else setCheck(i.key, 'cart');
-    });
-    showToast(`✓ ${todo.length} items op gekocht gezet`, { label: 'Ongedaan', onClick: () => {
-      todo.forEach(i => {
-        if (i.kind === 'extra') { const r = extraRows.find(x => x.id === i.extraId); if (r) putExtra({ ...r, checked: false }); }
-        else setCheck(i.key, null);
-      });
-    } });
+    todo.forEach(i => setItemState(i, 'cart'));
+    showToast(`✓ ${todo.length} items op gekocht gezet`, { label: 'Ongedaan', onClick: () => todo.forEach(i => setItemState(i, i.state)) });
   }
   function newShoppingRound() {
-    if (!window.confirm('Nieuwe ronde: alles uit "In de kar" van deze week terug op de lijst zetten en afgevinkte losse items verwijderen?')) return;
+    if (!window.confirm('Nieuwe ronde: alles uit "Gekocht" van deze week terug naar stap 1 zetten en gekochte losse items verwijderen?')) return;
     const ws = weekStartRef.current;
     setChecks(prev => Object.fromEntries(Object.entries(prev).filter(([, v]) => v !== 'cart')));
     enqueue({ t: 'checks_clear', ws });
@@ -1577,7 +1579,7 @@ function App() {
 
   const myEmail = session.user && session.user.email;
   const aiTargetCount = aiWeekTargets(weekmenu).length;
-  const shoppingTodo = shoppingItems.filter(i => !i.state && !i.basic).length;
+  const shoppingTodo = shoppingItems.filter(i => (!i.state && !i.basic) || i.state === 'buy').length;
   const openMealSlot = mealSheet ? weekmenu[mealSheet.day][mealSheet.meal] : null;
   const openRecipe = recipeSheet ? recipesById[recipeSheet.id] : null;
   const weekNav = {
@@ -1631,7 +1633,7 @@ function App() {
         {tab === 'shopping' && shoppingEnabled && (
           <ShoppingPage nav={weekNav} items={shoppingItems} stores={stores} storeAisles={storeAisles} staples={staples}
             online={online} pendingOps={pendingOps}
-            onToggle={toggleCart} onSetHave={setHave} onAssignStore={assignStore} onAssignAisle={assignAisle} onRemoveItem={removeItem}
+            onSetState={setItemState} onBulkState={bulkState} onAssignStore={assignStore} onAssignAisle={assignAisle} onRemoveItem={removeItem}
             onAddExtra={addExtraItem} onStoreMode={(s) => setStoreMode(s)} onNewRound={newShoppingRound} onMarkAllBought={markAllBought}
             onAddStore={(name) => persistSetting('stores', setStores, [...stores, name])} onRenameStore={renameStore} onRemoveStore={removeStore}
             onSetAisleOrder={setStoreAisleList} onRenameAisle={renameStoreAisle} onRemoveAisle={removeStoreAisle} onResetAisles={resetStoreAisles}
@@ -2305,7 +2307,7 @@ function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, 
               <div className="flex flex-wrap gap-1.5">
                 {parseFreeItems(slot.notes).map(n => <span key={n} className="rounded-full bg-white border border-line px-2.5 py-1 text-xs font-bold text-ink">{n}</span>)}
               </div>
-              <div className="text-[11px] text-stone-500 mt-1.5">Heb je iets al in huis? Tik dan in de boodschappenlijst op "🏠 Heb ik".</div>
+              <div className="text-[11px] text-stone-500 mt-1.5">In de boodschappenlijst kies je per item: 🏠 Kast of 🛒 Kopen.</div>
             </div>
           )}
           {(slot.notes || '').trim() && (
@@ -2480,53 +2482,41 @@ function groupByAisle(items, order, aisleOf = (i) => i.aisle) {
   return groups.filter(g => g.items.length);
 }
 
-// Boodschappen — thuis: tik aan wat je al in huis hebt, de rest koop je.
-// In de winkel: "Ik ben in de winkel" (afvinken = in de kar). Winkel/afdeling aanpassen zit achter één knop.
-function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendingOps, onToggle, onSetHave, onAssignStore, onAssignAisle, onRemoveItem,
+// Boodschappen in twee stappen:
+//   1. Wat heb je nodig?  → per item "🏠 In kast" of "🛒 Kopen"
+//   2. Winkelmandje       → per item de winkel kiezen (wordt onthouden voor volgende weken)
+// In de winkel: "Ik ben in de winkel" (afvinken = gekocht).
+function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendingOps, onSetState, onBulkState, onAssignStore, onAssignAisle, onRemoveItem,
   onAddExtra, onStoreMode, onNewRound, onMarkAllBought, onAddStore, onRenameStore, onRemoveStore, onSetAisleOrder, onRenameAisle, onRemoveAisle, onResetAisles, onAddStaple, onUpdateStaple, onDeleteStaple, showToast }) {
   const [extraName, setExtraName] = useState('');
   const [showStores, setShowStores] = useState(false);
   const [showStaples, setShowStaples] = useState(false);
   const [pickStore, setPickStore] = useState(false);
   const [editItem, setEditItem] = useState(null);
-  const [arrange, setArrange] = useState(false);
+  const [expanded, setExpanded] = useState(null);
   const [open, setOpen] = useState({});
 
-  const todo = items.filter(i => !i.state && !i.basic);
+  const undecided = items.filter(i => !i.state && !i.basic);
+  const basics = items.filter(i => !i.state && i.basic);
+  const basket = items.filter(i => i.state === 'buy');
   const have = items.filter(i => i.state === 'have');
-  const cart = items.filter(i => i.state === 'cart');
-  const basics = items.filter(i => i.basic && !i.state);
+  const bought = items.filter(i => i.state === 'cart');
 
-  // te kopen: per winkel (enkel winkels met items), daarbinnen per afdeling
   const byStore = {};
-  todo.forEach(i => { const k = i.store && stores.includes(i.store) ? i.store : '__none__'; (byStore[k] = byStore[k] || []).push(i); });
-  const storeKeys = [...stores.filter(s => byStore[s]), ...(byStore.__none__ ? ['__none__'] : [])];
-  const onlyNone = storeKeys.length === 1 && storeKeys[0] === '__none__';
+  basket.forEach(i => { const k = i.store && stores.includes(i.store) ? i.store : '__none__'; (byStore[k] = byStore[k] || []).push(i); });
+  const noStore = byStore.__none__ || [];
+  const storeKeys = stores.filter(s => byStore[s]);
 
   function addExtra() { if (onAddExtra(extraName, '')) setExtraName(''); }
-  function tapItem(i) {
-    if (arrange && i.kind !== 'extra') { setEditItem(i); return; }
-    if (i.kind === 'extra') onToggle(i);            // los item: afgehandeld
-    else onSetHave(i, true);                        // heb ik al
-  }
-  function undo(i) { if (i.state === 'have') onSetHave(i, false); else onToggle(i); }
-  // snelknop: van de lijst halen (heb ik al) — met ongedaan maken
-  function haveItem(i) {
-    onSetHave(i, true);
-    showToast(`"${i.name}" staat bij Al in huis`, { label: 'Ongedaan', onClick: () => onSetHave(i, false) });
-  }
-  // basisvoorraad toch nodig? → komt als los item op de lijst
-  function needBasic(i) {
-    if (onAddExtra(i.name, i.store || '', i.aisle)) { onSetHave(i, true); showToast(`"${i.name}" staat op de lijst`); }
-  }
+  function choose(i, st) { onSetState(i, st); }
+  function pickStoreFor(i, s) { onAssignStore(i, s); setExpanded(null); }
 
   async function share() {
     const lines = [`🛒 Boodschappen — week ${isoWeekNumber(nav.weekStart)}`];
-    storeKeys.forEach(s => {
-      lines.push('', `*${s === '__none__' ? (onlyNone ? 'Te kopen' : 'Zonder winkel') : s}*`);
-      groupByAisle(byStore[s], aisleOrderFor(s === '__none__' ? '' : s, storeAisles), i => (s === '__none__' ? i.baseAisle : i.aisleFor(s))).forEach(g => {
-        g.items.forEach(i => lines.push(`☐ ${i.name}${i.kind === 'recipe' || i.kind === 'free' ? ' — ' + fmtShopAmount(i) : ''}`));
-      });
+    [...storeKeys, ...(noStore.length ? ['__none__'] : [])].forEach(s => {
+      lines.push('', `*${s === '__none__' ? 'Nog geen winkel' : s}*`);
+      groupByAisle(byStore[s], aisleOrderFor(s === '__none__' ? '' : s, storeAisles), i => (s === '__none__' ? i.baseAisle : i.aisleFor(s)))
+        .forEach(g => g.items.forEach(i => lines.push(`☐ ${i.name}${i.kind === 'recipe' || i.kind === 'free' ? ' — ' + fmtShopAmount(i) : ''}`)));
     });
     const text = lines.join('\n');
     try {
@@ -2535,43 +2525,81 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
     } catch (e) { /* delen geannuleerd */ }
   }
 
-  const Fold = ({ id, label, list, hint, onTap, action }) => list.length > 0 && (
+  const sub = (i) => {
+    const s = i.kind === 'extra' ? 'zelf toegevoegd' : i.kind === 'staple' ? 'vast item' : fmtShopAmount(i);
+    const uses = (i.kind === 'recipe' || i.kind === 'free') && i.uses && i.uses.length ? ` · ${i.uses.join(', ')}` : '';
+    return <>{i.inKast ? <b className="text-leaf">in kast · </b> : null}{s}{uses}</>;
+  };
+  const pill = 'h-10 px-3 rounded-xl text-[13px] font-black flex items-center gap-1 active:scale-95 transition shrink-0';
+
+  // stap 1: kast of kopen
+  const ChooseRow = ({ i }) => (
+    <div className="flex items-center gap-2 px-3.5 py-2.5">
+      <div className="flex-1 min-w-0">
+        <div className="text-[15px] font-bold text-ink truncate">{i.name}{i.kind === 'staple' ? ' 📌' : ''}</div>
+        <div className="text-[12px] text-stone-500 truncate">{sub(i)}</div>
+      </div>
+      <button onClick={() => choose(i, 'have')} aria-label={`${i.name}: in kast`} className={cx(pill, 'bg-cream border border-line text-stone-600')}>🏠 Kast</button>
+      <button onClick={() => choose(i, 'buy')} aria-label={`${i.name}: kopen`} className={cx(pill, 'bg-forest text-white')}>🛒 Kopen</button>
+    </div>
+  );
+  // stap 2: winkel kiezen
+  const StoreChips = ({ i }) => (
+    <div className="flex flex-wrap gap-1.5 pt-2">
+      {stores.map(s => (
+        <button key={s} onClick={() => pickStoreFor(i, s)} aria-label={`${i.name} in ${s}`}
+          className={cx('h-9 px-3 rounded-xl text-[13px] font-extrabold border active:scale-95 transition', i.store === s ? 'bg-forest text-white border-forest' : 'bg-white text-deep border-line')}>{s}</button>
+      ))}
+    </div>
+  );
+  const BasketRow = ({ i, showChips }) => (
+    <div className="px-3.5 py-2.5">
+      <div className="flex items-center gap-2">
+        <button onClick={() => setExpanded(expanded === i.key ? null : i.key)} className="flex-1 min-w-0 text-left">
+          <div className="text-[15px] font-bold text-ink truncate">{i.name}{i.kind === 'staple' ? ' 📌' : ''}</div>
+          <div className="text-[12px] text-stone-500 truncate">{sub(i)}</div>
+        </button>
+        {i.kind === 'extra'
+          ? <button onClick={() => onRemoveItem(i)} aria-label={`${i.name} verwijderen`} className="w-10 h-10 shrink-0 flex items-center justify-center text-stone-400"><Icon name="x" size={16} /></button>
+          : <button onClick={() => choose(i, null)} aria-label={`${i.name} terug naar kiezen`} title="Terug naar stap 1" className="w-10 h-10 shrink-0 flex items-center justify-center text-stone-400 text-lg">↩</button>}
+      </div>
+      {(showChips || expanded === i.key) && <StoreChips i={i} />}
+      {expanded === i.key && (
+        <button onClick={() => { setEditItem(i); setExpanded(null); }} className="mt-2 text-[12px] font-extrabold text-forest">Afdeling: {i.aisle} ›</button>
+      )}
+    </div>
+  );
+
+  const Fold = ({ id, label, list, onTap, action }) => list.length > 0 && (
     <Card className="overflow-hidden">
       <button onClick={() => setOpen({ ...open, [id]: !open[id] })} className="w-full px-4 py-3 flex items-center justify-between text-sm font-extrabold text-stone-600 bg-cream/60">
         <span>{label} ({list.length})</span><Icon name="down" size={16} className={open[id] ? 'rotate-180' : ''} />
       </button>
       {open[id] && (
-        <>
-          {hint && <div className="px-4 pt-2 text-[12px] text-stone-500">{hint}</div>}
-          <div className="divide-y divide-line/70">
-            {list.map(i => (
-              <button key={i.key} onClick={() => onTap(i)} className="w-full px-4 py-3 flex items-center gap-3 text-left active:bg-mist">
-                <span className={cx('flex-1 min-w-0 text-[15px] font-semibold truncate', action ? 'text-ink' : 'text-stone-500 line-through')}>{i.name}</span>
-                <span className="shrink-0 text-xs font-extrabold text-forest bg-mint rounded-full px-3 py-1.5">{action || 'Terugzetten'}</span>
-              </button>
-            ))}
-          </div>
-        </>
+        <div className="divide-y divide-line/70">
+          {list.map(i => (
+            <button key={i.key} onClick={() => onTap(i)} className="w-full px-4 py-3 flex items-center gap-3 text-left active:bg-mist">
+              <span className="flex-1 min-w-0 text-[15px] font-semibold truncate text-stone-500">{i.name}</span>
+              <span className="shrink-0 text-xs font-extrabold text-forest bg-mint rounded-full px-3 py-1.5">{action}</span>
+            </button>
+          ))}
+        </div>
       )}
     </Card>
+  );
+
+  const StepHead = ({ n, title, count, right }) => (
+    <div className="px-4 py-3 flex items-center gap-2.5 bg-mist">
+      <span className="w-6 h-6 rounded-full bg-forest text-white text-[12px] font-black flex items-center justify-center shrink-0">{n}</span>
+      <span className="flex-1 text-[15px] font-black text-deep">{title} <span className="text-stone-500 font-bold">({count})</span></span>
+      {right}
+    </div>
   );
 
   return (
     <div>
       <PageHeader eyebrow={`Week ${isoWeekNumber(nav.weekStart)} · ${fmtWeekRange(nav.weekStart)}`} title="Boodschappen"
         right={<><IconBtn name="share" onClick={share} title="Delen" className="bg-white border border-line w-11 h-11" /><IconBtn name="settings" onClick={() => setShowStores(true)} title="Winkels & afdelingen" className="bg-white border border-line w-11 h-11" /></>} />
-
-      {todo.length > 0 && (
-        <button onClick={() => setPickStore(true)}
-          className="w-full mb-3 rounded-2xl bg-gradient-to-br from-deep to-forest text-white p-4 flex items-center gap-3 text-left shadow-card active:scale-[.99] transition">
-          <div className="w-11 h-11 rounded-xl bg-white/10 flex items-center justify-center"><Icon name="cart" size={22} /></div>
-          <div className="flex-1">
-            <div className="text-[15px] font-black">Ik ben in de winkel</div>
-            <div className="text-[12px] text-white/80">Afvinken wat in de kar ligt — het scherm blijft aan.</div>
-          </div>
-          <Icon name="right" size={18} className="text-white/60" />
-        </button>
-      )}
 
       <Card className="p-2 mb-3 flex gap-1.5">
         <input value={extraName} onChange={(e) => setExtraName(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') addExtra(); }}
@@ -2581,50 +2609,67 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
       </Card>
 
       {(!online || pendingOps > 0) && <div className="text-[12px] font-bold text-amber-800 mb-3 px-1">{online ? '⏳ Wijzigingen worden verstuurd…' : '📴 Offline — wordt later gesynchroniseerd'}</div>}
-
       {items.length === 0 && <EmptyState emoji="🧺" title="Je lijst is nog leeg" text="Plan maaltijden in de Planner — wat je nodig hebt, verschijnt hier vanzelf." />}
 
-      {todo.length > 0 && (
-        <div className="flex items-center justify-between gap-2 px-1 mb-2">
-          <div className="text-sm font-black text-deep">{todo.length} te kopen</div>
-          <button onClick={() => setArrange(!arrange)} className={cx('text-xs font-extrabold rounded-full px-3 py-2', arrange ? 'bg-forest text-white' : 'text-forest bg-mint')}>
-            {arrange ? '✓ Klaar met aanpassen' : 'Winkel of afdeling aanpassen'}
-          </button>
-        </div>
-      )}
-      {todo.length > 0 && (
-        <p className="text-[13px] text-stone-600 px-1 mb-3">
-          {arrange ? 'Tik op een item om de winkel of afdeling te kiezen. De app onthoudt dat.' : 'Heb je iets al in huis? Tik op 🏠 Heb ik. Wat overblijft, koop je.'}
-        </p>
-      )}
-
       <div className="space-y-3">
-        {storeKeys.map(s => (
-          <Card key={s} className="overflow-hidden">
-            {!onlyNone && (
-              <div className="px-4 py-2.5 flex items-center justify-between bg-mist">
-                <span className="text-sm font-black text-deep">{s === '__none__' ? 'Zonder winkel' : s}</span>
-                <span className="text-[12px] font-bold text-stone-600">{byStore[s].length}</span>
-              </div>
-            )}
-            {groupByAisle(byStore[s], aisleOrderFor(s === '__none__' ? '' : s, storeAisles), i => (s === '__none__' ? i.baseAisle : i.aisleFor(s))).map(g => (
-              <div key={g.aisle}>
-                <div className="px-4 pt-2.5 pb-1 text-[11px] font-black uppercase tracking-wider text-stone-500">{g.aisle}</div>
-                <div className="divide-y divide-line/70">
-                  {g.items.map(i => <ShoppingRow key={i.key} item={i} arrange={arrange} onTap={() => tapItem(i)} onRemove={() => onRemoveItem(i)} onHave={() => haveItem(i)} />)}
+        {(undecided.length > 0 || basics.length > 0) && (
+          <Card className="overflow-hidden">
+            <StepHead n="1" title="Wat heb je nodig?" count={undecided.length + basics.length}
+              right={undecided.length > 1 && <button onClick={() => onBulkState(undecided, 'buy')} className="text-[12px] font-extrabold text-forest bg-white rounded-full px-3 py-1.5 border border-line">Alles kopen</button>} />
+            <div className="divide-y divide-line/70">
+              {undecided.map(i => <ChooseRow key={i.key} i={i} />)}
+            </div>
+            {basics.length > 0 && (
+              <>
+                <div className="px-4 pt-3 pb-1 flex items-center justify-between border-t border-line/70">
+                  <span className="text-[11px] font-black uppercase tracking-wider text-stone-500">🧂 Meestal in huis</span>
+                  <button onClick={() => onBulkState(basics, 'have')} className="text-[12px] font-extrabold text-stone-600">Alles in kast</button>
                 </div>
+                <div className="divide-y divide-line/70">{basics.map(i => <ChooseRow key={i.key} i={i} />)}</div>
+              </>
+            )}
+          </Card>
+        )}
+
+        {basket.length > 0 && (
+          <Card className="overflow-hidden">
+            <StepHead n="2" title="Winkelmandje" count={basket.length} />
+            {noStore.length > 0 && (
+              <>
+                <div className="px-4 pt-2.5 text-[12px] font-bold text-amber-800">Kies per item een winkel — dat wordt onthouden.</div>
+                <div className="divide-y divide-line/70">{noStore.map(i => <BasketRow key={i.key} i={i} showChips />)}</div>
+              </>
+            )}
+            {storeKeys.map(s => (
+              <div key={s} className="border-t border-line/70">
+                <div className="px-4 pt-2.5 flex items-center justify-between">
+                  <span className="text-[13px] font-black text-deep">🏪 {s}</span>
+                  <span className="text-[12px] font-bold text-stone-500">{byStore[s].length}</span>
+                </div>
+                <div className="divide-y divide-line/70">{byStore[s].map(i => <BasketRow key={i.key} i={i} />)}</div>
               </div>
             ))}
+            <div className="p-3 border-t border-line/70">
+              <button onClick={() => setPickStore(true)}
+                className="w-full rounded-2xl bg-gradient-to-br from-deep to-forest text-white px-4 py-3 flex items-center gap-3 text-left active:scale-[.99] transition">
+                <Icon name="cart" size={20} />
+                <span className="flex-1 text-[15px] font-black">Ik ben in de winkel</span>
+                <Icon name="right" size={18} className="text-white/60" />
+              </button>
+            </div>
           </Card>
-        ))}
+        )}
 
-        <Fold id="have" label="🏠 Al in huis" list={have} hint="Tik om terug op de lijst te zetten." onTap={undo} />
-        <Fold id="basics" label="🧂 Meestal in huis" list={basics} hint="Zout, peper, olie, kruiden… Tik als je het toch moet kopen." onTap={needBasic} action="Toch kopen" />
-        <Fold id="cart" label="🛒 In de kar" list={cart} hint="Tik om terug op de lijst te zetten." onTap={undo} />
+        {undecided.length === 0 && basics.length === 0 && basket.length === 0 && items.length > 0 && (
+          <div className="text-center py-6"><div className="text-4xl">🎉</div><div className="font-black text-deep mt-2">Alles geregeld voor deze week</div></div>
+        )}
+
+        <Fold id="have" label="🏠 In kast" list={have} onTap={(i) => choose(i, null)} action="Terug" />
+        <Fold id="cart" label="✓ Gekocht" list={bought} onTap={(i) => choose(i, 'buy')} action="Terug" />
       </div>
 
-      {todo.length > 0 && (
-        <button onClick={() => { if (window.confirm(`Boodschappen al gedaan? Alle ${todo.length} items worden op "gekocht" gezet.`)) onMarkAllBought(); }}
+      {(undecided.length > 0 || basket.length > 0) && (
+        <button onClick={() => { if (window.confirm('Boodschappen al gedaan zonder de app? Alles wat nog op de lijst staat, wordt op "gekocht" gezet.')) onMarkAllBought(); }}
           className="mt-4 w-full rounded-2xl border-2 border-dashed border-line bg-white/60 px-4 py-3 text-left active:bg-mist">
           <div className="text-[14px] font-black text-forest">✓ Alles al gekocht</div>
           <div className="text-[12px] text-stone-500">Boodschappen gedaan zonder de app? Zet de hele lijst in één keer op gekocht.</div>
@@ -2634,7 +2679,7 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
         <button onClick={() => setShowStaples(true)} className="flex items-center gap-1.5 text-[13px] font-extrabold text-forest py-2">
           <Icon name="pin" size={15} />Vaste items{staples.length ? ` (${staples.filter(s => s.active).length})` : ''}
         </button>
-        {(cart.length > 0 || have.length > 0) && (
+        {(bought.length > 0 || have.length > 0) && (
           <button onClick={onNewRound} className="flex items-center gap-1.5 text-[13px] font-extrabold text-forest py-2"><Icon name="refresh" size={15} />Nieuwe ronde</button>
         )}
       </div>
@@ -2642,17 +2687,17 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
       {pickStore && (
         <Sheet title="In welke winkel ben je?" subtitle="Je ziet wat je daar moet halen, plus wat nog geen winkel heeft" onClose={() => setPickStore(false)}>
           <div className="space-y-2">
-            {stores.filter(s => byStore[s]).map(s => (
+            {storeKeys.map(s => (
               <button key={s} onClick={() => { setPickStore(false); onStoreMode(s); }}
                 className="w-full flex items-center justify-between rounded-2xl border border-line bg-white px-4 py-3.5 text-left active:bg-mist">
                 <span className="text-[15px] font-extrabold text-deep">{s}</span>
-                <span className="text-xs font-bold text-stone-500">{byStore[s].length + (byStore.__none__ || []).length} te halen</span>
+                <span className="text-xs font-bold text-stone-500">{byStore[s].length + noStore.length} te halen</span>
               </button>
             ))}
             <button onClick={() => { setPickStore(false); onStoreMode('__all__'); }}
               className="w-full flex items-center justify-between rounded-2xl border-2 border-dashed border-line px-4 py-3.5 text-left active:bg-mist">
               <span className="text-[15px] font-extrabold text-forest">Alles in één lijst</span>
-              <span className="text-xs font-bold text-stone-500">{todo.length} te halen</span>
+              <span className="text-xs font-bold text-stone-500">{basket.length} te halen</span>
             </button>
           </div>
         </Sheet>
@@ -2666,31 +2711,6 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
       {showStores && <StoresSheet stores={stores} storeAisles={storeAisles} onAdd={onAddStore} onRename={onRenameStore} onRemove={onRemoveStore}
         onSetAisleOrder={onSetAisleOrder} onRenameAisle={onRenameAisle} onRemoveAisle={onRemoveAisle} onResetAisles={onResetAisles} onClose={() => setShowStores(false)} />}
       {showStaples && <StaplesSheet staples={staples} stores={stores} onAdd={onAddStaple} onUpdate={onUpdateStaple} onDelete={onDeleteStaple} onClose={() => setShowStaples(false)} />}
-    </div>
-  );
-}
-
-// Eén rij: naam, hoeveelheid, waarvoor. De hele rij is de knop.
-function ShoppingRow({ item, arrange, onTap, onRemove, onHave }) {
-  const sub = item.kind === 'extra' ? 'zelf toegevoegd' : item.kind === 'staple' ? 'vast item' : fmtShopAmount(item);
-  const uses = (item.kind === 'recipe' || item.kind === 'free') && item.uses && item.uses.length ? item.uses.join(', ') : '';
-  return (
-    <div className="flex items-center">
-      <button onClick={onTap} className="flex-1 min-w-0 flex items-center gap-3 px-4 py-3 text-left active:bg-mist">
-        <span className={cx('w-6 h-6 shrink-0 rounded-full border-2 flex items-center justify-center', arrange ? 'border-forest text-forest' : 'border-stone-300')}>
-          {arrange && <Icon name="pencil" size={12} />}
-        </span>
-        <span className="flex-1 min-w-0">
-          <span className="block text-[15px] font-bold text-ink">{item.name}{item.kind === 'staple' ? ' 📌' : ''}</span>
-          <span className="block text-[12px] text-stone-600 truncate">{!arrange && item.inKast ? <b className="text-leaf">in kast · </b> : null}{sub}{uses ? ` · ${uses}` : ''}{arrange ? ` · ${item.store || 'geen winkel'} › ${item.aisle}` : ''}</span>
-        </span>
-      </button>
-      {item.kind === 'extra' ? (
-        <button onClick={onRemove} className="w-11 h-11 mr-1 shrink-0 flex items-center justify-center text-stone-400" aria-label={`${item.name} verwijderen`}><Icon name="x" size={16} /></button>
-      ) : (
-        <button onClick={onHave} aria-label={`${item.name}: heb ik al`}
-          className="shrink-0 mr-2 h-9 px-3 rounded-full bg-mint text-forest text-[12px] font-black flex items-center gap-1 active:scale-95 transition">🏠 Heb ik</button>
-      )}
     </div>
   );
 }
@@ -2840,7 +2860,7 @@ function StoreMode({ storeKey, weekLabel, items, storeAisles, online, pendingOps
     return () => { document.body.style.overflow = prev; };
   }, []);
   const all = storeKey === '__all__';
-  const mine = items.filter(i => i.state !== 'have' && !(i.basic && !i.state) && (all || i.store === storeKey || !i.store));
+  const mine = items.filter(i => (i.state === 'buy' || i.state === 'cart') && (all || i.store === storeKey || !i.store));
   const todo = mine.filter(i => i.state !== 'cart');
   const cart = mine.filter(i => i.state === 'cart');
   const order = aisleOrderFor(all ? '' : storeKey, storeAisles);
