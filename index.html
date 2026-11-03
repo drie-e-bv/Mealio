@@ -230,12 +230,12 @@ let HOUSEHOLD_SIZE = 5;
 function defaultTypeFor(mealKey) { return mealKey === 'Ontbijt' ? 'Ontbijt' : 'Hoofdmaaltijd'; }
 function emptySlot(mealKey) {
   return { persons: HOUSEHOLD_SIZE, category: '', recipeId: '', locked: false, feedback: null, notes: '', componentIds: [], aiGenerated: false,
-    doubleFor: null, leftoverFrom: null };
+    doubleFor: null, leftoverFrom: null, eatenAt: null, pantryUsed: null };
 }
 function entryToSlot(e) {
   return { persons: e.persons, category: e.type || '', recipeId: e.recipeId || '', locked: !!e.locked, feedback: e.feedback || null,
     notes: e.notes || '', componentIds: e.componentIds || [], aiGenerated: !!e.aiGenerated,
-    doubleFor: e.doubleFor || null, leftoverFrom: e.leftoverFrom || null };
+    doubleFor: e.doubleFor || null, leftoverFrom: e.leftoverFrom || null, eatenAt: e.eatenAt || null, pantryUsed: e.pantryUsed || null };
 }
 // "Kook dubbel": sleutel van een slot, bv. "Woensdag|Avond"
 function slotKeyOf(day, meal) { return `${day}|${meal}`; }
@@ -526,9 +526,45 @@ function weekmenuOut(row) {
   return { weekStart: row.week_start, day: row.day, meal: row.meal, persons: row.persons, type: row.type || '',
     recipeId: row.recipe_id || '', locked: !!row.locked, feedback: row.feedback || null, notes: row.notes || '',
     componentIds: row.component_ids || [], aiGenerated: !!row.ai_generated,
-    doubleFor: row.double_for || null, leftoverFrom: row.leftover_from || null };
+    doubleFor: row.double_for || null, leftoverFrom: row.leftover_from || null, eatenAt: row.eaten_at || null, pantryUsed: row.pantry_used || null };
 }
-function pantryOut(row) { return { id: row.id, name: row.ingredient_name, inStock: !!row.in_stock }; }
+function pantryOut(row) { return { id: row.id, name: row.ingredient_name, inStock: !!row.in_stock, qty: row.qty == null ? null : Number(row.qty), unit: row.unit || '' }; }
+// Hoeveelheid zoals je ze koopt (dezelfde afronding als op de lijst), voor in de kast
+function shopQty(item) {
+  if (item.kind !== 'recipe' || !item.hasAmount) return { qty: null, unit: '' };
+  const unit = item.unit || '';
+  if (COUNT_UNITS[unit]) return { qty: Math.max(1, Math.ceil(item.amount - 1e-9)), unit };
+  if (/^(g|gr|gram|ml|cl)$/.test(unit)) {
+    const a = item.amount; const step = a >= 1000 ? 100 : a >= 250 ? 50 : a >= 50 ? 25 : 5;
+    return { qty: Math.max(step, Math.ceil(a / step - 1e-9) * step), unit: unit === 'gr' || unit === 'gram' ? 'g' : unit };
+  }
+  return { qty: Math.round(item.amount * 100) / 100, unit };
+}
+// eenheden omrekenen waar dat kan (kg↔g, l↔ml); null = niet vergelijkbaar
+function convertQty(qty, from, to) {
+  const f = normUnit(from || ''), t = normUnit(to || '');
+  if (f === t) return qty;
+  const base = { g: ['g', 1], gr: ['g', 1], gram: ['g', 1], kg: ['g', 1000], ml: ['ml', 1], cl: ['ml', 10], l: ['ml', 1000] };
+  const a = base[f], b = base[t];
+  if (a && b && a[0] === b[0]) return qty * a[1] / b[1];
+  return null;
+}
+function fmtPantryQty(p) {
+  if (p.qty == null) return '';
+  const u = p.unit || '';
+  if (u === 'g' && p.qty >= 1000) return `${fmtAmount(Math.round(p.qty / 100) / 10)} kg`;
+  if (u === 'ml' && p.qty >= 1000) return `${fmtAmount(Math.round(p.qty / 100) / 10)} l`;
+  if (COUNT_UNITS[u]) { const [one, many] = COUNT_UNITS[u]; return `${fmtAmount(Math.round(p.qty * 100) / 100)} ${p.qty === 1 ? one : many}`; }
+  return `${fmtAmount(Math.round(p.qty * 100) / 100)} ${u}`.trim();
+}
+// Vanaf wanneer mag je "gegeten" aanvinken?
+const MEAL_DONE_HOUR = { Ontbijt: 8.5, Middag: 12.5, Avond: 18.5 };
+function mealIsPast(weekStart, day, meal) {
+  const d = parseISODate(addDays(weekStart, DAYS.indexOf(day)));
+  const h = MEAL_DONE_HOUR[meal] || 12;
+  d.setHours(Math.floor(h), Math.round((h % 1) * 60), 0, 0);
+  return Date.now() >= d.getTime();
+}
 function suggestionOut(row) {
   return { id: row.id, title: row.title, category: row.category || '', basePortions: row.portions_base || 1,
     ingredients: row.ingredients || [], steps: row.steps || [], basedOn: row.based_on_ingredients || [] };
@@ -840,7 +876,7 @@ function App() {
   const [pendingOps, setPendingOps] = useState(QUEUE.length);
   const [online, setOnline] = useState(typeof navigator === 'undefined' ? true : navigator.onLine);
 
-  const [tab, setTab] = useState(['planner', 'shopping', 'recipes', 'kast'].includes(UI_SAVED.tab) ? UI_SAVED.tab : 'planner');
+  const [tab, setTab] = useState(['planner', 'shopping', 'winkel', 'recipes', 'kast'].includes(UI_SAVED.tab) ? UI_SAVED.tab : 'planner');
   const [selectedDay, setSelectedDay] = useState(DAYS.includes(UI_SAVED.day) ? UI_SAVED.day : DAYS[dayIndexOf(todayISO())]);
   const [toast, setToast] = useState(null);
   const [mealSheet, setMealSheet] = useState(null);        // { day, meal }
@@ -1083,7 +1119,7 @@ function App() {
     setEntries([...entriesRef.current.filter(e => !(e.day === day && e.meal === meal)), {
       weekStart: ws, day, meal, persons: next.persons, type: next.category, recipeId: next.recipeId, locked: next.locked,
       feedback: next.feedback, notes: next.notes, componentIds: next.componentIds, aiGenerated: next.aiGenerated,
-      doubleFor: next.doubleFor || null, leftoverFrom: next.leftoverFrom || null,
+      doubleFor: next.doubleFor || null, leftoverFrom: next.leftoverFrom || null, eatenAt: next.eatenAt || null, pantryUsed: next.pantryUsed || null,
     }]);
     lastWriteRef.current = Date.now();
     const row = {
@@ -1091,14 +1127,14 @@ function App() {
       locked: !!next.locked, feedback: next.feedback || null, notes: next.notes || null,
       component_ids: next.componentIds || [], ai_generated: !!next.aiGenerated,
     };
-    if (HAS_V2_COLUMNS) { row.double_for = next.doubleFor || null; row.leftover_from = next.leftoverFrom || null; }
+    if (HAS_V2_COLUMNS) { row.double_for = next.doubleFor || null; row.leftover_from = next.leftoverFrom || null; row.eaten_at = next.eatenAt || null; row.pantry_used = next.pantryUsed || null; }
     try {
       throwIfError(await sb.from('weekmenu_entries').upsert(row, { onConflict: 'week_start,day,meal' }));
     } catch (e) {
-      if (HAS_V2_COLUMNS && /double_for|leftover_from|schema cache|column/i.test(e.message || '')) {
+      if (HAS_V2_COLUMNS && /double_for|leftover_from|eaten_at|pantry_used|schema cache|column/i.test(e.message || '')) {
         // database nog niet bijgewerkt: opnieuw proberen zonder de nieuwe kolommen
         HAS_V2_COLUMNS = false; setMigrationMissing(true);
-        delete row.double_for; delete row.leftover_from;
+        delete row.double_for; delete row.leftover_from; delete row.eaten_at; delete row.pantry_used;
         try { throwIfError(await sb.from('weekmenu_entries').upsert(row, { onConflict: 'week_start,day,meal' })); }
         catch (e2) { showToast('Opslaan mislukt — probeer opnieuw'); }
       } else showToast('Opslaan mislukt — probeer opnieuw');
@@ -1433,11 +1469,60 @@ function App() {
     }
     setCheck(item.key, st || null, st ? item.qty : null);
     // "🏠 Kast" in de boodschappenlijst = het staat in huis → ook in de Kast zetten
-    if (st === 'have' && !pantryStock.some(p => p.inStock && normalize(p.name) === normalize(item.name))) addPantryStockItem(item.name.toLowerCase());
+    if (st === 'have' && !pantryStock.some(p => p.inStock && normalize(p.name) === normalize(item.name))) addManyToPantry([{ name: item.name.toLowerCase(), ...shopQty(item) }]);
   }
   function bulkState(list, st) {
     list.forEach(i => setItemState(i, st));
     showToast(`${list.length} items ${st === 'buy' ? 'in het winkelmandje' : st === 'hidden' || st === 'cart' ? 'van de lijst gehaald' : 'in de kast'}`, { label: 'Ongedaan', onClick: () => list.forEach(i => setItemState(i, i.state)) });
+  }
+  // Winkelen afronden: alles wat afgevinkt is gaat (met hoeveelheid) naar de kast en verdwijnt van de lijst
+  async function finishShopping() {
+    const done = shoppingItems.filter(i => i.state === 'cart');
+    if (!done.length) return 0;
+    await addManyToPantry(done.map(i => ({ name: i.name.toLowerCase(), ...shopQty(i) })));
+    done.forEach(i => setItemState(i, 'hidden'));
+    showToast(`🏠 ${done.length} items in de kast gezet`);
+    return done.length;
+  }
+  // Gegeten: wat de maaltijd gebruikte gaat uit de kast (nog eens tikken = terugzetten)
+  async function markEaten(day, meal, eaten) {
+    const slot = buildWeekmenu(entriesRef.current)[day][meal];
+    if (!eaten) {
+      (slot.pantryUsed || []).forEach(u => { if (pantryRef.current.some(p => p.id === u.id)) updatePantryItem(u.id, { inStock: u.prevIn, qty: u.prevQty }); });
+      await updateMealSlot(day, meal, { eatenAt: null, pantryUsed: null });
+      showToast('Terug in de kast gezet');
+      return;
+    }
+    let persons = slot.persons || 1;
+    const dbl = parseSlotKey(slot.doubleFor);
+    if (dbl) { const t = buildWeekmenu(entriesRef.current)[dbl.day][dbl.meal]; if (t.leftoverFrom === slotKeyOf(day, meal)) persons += t.persons || 0; }
+    const work = pantryRef.current.map(p => ({ ...p }));
+    const used = [];
+    slotRecipes(slot, recipesById).forEach(recipe => {
+      const ratio = recipe.basePortions ? persons / recipe.basePortions : 1;
+      (recipe.ingredients || []).forEach(ing => {
+        if (!ing.name) return;
+        const p = work.find(x => x.inStock && normalize(x.name) === normalize(ing.name)) || work.find(x => x.inStock && ingredientMatches(ing.name, [normalize(x.name)]));
+        if (!p) return;
+        if (!used.some(u => u.id === p.id)) used.push({ id: p.id, prevIn: p.inStock, prevQty: p.qty });
+        const basic = isBasicIngredient({ kind: 'recipe', name: ing.name, unit: normUnit(ing.unit), hasAmount: ing.amount != null });
+        if (p.qty != null && ing.amount != null) {
+          const need = convertQty(Number(ing.amount) * ratio, normUnit(ing.unit), p.unit);
+          if (need != null) {
+            let rest = p.qty - need;
+            if (COUNT_UNITS[p.unit || '']) rest = rest < 0.5 ? 0 : Math.round(rest);   // stuks: geen 0,33 ui overhouden
+            p.qty = Math.round(rest * 1000) / 1000;
+            if (p.qty <= 0.001) { p.qty = null; p.inStock = false; }
+            return;
+          }
+        }
+        if (p.qty == null && !basic) p.inStock = false;   // geen aantal gekend: gebruikt = op (zout, olie, kruiden blijven)
+      });
+    });
+    const changed = used.filter(u => { const p = work.find(x => x.id === u.id); return p.inStock !== u.prevIn || p.qty !== u.prevQty; });
+    changed.forEach(u => { const p = work.find(x => x.id === u.id); updatePantryItem(p.id, { inStock: p.inStock, qty: p.qty }); });
+    await updateMealSlot(day, meal, { eatenAt: new Date().toISOString(), pantryUsed: changed });
+    showToast(changed.length ? `✓ Gegeten — ${changed.length} ingrediënten uit de kast gehaald` : '✓ Gegeten', changed.length ? { label: 'Ongedaan', onClick: () => markEaten(day, meal, false) } : undefined);
   }
   // winkelmodus: afvinken = gekocht, nog eens tikken = terug in het winkelmandje
   function toggleCart(item) { setItemState(item, item.state === 'cart' ? 'buy' : 'cart'); }
@@ -1525,21 +1610,47 @@ function App() {
   }
 
   // ---------- kast ----------
-  async function addPantryStockItem(name) {
-    name = (name || '').trim();
-    if (!name) return;
-    const existing = pantryStock.find(p => normalize(p.name) === normalize(name));
-    if (existing) { if (!existing.inStock) togglePantryStockItem(existing.id); return; }
-    try {
-      const created = pantryOut(throwIfError(await sb.from('pantry_stock').upsert({ ingredient_name: name, in_stock: true }, { onConflict: 'ingredient_name' }).select().single()));
-      setPantryStock(prev => [...prev.filter(p => p.id !== created.id), created]);
-    } catch (e) { showToast('Opslaan mislukt — probeer opnieuw'); }
+  const pantryRef = useRef([]);
+  pantryRef.current = pantryStock;
+  async function addPantryStockItem(name) { return addManyToPantry([{ name, qty: null, unit: '' }]); }
+  // Meerdere dingen in de kast zetten (bv. na het winkelen). Zelfde naam = hoeveelheid erbij tellen.
+  async function addManyToPantry(list) {
+    let cur = [...pantryRef.current];
+    let n = 0;
+    for (const it of list) {
+      const name = (it.name || '').trim(); if (!name) continue;
+      const ex = cur.find(p => normalize(p.name) === normalize(name));
+      let row;
+      if (ex) {
+        let qty = ex.inStock ? ex.qty : null, unit = ex.unit || '';
+        if (it.qty != null) {
+          if (qty == null) { qty = it.qty; unit = it.unit || ''; }
+          else { const c = convertQty(it.qty, it.unit, unit); if (c != null) qty += c; else { qty = it.qty; unit = it.unit || ''; } }
+        }
+        row = { ingredient_name: ex.name, in_stock: true, qty, unit: unit || null };
+      } else row = { ingredient_name: name, in_stock: true, qty: it.qty, unit: it.unit || null };
+      try {
+        const saved = pantryOut(throwIfError(await sb.from('pantry_stock').upsert(row, { onConflict: 'ingredient_name' }).select().single()));
+        cur = [...cur.filter(p => p.id !== saved.id), saved]; n++;
+      } catch (e) { console.error(e); }
+    }
+    setPantryStock(cur); pantryRef.current = cur;
+    if (n < list.filter(i => (i.name || '').trim()).length) showToast('Niet alles kon in de kast — controleer je verbinding');
+    return n;
+  }
+  async function updatePantryItem(id, patch) {
+    setPantryStock(prev => prev.map(p => p.id === id ? { ...p, ...patch } : p));
+    const row = {};
+    if ('inStock' in patch) row.in_stock = patch.inStock;
+    if ('qty' in patch) row.qty = patch.qty;
+    if ('unit' in patch) row.unit = patch.unit || null;
+    try { throwIfError(await sb.from('pantry_stock').update(row).eq('id', id)); }
+    catch (e) { showToast('Opslaan mislukt — probeer opnieuw'); }
   }
   async function togglePantryStockItem(id) {
     const item = pantryStock.find(p => p.id === id);
-    setPantryStock(prev => prev.map(p => p.id === id ? { ...p, inStock: !p.inStock } : p));
-    try { throwIfError(await sb.from('pantry_stock').update({ in_stock: item ? !item.inStock : true }).eq('id', id)); }
-    catch (e) { showToast('Opslaan mislukt — probeer opnieuw'); }
+    // op → in huis: hoeveelheid vergeten (onbekend); in huis → op: hoeveelheid 0
+    return updatePantryItem(id, item && item.inStock ? { inStock: false, qty: null } : { inStock: true });
   }
   async function removePantryStockItem(id) {
     setPantryStock(prev => prev.filter(p => p.id !== id));
@@ -1606,7 +1717,8 @@ function App() {
 
   const myEmail = session.user && session.user.email;
   const aiTargetCount = aiWeekTargets(weekmenu).length;
-  const shoppingTodo = shoppingItems.filter(i => (!i.state && !i.basic) || i.state === 'buy').length;
+  const shoppingTodo = shoppingItems.filter(i => !i.state && !i.basic).length;     // lijst: nog te kiezen
+  const basketTodo = shoppingItems.filter(i => i.state === 'buy').length;            // winkelen: nog te halen
   const openMealSlot = mealSheet ? weekmenu[mealSheet.day][mealSheet.meal] : null;
   const openRecipe = recipeSheet ? recipesById[recipeSheet.id] : null;
   const weekNav = {
@@ -1638,7 +1750,7 @@ function App() {
             </span>
           )}
           <UserMenu email={myEmail} onSignOut={() => sb.auth.signOut()} household={householdSize} onHousehold={changeHousehold}
-            shoppingEnabled={shoppingEnabled} onShoppingEnabled={(v) => { persistSetting('shoppingEnabled', setShoppingEnabled, v); if (!v) { setStoreMode(null); if (tab === 'shopping') setTab('planner'); } showToast(v ? 'Boodschappenlijst staat aan' : 'Boodschappenlijst staat uit — weer aanzetten via de letter rechtsboven'); }}
+            shoppingEnabled={shoppingEnabled} onShoppingEnabled={(v) => { persistSetting('shoppingEnabled', setShoppingEnabled, v); if (!v) { setStoreMode(null); if (tab === 'shopping' || tab === 'winkel') setTab('planner'); } showToast(v ? 'Boodschappenlijst staat aan' : 'Boodschappenlijst staat uit — weer aanzetten via de letter rechtsboven'); }}
             onOpenFamily={() => setFamilyOpen(true)} onOpenAccess={() => setAccessOpen(true)} />
         </div>
       </header>
@@ -1654,8 +1766,11 @@ function App() {
             selectedDay={selectedDay} setSelectedDay={setSelectedDay}
             onOpenMeal={(day, meal) => setMealSheet({ day, meal })}
             onToggleLock={(day, meal) => updateMealSlot(day, meal, { locked: !weekmenu[day][meal].locked })}
-            onFeedback={giveMealFeedback} aiTargetCount={aiTargetCount} aiBusy={aiBusy} onAiFill={aiFillWeek}
+            onFeedback={giveMealFeedback} onEaten={markEaten} aiTargetCount={aiTargetCount} aiBusy={aiBusy} onAiFill={aiFillWeek}
             onCopyPrev={copyPreviousWeek} showToast={showToast} />
+        )}
+        {tab === 'winkel' && shoppingEnabled && (
+          <WinkelPage items={shoppingItems} stores={stores} onStoreMode={(s) => setStoreMode(s)} onGoList={() => switchTab('shopping')} />
         )}
         {tab === 'shopping' && shoppingEnabled && (
           <ShoppingPage nav={weekNav} items={shoppingItems} stores={stores} storeAisles={storeAisles} staples={staples}
@@ -1671,24 +1786,25 @@ function App() {
             onOpenRecipe={(id) => setRecipeSheet({ id })} onAdd={() => openAdd({})} />
         )}
         {tab === 'kast' && (
-          <KastPage pantryStock={pantryStock} recipes={recipes} onAdd={addPantryStockItem} onToggle={togglePantryStockItem}
+          <KastPage pantryStock={pantryStock} recipes={recipes} onAdd={addPantryStockItem} onToggle={togglePantryStockItem} onUpdate={updatePantryItem}
             onRemove={removePantryStockItem} onAddToShopping={shoppingEnabled ? (name) => { if (addExtraItem(name)) showToast(`🛒 "${name}" op je boodschappenlijst`); } : null}
             onOpenRecipe={(id) => setRecipeSheet({ id })} onAiSuggest={aiSuggestFromPantry} aiSuggesting={aiSuggesting} showToast={showToast} />
         )}
       </main>
 
       <nav className="fixed bottom-0 inset-x-0 z-30 bg-white/95 backdrop-blur border-t border-line pb-safe">
-        <div className={cx('max-w-lg mx-auto grid px-2 pt-1.5', shoppingEnabled ? 'grid-cols-4' : 'grid-cols-3')}>
+        <div className={cx('max-w-lg mx-auto grid px-1 pt-1.5', shoppingEnabled ? 'grid-cols-5' : 'grid-cols-3')}>
           {[
             { id: 'planner', label: 'Planner', icon: 'calendar' },
-            shoppingEnabled && { id: 'shopping', label: 'Boodschappen', icon: 'cart', badge: shoppingTodo },
+            shoppingEnabled && { id: 'shopping', label: 'Lijst', icon: 'list', badge: shoppingTodo },
+            shoppingEnabled && { id: 'winkel', label: 'Winkelen', icon: 'cart', badge: basketTodo },
             { id: 'recipes', label: 'Recepten', icon: 'book', badge: aiSuggestions.length, badgeTone: 'amber' },
             { id: 'kast', label: 'Kast', icon: 'box' },
           ].filter(Boolean).map(t => {
             const active = tab === t.id;
             return (
               <button key={t.id} onClick={() => switchTab(t.id)} className="flex flex-col items-center gap-0.5 pb-1">
-                <span className={cx('relative px-5 py-1.5 rounded-full transition', active ? 'bg-mint text-forest' : 'text-stone-400')}>
+                <span className={cx('relative py-1.5 rounded-full transition', shoppingEnabled ? 'px-3.5' : 'px-5', active ? 'bg-mint text-forest' : 'text-stone-400')}>
                   <Icon name={t.icon} size={21} stroke={active ? 2.3 : 2} />
                   {t.badge ? <span className={cx('absolute -top-0.5 right-1.5 min-w-[18px] h-[18px] px-1 rounded-full text-[10px] font-black text-white flex items-center justify-center border-2 border-white', t.badgeTone === 'amber' ? 'bg-amber-500' : 'bg-forest')}>{t.badge > 99 ? '99+' : t.badge}</span> : null}
                 </span>
@@ -1746,7 +1862,7 @@ function App() {
         <StoreMode storeKey={storeMode} weekLabel={`Week ${isoWeekNumber(weekStart)}`} items={shoppingItems} storeAisles={storeAisles}
           online={online} pendingOps={pendingOps} onToggle={toggleCart}
           onAddExtra={(name) => addExtraItem(name, storeMode === '__all__' ? '' : storeMode)}
-          onClose={() => setStoreMode(null)} />
+          onFinish={finishShopping} onClose={() => setStoreMode(null)} />
       )}
 
       {toast && (
@@ -1837,7 +1953,7 @@ function MoreMenu({ items }) {
   );
 }
 
-function PlannerPage({ nav, weekmenu, recipesById, weekLoading, members, selectedDay, setSelectedDay, onOpenMeal, onToggleLock, onFeedback, aiTargetCount, aiBusy, onAiFill, onCopyPrev, showToast }) {
+function PlannerPage({ nav, weekmenu, recipesById, weekLoading, members, selectedDay, setSelectedDay, onOpenMeal, onToggleLock, onFeedback, onEaten, aiTargetCount, aiBusy, onAiFill, onCopyPrev, showToast }) {
   const [view, setView] = useState('day');
   const swipeRef = useRef(null);
   const today = todayISO();
@@ -1926,7 +2042,8 @@ function PlannerPage({ nav, weekmenu, recipesById, weekLoading, members, selecte
           {MEALS.map(m => (
             <MealCard key={m.key} meal={m} slot={weekmenu[selectedDay][m.key]} recipesById={recipesById} members={members}
               onOpen={() => onOpenMeal(selectedDay, m.key)} onToggleLock={() => onToggleLock(selectedDay, m.key)}
-              onFeedback={(v) => onFeedback(selectedDay, m.key, v)} />
+              onFeedback={(v) => onFeedback(selectedDay, m.key, v)}
+              canEat={mealIsPast(nav.weekStart, selectedDay, m.key)} onEaten={(v) => onEaten(selectedDay, m.key, v)} />
           ))}
         </div>
       ) : (
@@ -1958,7 +2075,7 @@ function PlannerPage({ nav, weekmenu, recipesById, weekLoading, members, selecte
   );
 }
 
-function MealCard({ meal, slot, recipesById, members, onOpen, onToggleLock, onFeedback }) {
+function MealCard({ meal, slot, recipesById, members, onOpen, onToggleLock, onFeedback, canEat, onEaten }) {
   const mode = slotMode(slot);
   const rs = slotRecipes(slot, recipesById);
   const hits = restrictionHits(rs, members);
@@ -2034,6 +2151,15 @@ function MealCard({ meal, slot, recipesById, members, onOpen, onToggleLock, onFe
         )}
       </button>
 
+      {rs.length > 0 && (canEat || slot.eatenAt) && (
+        <button onClick={() => onEaten(!slot.eatenAt)} aria-label={slot.eatenAt ? `${meal.label}: niet gegeten` : `${meal.label}: gegeten`}
+          className={cx('w-full flex items-center gap-2.5 px-4 py-2.5 border-t border-line/70 text-left active:bg-mist', slot.eatenAt ? 'bg-mint/60' : 'bg-white')}>
+          <span className={cx('w-6 h-6 rounded-full shrink-0 flex items-center justify-center border-2', slot.eatenAt ? 'bg-sage border-sage text-white' : 'border-forest')}>
+            {slot.eatenAt && <Icon name="check" size={14} stroke={3} />}
+          </span>
+          <span className="flex-1 text-[13px] font-extrabold text-deep">{slot.eatenAt ? 'Gegeten — uit de kast gehaald' : 'Gegeten? Vink aan — gebruikte ingrediënten gaan uit de kast'}</span>
+        </button>
+      )}
       {rs.length > 0 && (
         <div className="flex items-center justify-between pl-4 pr-2 py-1.5 bg-mist/70 border-t border-line/70">
           <span className="text-[11px] font-bold text-stone-500">{carbs != null ? `≈ ${Math.round(carbs)} g koolhydraten` : 'Hoe was het?'}</span>
@@ -2601,10 +2727,8 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
     return (
       <div className={cx('px-3 py-2', done && 'bg-cream/50')}>
         <div className="flex items-center gap-2">
-          <button onClick={() => { choose(i, done ? 'buy' : 'cart'); if (!done) showToast(`✓ ${i.name} in de kar`, { label: 'Ongedaan', onClick: () => choose(i, 'buy') }); }} aria-label={`${i.name}: ${done ? 'niet gekocht' : 'gekocht'}`} className="flex-1 min-w-0 flex items-center gap-3 text-left py-1">
-            <span className={cx('w-7 h-7 rounded-full shrink-0 flex items-center justify-center border-2', done ? 'bg-sage border-sage text-white' : 'border-stone-300')}>
-              {done && <Icon name="check" size={15} stroke={3} />}
-            </span>
+          <button onClick={() => (done ? choose(i, 'buy') : setExpanded(expanded === i.key ? null : i.key))} aria-label={done ? `${i.name}: terug in winkelmandje` : `${i.name}: winkel kiezen`} className="flex-1 min-w-0 flex items-center gap-3 text-left py-1">
+            {done && <span className="w-7 h-7 rounded-full shrink-0 flex items-center justify-center bg-sage text-white"><Icon name="check" size={15} stroke={3} /></span>}
             <span className="min-w-0">
               <span className={cx('block text-[15px] font-bold truncate', done ? 'text-stone-400 line-through' : 'text-ink')}>{i.name}{i.kind === 'staple' ? ' 📌' : ''}</span>
               {!done && <span className="block text-[12px] text-stone-500 truncate">{sub(i)}</span>}
@@ -2696,7 +2820,7 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
           <Card className="overflow-hidden">
             <StepHead n="2" title="Winkelmandje" count={basket.length}
               right={basket.length > 0 && <button onClick={() => clearStep(basket, 'Winkelmandje leegmaken', 'hidden')} aria-label="Winkelmandje leegmaken" title="Leegmaken" className="w-8 h-8 text-[13px] text-stone-500 bg-white rounded-full border border-line flex items-center justify-center">🗑</button>} />
-            {basket.length > 0 && <div className="px-4 pt-2 text-[12px] text-stone-500">Tik aan wat in de kar ligt.{noStore.length ? ' Kies eerst een winkel bij de oranje items — dat wordt onthouden.' : ''}</div>}
+            {basket.length > 0 && <div className="px-4 pt-2 text-[12px] text-stone-500">{noStore.length ? 'Kies een winkel bij de oranje items — dat wordt onthouden. ' : ''}Klaar? Ga naar <b>🛒 Winkelen</b> onderaan.</div>}
             {basketStores.map(s => (
               <div key={s} className="border-t border-line/70 mt-2 first:mt-1">
                 <div className="px-4 pt-2.5 pb-0.5 flex items-center justify-between">
@@ -2710,19 +2834,12 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
               <div className="border-t border-line/70">
                 <div className="flex items-center">
                   <button onClick={() => setOpen({ ...open, cart: !open.cart })} className="flex-1 px-4 py-2.5 flex items-center justify-between text-[13px] font-extrabold text-stone-500">
-                    <span>✓ In de kar / gekocht ({bought.length})</span><Icon name="down" size={15} className={open.cart ? 'rotate-180' : ''} />
+                    <span>✓ Afgevinkt in de winkel ({bought.length})</span><Icon name="down" size={15} className={open.cart ? 'rotate-180' : ''} />
                   </button>
                   <button onClick={() => clearStep(bought, 'Gekocht leegmaken', 'hidden')} aria-label="Gekocht leegmaken" title="Leegmaken"
                     className="w-8 h-8 mr-3 shrink-0 text-[12px] text-stone-500 bg-white rounded-full border border-line flex items-center justify-center">🗑</button>
                 </div>
                 {open.cart && <div className="divide-y divide-line/60 pb-1">{bought.map(i => <BasketRow key={i.key} i={i} />)}</div>}
-              </div>
-            )}
-            {basket.length > 0 && (
-              <div className="px-3 pb-3 pt-1 border-t border-line/70">
-                <button onClick={() => setPickStore(true)} className="w-full flex items-center justify-center gap-1.5 py-2.5 text-[13px] font-extrabold text-forest">
-                  <Icon name="cart" size={16} />Winkelmodus — groot, scherm blijft aan
-                </button>
               </div>
             )}
           </Card>
@@ -2921,9 +3038,54 @@ function StaplesSheet({ staples, stores, onAdd, onUpdate, onDelete, onClose }) {
   );
 }
 
+// Winkelen: los van het lijstje maken. Kies je winkel → afvinklijst zoals Google Keep → afronden = in de kast.
+function WinkelPage({ items, stores, onStoreMode, onGoList }) {
+  const basket = items.filter(i => i.state === 'buy');
+  const done = items.filter(i => i.state === 'cart');
+  const forStore = (s) => basket.filter(i => i.store === s || !i.store).length;
+  const shops = stores.filter(s => basket.some(i => i.store === s));
+  const noStore = basket.filter(i => !i.store).length;
+  return (
+    <div>
+      <PageHeader eyebrow={`${basket.length} te halen${done.length ? ` · ${done.length} afgevinkt` : ''}`} title="Winkelen" />
+      {basket.length === 0 && done.length === 0 ? (
+        <EmptyState emoji="🛒" title="Je winkelmandje is leeg" text="Maak eerst je lijst: kies per product 🏠 Kast of 🛒 Kopen." />
+      ) : (
+        <div className="space-y-2.5">
+          <div className="text-[13px] font-bold text-stone-600 px-1">In welke winkel ben je?</div>
+          {shops.map(s => (
+            <button key={s} onClick={() => onStoreMode(s)}
+              className="w-full flex items-center gap-3 rounded-2xl bg-white border border-line shadow-card px-4 py-4 text-left active:scale-[.99] transition">
+              <span className="w-11 h-11 rounded-xl bg-mint text-forest flex items-center justify-center shrink-0"><Icon name="cart" size={21} /></span>
+              <span className="flex-1 text-[17px] font-black text-deep">{s}</span>
+              <span className="text-[13px] font-extrabold text-stone-500">{forStore(s)} te halen</span>
+              <Icon name="right" size={18} className="text-stone-300" />
+            </button>
+          ))}
+          <button onClick={() => onStoreMode('__all__')}
+            className="w-full flex items-center gap-3 rounded-2xl border-2 border-dashed border-line px-4 py-4 text-left active:bg-mist">
+            <span className="flex-1 text-[15px] font-extrabold text-forest">Alles in één lijst</span>
+            <span className="text-[13px] font-extrabold text-stone-500">{basket.length + done.length}</span>
+          </button>
+          {noStore > 0 && <p className="text-[12px] text-amber-800 px-1">{noStore === 1 ? '1 item heeft' : `${noStore} items hebben`} nog geen winkel — dat zie je in elke winkel.</p>}
+          {done.length > 0 && <p className="text-[12px] text-stone-500 px-1">{done.length} items afgevinkt maar nog niet afgerond — open je winkel en tik op ✓ Afronden.</p>}
+          <button onClick={onGoList} className="w-full text-center text-[13px] font-extrabold text-forest py-3">← Lijst aanpassen</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Winkelmodus — zoals Google Keep: grote vinkzones, afgevinkt zakt naar "In de kar".
-function StoreMode({ storeKey, weekLabel, items, storeAisles, online, pendingOps, onToggle, onAddExtra, onClose }) {
-  const [showCart, setShowCart] = useState(false);
+function StoreMode({ storeKey, weekLabel, items, storeAisles, online, pendingOps, onToggle, onAddExtra, onFinish, onClose }) {
+  const [showCart, setShowCart] = useState(true);
+  const [finishing, setFinishing] = useState(false);
+  async function finish() {
+    if (!cart.length) { onClose(); return; }
+    if (!window.confirm(`Winkelen afronden? ${cart.length} afgevinkte items gaan naar je kast en verdwijnen van de lijst.${todo.length ? ` ${todo.length} niet-afgevinkte items blijven in je winkelmandje.` : ''}`)) return;
+    setFinishing(true);
+    try { await onFinish(); onClose(); } finally { setFinishing(false); }
+  }
   const [name, setName] = useState('');
   const wakeSupported = useWakeLock(true);
   useEffect(() => {
@@ -2946,7 +3108,8 @@ function StoreMode({ storeKey, weekLabel, items, storeAisles, online, pendingOps
               <div className="text-[11px] font-bold text-white/70">{weekLabel} · {cart.length} van {mine.length} in de kar</div>
               <div className="text-xl font-black truncate">🛒 {all ? 'Alle winkels' : storeKey}</div>
             </div>
-            <button onClick={onClose} className="rounded-xl bg-white text-forest font-black text-sm px-4 py-2">Klaar</button>
+            <button onClick={onClose} aria-label="Sluiten (afvinkingen blijven bewaard)" className="w-10 h-10 rounded-xl bg-white/10 text-white flex items-center justify-center"><Icon name="x" size={18} /></button>
+            <button onClick={finish} disabled={finishing} className="rounded-xl bg-white text-forest font-black text-sm px-3.5 py-2 disabled:opacity-60">{finishing ? '…' : '✓ Afronden'}</button>
           </div>
           <div className="h-1.5 bg-white/15"><div className="h-full bg-mint transition-all" style={{ width: `${mine.length ? (cart.length / mine.length) * 100 : 0}%` }} /></div>
         </div>
@@ -2985,7 +3148,7 @@ function StoreMode({ storeKey, weekLabel, items, storeAisles, online, pendingOps
             {cart.length > 0 && (
               <div className="mb-6">
                 <button onClick={() => setShowCart(!showCart)} className="w-full flex items-center justify-between px-2 py-2 text-xs font-black text-stone-400">
-                  <span>🛒 In de kar ({cart.length})</span><Icon name="down" size={16} className={showCart ? 'rotate-180' : ''} />
+                  <span>✓ Afgevinkt ({cart.length})</span><Icon name="down" size={16} className={showCart ? 'rotate-180' : ''} />
                 </button>
                 {showCart && (
                   <div className="bg-white/60 rounded-2xl border border-line divide-y divide-line/70 overflow-hidden">
@@ -2998,6 +3161,11 @@ function StoreMode({ storeKey, weekLabel, items, storeAisles, online, pendingOps
                   </div>
                 )}
               </div>
+            )}
+            {cart.length > 0 && (
+              <button onClick={finish} disabled={finishing} className="w-full mb-6 rounded-2xl bg-forest text-white py-3.5 text-[15px] font-black disabled:opacity-60">
+                ✓ Winkelen afronden — {cart.length} items naar de kast
+              </button>
             )}
             {!wakeSupported && <div className="text-center text-[11px] text-stone-400 pb-4">Tip: dit toestel ondersteunt "scherm aan houden" niet — zet eventueel de automatische schermvergrendeling even langer.</div>}
           </div>
@@ -3455,7 +3623,7 @@ function AddRecipeSheet({ preset, onSave, onClose }) {
 // =================================================================
 // 9. Kast
 // =================================================================
-function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onAddToShopping, onOpenRecipe, onAiSuggest, aiSuggesting, showToast }) {
+function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onUpdate, onAddToShopping, onOpenRecipe, onAiSuggest, aiSuggesting, showToast }) {
   const scanRef = useRef(null);
   const [scanning, setScanning] = useState(false);
   const [scanItems, setScanItems] = useState(null);
@@ -3501,6 +3669,14 @@ function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onAddToShop
   ].filter((n, i, a) => a.findIndex(x => normalize(x) === normalize(n)) === i).slice(0, 8) : [];
   const quick = known.filter(k => !inStockSet.has(normalize(k.name)) && !outStock.some(p => normalize(p.name) === normalize(k.name))).slice(0, 24);
   const [showQuick, setShowQuick] = useState(false);
+  const [tidy, setTidy] = useState(false);   // opruimen: aantallen aanpassen
+  const stepFor = (u) => (/^(g|ml)$/.test(u || '') ? 50 : 1);
+  function bump(p, d) {
+    const u = p.unit || 'stuks';
+    const q = Math.max(0, Math.round(((p.qty == null ? (d > 0 ? 0 : 1) : p.qty) + d * stepFor(u)) * 100) / 100);
+    if (q <= 0) onUpdate(p.id, { inStock: false, qty: null, unit: p.unit || u });
+    else onUpdate(p.id, { inStock: true, qty: q, unit: p.unit || u });
+  }
   function addExtra() {
     const parts = extraInput.split(',').map(s => s.trim()).filter(Boolean);
     setExtra([...extra, ...parts.filter(p => !sources.some(s => normalize(s) === normalize(p)))]); setExtraInput('');
@@ -3567,12 +3743,37 @@ function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onAddToShop
 
           {inStock.length > 0 && (
             <div>
-              <div className="text-[11px] font-extrabold uppercase tracking-wide text-stone-400 mb-1.5 px-1">In huis ({inStock.length})</div>
+              <div className="flex items-center justify-between mb-1.5 px-1">
+                <span className="text-[11px] font-extrabold uppercase tracking-wide text-stone-400">In huis ({inStock.length})</span>
+                <button onClick={() => setTidy(!tidy)} className={cx('text-[12px] font-extrabold rounded-full px-3 py-1.5', tidy ? 'bg-forest text-white' : 'bg-mint text-forest')}>
+                  {tidy ? '✓ Klaar met opruimen' : '🧹 Opruimen & aantallen'}
+                </button>
+              </div>
+              {tidy && <p className="text-[12px] text-stone-500 px-1 mb-2">Pas aan wat er écht nog is: − en +, of tik op het getal. Op 0 = op.</p>}
               <Card className="divide-y divide-line/70 overflow-hidden">
-                {inStock.map(p => (
+                {inStock.map(p => tidy ? (
+                  <div key={p.id} className="flex items-center gap-1.5 px-3 py-2">
+                    <span className="flex-1 min-w-0 text-sm font-bold text-ink truncate">{p.name}</span>
+                    <button onClick={() => bump(p, -1)} aria-label={`${p.name} minder`} className="w-9 h-9 rounded-xl bg-cream border border-line text-lg font-black text-deep shrink-0">−</button>
+                    <input type="number" inputMode="decimal" min="0" defaultValue={p.qty == null ? '' : p.qty} key={`${p.id}-${p.qty}`} placeholder="?"
+                      aria-label={`Aantal ${p.name}`}
+                      onBlur={(e) => { const v = e.target.value.trim(); if (v === '') { if (p.qty != null) onUpdate(p.id, { qty: null }); return; }
+                        const n = Math.max(0, Number(v.replace(',', '.')) || 0); if (n === p.qty) return;
+                        onUpdate(p.id, n <= 0 ? { inStock: false, qty: null } : { qty: n, unit: p.unit || 'stuks' }); }}
+                      onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }}
+                      className="w-14 h-9 rounded-xl border border-line bg-white text-center text-sm font-black text-deep" />
+                    <button onClick={() => bump(p, 1)} aria-label={`${p.name} meer`} className="w-9 h-9 rounded-xl bg-cream border border-line text-lg font-black text-deep shrink-0">+</button>
+                    <select value={p.unit || 'stuks'} onChange={(e) => onUpdate(p.id, { unit: e.target.value })} aria-label={`Eenheid ${p.name}`}
+                      className="w-[4.2rem] h-9 rounded-xl border border-line bg-white text-xs font-bold text-stone-600 px-1 shrink-0">
+                      {[...new Set(['stuks', 'g', 'ml', 'pot', 'blik', 'pak', 'zakje', 'fles', 'bosje', p.unit || 'stuks'])].map(u => <option key={u} value={u}>{u}</option>)}
+                    </select>
+                    <IconBtn name="trash" size={14} title={`${p.name} verwijderen`} onClick={() => onRemove(p.id)} className="w-8 h-8 text-stone-300 shrink-0" />
+                  </div>
+                ) : (
                   <div key={p.id} className="flex items-center gap-3 px-3 py-2.5">
                     <button onClick={() => onToggle(p.id)} className="w-6 h-6 rounded-full bg-sage text-white flex items-center justify-center shrink-0" aria-label="Markeer als op"><Icon name="check" size={14} stroke={3} /></button>
-                    <span className="flex-1 text-sm font-bold text-ink">{p.name}</span>
+                    <span className="flex-1 min-w-0 text-sm font-bold text-ink truncate">{p.name}</span>
+                    {p.qty != null && <span className="text-[12px] font-extrabold text-leaf bg-mint rounded-full px-2 py-0.5 shrink-0">{fmtPantryQty(p)}</span>}
                     <button onClick={() => onToggle(p.id)} className="text-[11px] font-extrabold text-stone-400 px-2 py-1 rounded-lg active:bg-mist">Op</button>
                   </div>
                 ))}
@@ -3581,7 +3782,11 @@ function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onAddToShop
           )}
           {outStock.length > 0 && (
             <div>
-              <div className="text-[11px] font-extrabold uppercase tracking-wide text-stone-400 mb-1.5 px-1">Op / aan te vullen ({outStock.length})</div>
+              <div className="flex items-center justify-between mb-1.5 px-1">
+                <span className="text-[11px] font-extrabold uppercase tracking-wide text-stone-400">Op / aan te vullen ({outStock.length})</span>
+                <button onClick={() => { if (window.confirm(`Alle ${outStock.length} items die op zijn uit de kast verwijderen?`)) outStock.forEach(p => onRemove(p.id)); }}
+                  className="text-[12px] font-extrabold text-stone-500">🗑 Opkuisen</button>
+              </div>
               <Card className="divide-y divide-line/70 overflow-hidden">
                 {outStock.map(p => (
                   <div key={p.id} className="flex items-center gap-2 px-3 py-2.5">
