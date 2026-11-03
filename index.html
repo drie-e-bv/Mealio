@@ -649,6 +649,34 @@ function useWakeLock(active) {
 // Volledig-scherm-overlays buiten de (getransformeerde) sheets renderen.
 function Portal({ children }) { return ReactDOM.createPortal(children, document.body); }
 
+// Android-terugknop = één stap terug in de app (venster sluiten, terug naar de planner) i.p.v. de app verlaten.
+// Elk open venster/menu legt een stap op de stapel; "terug" sluit het bovenste.
+const BACK_STACK = [];
+let BACK_IGNORE = 0;
+if (typeof window !== 'undefined') {
+  window.addEventListener('popstate', () => {
+    if (BACK_IGNORE > 0) { BACK_IGNORE--; return; }
+    const top = BACK_STACK.pop();
+    if (top) { top.popped = true; top.close.current(); }
+  });
+}
+function useBackClose(active, onClose) {
+  const ref = useRef(onClose);
+  ref.current = onClose;
+  useEffect(() => {
+    if (!active) return;
+    const entry = { close: ref, popped: false };
+    BACK_STACK.push(entry);
+    try { window.history.pushState({ mealio: BACK_STACK.length }, ''); } catch (e) {}
+    return () => {
+      const i = BACK_STACK.indexOf(entry);
+      if (i >= 0) BACK_STACK.splice(i, 1);
+      // zelf gesloten (✕, Klaar…): de stap uit de geschiedenis halen
+      if (!entry.popped) { BACK_IGNORE++; try { window.history.back(); } catch (e) { BACK_IGNORE--; } }
+    };
+  }, [active]); // eslint-disable-line
+}
+
 // =================================================================
 // 4. UI-bouwstenen
 // =================================================================
@@ -800,6 +828,7 @@ function EmptyState({ emoji, title, text, action }) {
 // worden (bv. maaltijd → recept → nieuw recept); zIndex bepaalt de volgorde.
 let openSheets = 0;
 function Sheet({ title, subtitle, onClose, children, footer, z = 40, full }) {
+  useBackClose(true, onClose);
   useEffect(() => {
     openSheets++; document.body.style.overflow = 'hidden';
     const onKey = (e) => { if (e.key === 'Escape') onClose(); };
@@ -907,6 +936,8 @@ function App() {
     toastTimer.current = setTimeout(() => setToast(null), action ? 5500 : 2600);
   }
 
+  // terugknop vanuit een ander tabblad → terug naar de planner (vanuit de planner = app verlaten)
+  useBackClose(tab !== 'planner', () => setTab('planner'));
   // ---------- plaats onthouden (zie UI_KEY) ----------
   useEffect(() => { saveUi({ tab, day: selectedDay, weekStart, storeMode: storeMode || null, recipeId: recipeSheet && !recipeSheet.edit ? recipeSheet.id : null }); },
     [tab, selectedDay, weekStart, storeMode, recipeSheet]);
@@ -1879,6 +1910,7 @@ function App() {
 
 function UserMenu({ email, onSignOut, household, onHousehold, onOpenFamily, onOpenAccess, shoppingEnabled, onShoppingEnabled }) {
   const [open, setOpen] = useState(false);
+  useBackClose(open, () => setOpen(false));
   const initial = (email || '?').slice(0, 1).toUpperCase();
   const item = 'w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-bold text-deep active:bg-mist text-left';
   return (
@@ -1933,6 +1965,7 @@ function WeekNav({ nav }) {
 // Klein "⋯"-menu (weekoverzicht delen, vorige week kopiëren).
 function MoreMenu({ items }) {
   const [open, setOpen] = useState(false);
+  useBackClose(open, () => setOpen(false));
   return (
     <div className="relative">
       <IconBtn name="more" onClick={() => setOpen(!open)} title="Meer" className="bg-white border border-line" />
@@ -3078,6 +3111,7 @@ function WinkelPage({ items, stores, onStoreMode, onGoList }) {
 
 // Winkelmodus — zoals Google Keep: grote vinkzones, afgevinkt zakt naar "In de kar".
 function StoreMode({ storeKey, weekLabel, items, storeAisles, online, pendingOps, onToggle, onAddExtra, onFinish, onClose }) {
+  useBackClose(true, onClose);
   const [showCart, setShowCart] = useState(true);
   const [finishing, setFinishing] = useState(false);
   async function finish() {
@@ -3974,6 +4008,7 @@ function beep() {
 }
 
 function CookMode({ recipe, persons: startPersons, onClose }) {
+  useBackClose(true, onClose);
   const [persons, setPersons] = useState(startPersons || recipe.basePortions || 1);
   const [phase, setPhase] = useState(-1);     // -1 = ingrediënten, 0..n-1 = stappen
   const [have, setHave] = useState({});
