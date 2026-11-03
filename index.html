@@ -1411,7 +1411,7 @@ function App() {
   }
   function bulkState(list, st) {
     list.forEach(i => setItemState(i, st));
-    showToast(`${list.length} items ${st === 'buy' ? 'in het winkelmandje' : 'in de kast'}`, { label: 'Ongedaan', onClick: () => list.forEach(i => setItemState(i, i.state)) });
+    showToast(`${list.length} items ${st === 'buy' ? 'in het winkelmandje' : st === 'cart' ? 'van de lijst gehaald' : 'in de kast'}`, { label: 'Ongedaan', onClick: () => list.forEach(i => setItemState(i, i.state)) });
   }
   // winkelmodus: afvinken = gekocht, nog eens tikken = terug in het winkelmandje
   function toggleCart(item) { setItemState(item, item.state === 'cart' ? 'buy' : 'cart'); }
@@ -2506,6 +2506,20 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
   basket.forEach(i => { const k = i.store && stores.includes(i.store) ? i.store : '__none__'; (byStore[k] = byStore[k] || []).push(i); });
   const noStore = byStore.__none__ || [];
   const storeKeys = stores.filter(s => byStore[s]);
+  // in het mandje: per winkel, in winkelvolgorde (afdeling), gekochte onderaan
+  const boughtBy = {};
+  bought.forEach(i => { const k = i.store && stores.includes(i.store) ? i.store : '__none__'; (boughtBy[k] = boughtBy[k] || []).push(i); });
+  const basketStores = [...(noStore.length ? ['__none__'] : []), ...storeKeys];
+  const sortedFor = (s) => {
+    const order = aisleOrderFor(s === '__none__' ? '' : s, storeAisles);
+    const ai = (i) => { const k = order.indexOf(s === '__none__' ? i.baseAisle : i.aisleFor(s)); return k < 0 ? 999 : k; };
+    const by = (a, b) => ai(a) - ai(b) || a.name.localeCompare(b.name);
+    return (byStore[s] || []).sort(by);
+  };
+  function clearStep(list, label, st) {
+    if (!list.length) return;
+    if (window.confirm(`${label}: ${list.length} items van de lijst halen? (bv. boodschappen gedaan zonder de app)`)) onBulkState(list, st);
+  }
 
   function addExtra() { if (onAddExtra(extraName, '')) setExtraName(''); }
   function choose(i, st) { onSetState(i, st); }
@@ -2543,32 +2557,44 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
       <button onClick={() => choose(i, 'buy')} aria-label={`${i.name}: kopen`} className={cx(pill, 'bg-forest text-white')}>🛒 Kopen</button>
     </div>
   );
-  // stap 2: winkel kiezen
+  // stap 2: winkelmandje = afvinklijst (zoals Google Keep). Tik = gekocht, nog eens = terug.
   const StoreChips = ({ i }) => (
-    <div className="flex flex-wrap gap-1.5 pt-2">
+    <div className="flex flex-wrap gap-1.5 pt-2 pl-10">
       {stores.map(s => (
         <button key={s} onClick={() => pickStoreFor(i, s)} aria-label={`${i.name} in ${s}`}
           className={cx('h-9 px-3 rounded-xl text-[13px] font-extrabold border active:scale-95 transition', i.store === s ? 'bg-forest text-white border-forest' : 'bg-white text-deep border-line')}>{s}</button>
       ))}
+      <button onClick={() => { setEditItem(i); setExpanded(null); }} className="h-9 px-2 text-[12px] font-extrabold text-stone-500">Afdeling: {i.aisle} ›</button>
     </div>
   );
-  const BasketRow = ({ i, showChips }) => (
-    <div className="px-3.5 py-2.5">
-      <div className="flex items-center gap-2">
-        <button onClick={() => setExpanded(expanded === i.key ? null : i.key)} className="flex-1 min-w-0 text-left">
-          <div className="text-[15px] font-bold text-ink truncate">{i.name}{i.kind === 'staple' ? ' 📌' : ''}</div>
-          <div className="text-[12px] text-stone-500 truncate">{sub(i)}</div>
-        </button>
-        {i.kind === 'extra'
-          ? <button onClick={() => onRemoveItem(i)} aria-label={`${i.name} verwijderen`} className="w-10 h-10 shrink-0 flex items-center justify-center text-stone-400"><Icon name="x" size={16} /></button>
-          : <button onClick={() => choose(i, null)} aria-label={`${i.name} terug naar kiezen`} title="Terug naar stap 1" className="w-10 h-10 shrink-0 flex items-center justify-center text-stone-400 text-lg">↩</button>}
+  const BasketRow = ({ i }) => {
+    const done = i.state === 'cart';
+    const needStore = !done && !i.store;
+    return (
+      <div className={cx('px-3 py-2', done && 'bg-cream/50')}>
+        <div className="flex items-center gap-2">
+          <button onClick={() => { choose(i, done ? 'buy' : 'cart'); if (!done) showToast(`✓ ${i.name} in de kar`, { label: 'Ongedaan', onClick: () => choose(i, 'buy') }); }} aria-label={`${i.name}: ${done ? 'niet gekocht' : 'gekocht'}`} className="flex-1 min-w-0 flex items-center gap-3 text-left py-1">
+            <span className={cx('w-7 h-7 rounded-full shrink-0 flex items-center justify-center border-2', done ? 'bg-sage border-sage text-white' : 'border-stone-300')}>
+              {done && <Icon name="check" size={15} stroke={3} />}
+            </span>
+            <span className="min-w-0">
+              <span className={cx('block text-[15px] font-bold truncate', done ? 'text-stone-400 line-through' : 'text-ink')}>{i.name}{i.kind === 'staple' ? ' 📌' : ''}</span>
+              {!done && <span className="block text-[12px] text-stone-500 truncate">{sub(i)}</span>}
+            </span>
+          </button>
+          {!done && (
+            <button onClick={() => setExpanded(expanded === i.key ? null : i.key)} aria-label={`Winkel voor ${i.name}`}
+              className={cx('h-9 px-2.5 rounded-xl text-[12px] font-extrabold shrink-0 border', needStore ? 'bg-amber-50 border-amber-300 text-amber-800' : 'bg-white border-line text-forest')}>
+              {i.store || 'Winkel?'} ▾
+            </button>
+          )}
+          <button onClick={() => (i.kind === 'extra' ? onRemoveItem(i) : choose(i, 'have'))} aria-label={`${i.name} van de lijst halen`}
+            className="w-9 h-9 shrink-0 flex items-center justify-center text-stone-400"><Icon name="x" size={16} /></button>
+        </div>
+        {!done && (needStore || expanded === i.key) && <StoreChips i={i} />}
       </div>
-      {(showChips || expanded === i.key) && <StoreChips i={i} />}
-      {expanded === i.key && (
-        <button onClick={() => { setEditItem(i); setExpanded(null); }} className="mt-2 text-[12px] font-extrabold text-forest">Afdeling: {i.aisle} ›</button>
-      )}
-    </div>
-  );
+    );
+  };
 
   const Fold = ({ id, label, list, onTap, action }) => list.length > 0 && (
     <Card className="overflow-hidden">
@@ -2588,7 +2614,7 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
     </Card>
   );
 
-  const StepHead = ({ n, title, count, right }) => (
+  const StepHead = ({ n, title, count, right }) => (  // eslint-disable-line
     <div className="px-4 py-3 flex items-center gap-2.5 bg-mist">
       <span className="w-6 h-6 rounded-full bg-forest text-white text-[12px] font-black flex items-center justify-center shrink-0">{n}</span>
       <span className="flex-1 text-[15px] font-black text-deep">{title} <span className="text-stone-500 font-bold">({count})</span></span>
@@ -2615,7 +2641,10 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
         {(undecided.length > 0 || basics.length > 0) && (
           <Card className="overflow-hidden">
             <StepHead n="1" title="Wat heb je nodig?" count={undecided.length + basics.length}
-              right={undecided.length > 1 && <button onClick={() => onBulkState(undecided, 'buy')} className="text-[12px] font-extrabold text-forest bg-white rounded-full px-3 py-1.5 border border-line">Alles kopen</button>} />
+              right={<div className="flex gap-1.5">
+                {undecided.length > 1 && <button onClick={() => onBulkState(undecided, 'buy')} className="text-[12px] font-extrabold text-forest bg-white rounded-full px-3 py-1.5 border border-line">Alles kopen</button>}
+                <button onClick={() => clearStep([...undecided, ...basics], 'Stap 1 wissen', 'have')} aria-label="Stap 1 wissen" title="Wissen" className="w-8 h-8 text-[13px] text-stone-500 bg-white rounded-full border border-line flex items-center justify-center">🗑</button>
+              </div>} />
             <div className="divide-y divide-line/70">
               {undecided.map(i => <ChooseRow key={i.key} i={i} />)}
             </div>
@@ -2631,32 +2660,35 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
           </Card>
         )}
 
-        {basket.length > 0 && (
+        {(basket.length > 0 || bought.length > 0) && (
           <Card className="overflow-hidden">
-            <StepHead n="2" title="Winkelmandje" count={basket.length} />
-            {noStore.length > 0 && (
-              <>
-                <div className="px-4 pt-2.5 text-[12px] font-bold text-amber-800">Kies per item een winkel — dat wordt onthouden.</div>
-                <div className="divide-y divide-line/70">{noStore.map(i => <BasketRow key={i.key} i={i} showChips />)}</div>
-              </>
-            )}
-            {storeKeys.map(s => (
-              <div key={s} className="border-t border-line/70">
-                <div className="px-4 pt-2.5 flex items-center justify-between">
-                  <span className="text-[13px] font-black text-deep">🏪 {s}</span>
-                  <span className="text-[12px] font-bold text-stone-500">{byStore[s].length}</span>
+            <StepHead n="2" title="Winkelmandje" count={basket.length}
+              right={basket.length > 0 && <button onClick={() => clearStep(basket, 'Winkelmandje wissen', 'cart')} aria-label="Winkelmandje wissen" className="text-[12px] font-extrabold text-stone-500 bg-white rounded-full px-2.5 py-1.5 border border-line">🗑 Wissen</button>} />
+            {basket.length > 0 && <div className="px-4 pt-2 text-[12px] text-stone-500">Tik aan wat in de kar ligt.{noStore.length ? ' Kies eerst een winkel bij de oranje items — dat wordt onthouden.' : ''}</div>}
+            {basketStores.map(s => (
+              <div key={s} className="border-t border-line/70 mt-2 first:mt-1">
+                <div className="px-4 pt-2.5 pb-0.5 flex items-center justify-between">
+                  <span className={cx('text-[13px] font-black', s === '__none__' ? 'text-amber-800' : 'text-deep')}>{s === '__none__' ? 'Nog geen winkel' : `🏪 ${s}`}</span>
+                  <span className="text-[12px] font-bold text-stone-500">{(byStore[s] || []).length} te halen</span>
                 </div>
-                <div className="divide-y divide-line/70">{byStore[s].map(i => <BasketRow key={i.key} i={i} />)}</div>
+                <div className="divide-y divide-line/60">{sortedFor(s).map(i => <BasketRow key={i.key} i={i} />)}</div>
               </div>
             ))}
-            <div className="p-3 border-t border-line/70">
-              <button onClick={() => setPickStore(true)}
-                className="w-full rounded-2xl bg-gradient-to-br from-deep to-forest text-white px-4 py-3 flex items-center gap-3 text-left active:scale-[.99] transition">
-                <Icon name="cart" size={20} />
-                <span className="flex-1 text-[15px] font-black">Ik ben in de winkel</span>
-                <Icon name="right" size={18} className="text-white/60" />
-              </button>
-            </div>
+            {bought.length > 0 && (
+              <div className="border-t border-line/70">
+                <button onClick={() => setOpen({ ...open, cart: !open.cart })} className="w-full px-4 py-2.5 flex items-center justify-between text-[13px] font-extrabold text-stone-500">
+                  <span>✓ In de kar / gekocht ({bought.length})</span><Icon name="down" size={15} className={open.cart ? 'rotate-180' : ''} />
+                </button>
+                {open.cart && <div className="divide-y divide-line/60 pb-1">{bought.map(i => <BasketRow key={i.key} i={i} />)}</div>}
+              </div>
+            )}
+            {basket.length > 0 && (
+              <div className="px-3 pb-3 pt-1 border-t border-line/70">
+                <button onClick={() => setPickStore(true)} className="w-full flex items-center justify-center gap-1.5 py-2.5 text-[13px] font-extrabold text-forest">
+                  <Icon name="cart" size={16} />Winkelmodus — groot, scherm blijft aan
+                </button>
+              </div>
+            )}
           </Card>
         )}
 
@@ -2664,17 +2696,9 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
           <div className="text-center py-6"><div className="text-4xl">🎉</div><div className="font-black text-deep mt-2">Alles geregeld voor deze week</div></div>
         )}
 
-        <Fold id="have" label="🏠 In kast" list={have} onTap={(i) => choose(i, null)} action="Terug" />
-        <Fold id="cart" label="✓ Gekocht" list={bought} onTap={(i) => choose(i, 'buy')} action="Terug" />
+        <Fold id="have" label="🏠 In kast / niet nodig" list={have} onTap={(i) => choose(i, null)} action="Terug" />
       </div>
 
-      {(undecided.length > 0 || basket.length > 0) && (
-        <button onClick={() => { if (window.confirm('Boodschappen al gedaan zonder de app? Alles wat nog op de lijst staat, wordt op "gekocht" gezet.')) onMarkAllBought(); }}
-          className="mt-4 w-full rounded-2xl border-2 border-dashed border-line bg-white/60 px-4 py-3 text-left active:bg-mist">
-          <div className="text-[14px] font-black text-forest">✓ Alles al gekocht</div>
-          <div className="text-[12px] text-stone-500">Boodschappen gedaan zonder de app? Zet de hele lijst in één keer op gekocht.</div>
-        </button>
-      )}
       <div className="mt-5 flex flex-wrap gap-2 justify-between items-center px-1">
         <button onClick={() => setShowStaples(true)} className="flex items-center gap-1.5 text-[13px] font-extrabold text-forest py-2">
           <Icon name="pin" size={15} />Vaste items{staples.length ? ` (${staples.filter(s => s.active).length})` : ''}
