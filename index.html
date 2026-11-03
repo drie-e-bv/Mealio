@@ -562,7 +562,7 @@ function persistQueue() { try { localStorage.setItem(QUEUE_KEY, JSON.stringify(Q
 function isNetworkError(e) { return !navigator.onLine || /failed to fetch|networkerror|network request failed|load failed|timeout|fetch/i.test((e && e.message) || ''); }
 async function runQueueOp(op) {
   if (op.t === 'check') {
-    if (op.state) throwIfError(await sb.from('shopping_checks').upsert({ week_start: op.ws, item_key: op.key, state: op.state, updated_at: new Date(op.at || Date.now()).toISOString() }, { onConflict: 'week_start,item_key' }));
+    if (op.state) throwIfError(await sb.from('shopping_checks').upsert({ week_start: op.ws, item_key: op.key, state: op.state, qty: op.qty == null ? null : op.qty, updated_at: new Date(op.at || Date.now()).toISOString() }, { onConflict: 'week_start,item_key' }));
     else throwIfError(await sb.from('shopping_checks').delete().eq('week_start', op.ws).eq('item_key', op.key));
   } else if (op.t === 'checks_reset') {
     throwIfError(await sb.from('shopping_checks').delete().eq('week_start', op.ws));
@@ -578,8 +578,11 @@ async function runQueueOp(op) {
 function applyQueueToChecks(checks, ws) {
   const out = { ...checks };
   QUEUE.forEach(op => {
-    if (op.t === 'check' && op.ws === ws) { if (op.state) out[op.key] = op.state; else delete out[op.key]; }
-    else if (op.t === 'checks_clear' && op.ws === ws) Object.keys(out).forEach(k => { if (out[k] === 'cart') delete out[k]; });
+    if (op.t === 'check' && op.ws === ws) {
+      if (op.state) out[op.key] = op.state; else delete out[op.key];
+      if (op.state && op.qty != null) out[op.key + '#q'] = op.qty; else delete out[op.key + '#q'];
+    }
+    else if (op.t === 'checks_clear' && op.ws === ws) Object.keys(out).forEach(k => { if (out[k] === 'cart') { delete out[k]; delete out[k + '#q']; } });
     else if (op.t === 'checks_reset' && op.ws === ws) Object.keys(out).forEach(k => { delete out[k]; });
   });
   return out;
@@ -904,12 +907,13 @@ function App() {
   const loadShopping = useCallback(async (ws) => {
     try {
       const [checkRows, extraDb, stapleRows] = await Promise.all([
-        sb.from('shopping_checks').select('item_key,state').eq('week_start', ws),
+        sb.from('shopping_checks').select('*').eq('week_start', ws),
         sb.from('shopping_extra_items').select('*').order('created_at'),
         sb.from('staple_items').select('*').order('sort').order('name'),
       ].map(p => p.then(throwIfError)));
       if (ws !== weekStartRef.current) return;
-      const c = {}; (checkRows || []).forEach(r => { c[r.item_key] = r.state; });
+      // "#q" = hoeveelheid op het moment van kiezen: komt er later een maaltijd bij, dan verschijnt het extra deel opnieuw
+      const c = {}; (checkRows || []).forEach(r => { c[r.item_key] = r.state; if (r.qty != null) c[r.item_key + '#q'] = Number(r.qty); });
       setChecks(applyQueueToChecks(c, ws));
       setExtraRows(applyQueueToExtras(extraDb || []));
       setStaples(stapleRows || []);
@@ -1316,10 +1320,15 @@ function App() {
   }
 
   // ---------- boodschappen ----------
-  function setCheck(key, state) {
+  function setCheck(key, state, qty) {
     const ws = weekStartRef.current;
-    setChecks(prev => { const n = { ...prev }; if (state) n[key] = state; else delete n[key]; return n; });
-    enqueue({ t: 'check', ws, key, state: state || null });
+    setChecks(prev => {
+      const n = { ...prev };
+      if (state) n[key] = state; else delete n[key];
+      if (state && qty != null) n[key + '#q'] = qty; else delete n[key + '#q'];
+      return n;
+    });
+    enqueue({ t: 'check', ws, key, state: state || null, qty: state && qty != null ? qty : null });
   }
   function putExtra(row) {
     setExtraRows(prev => [...prev.filter(r => r.id !== row.id), row]);
@@ -1371,8 +1380,9 @@ function App() {
           const name = ing.name.trim();
           const unit = normUnit(ing.unit) || (ing.amount == null ? 'naar smaak' : '');
           const k = `${name.toLowerCase()}|${unit}`;
-          if (!map[k]) map[k] = { key: k, kind: 'recipe', name, unit, amount: 0, hasAmount: ing.amount != null, uses: new Set() };
+          if (!map[k]) map[k] = { key: k, kind: 'recipe', name, unit, amount: 0, hasAmount: ing.amount != null, uses: new Set(), slots: 0 };
           if (ing.amount != null) { map[k].amount += Number(ing.amount) * ratio; map[k].hasAmount = true; }
+          map[k].slots += 1;
           map[k].uses.add(recipe.title);
         });
       });
@@ -1389,8 +1399,19 @@ function App() {
     const stockNorm = pantryStock.filter(p => p.inStock).map(p => normalize(p.name));
     const validStore = (s) => (s && stores.includes(s) ? s : '');
     const aisleOf = (name, own) => (own && AISLES.includes(own) ? own : null) || itemAisleMap[normalize(name)] || guessAisle(name);
+    // gekozen toestand + "is er sindsdien iets bijgekomen?" (nieuwe maaltijd na kiezen/leegmaken)
+    const withState = (i) => {
+      const qty = i.kind === 'recipe' ? (i.hasAmount ? Math.round(i.amount * 1000) / 1000 : i.slots) : i.kind === 'free' ? i.persons : 1;
+      const st = checks[i.key] || null;
+      const dq = checks[i.key + '#q'];
+      if (st && st !== 'buy' && dq != null && qty > dq + 1e-6) {
+        // alleen het extra deel opnieuw tonen
+        return { ...i, qty, state: null, isExtra: true, amount: i.hasAmount ? i.amount - dq : i.amount, persons: i.kind === 'free' ? i.persons - dq : i.persons };
+      }
+      return { ...i, qty, state: st };
+    };
     const list = [
-      ...Object.values(map).map(i => ({ ...i, uses: [...i.uses], store: validStore(itemStoreMap[i.key]), aisle: aisleOf(i.name), state: checks[i.key] || null })),
+      ...Object.values(map).map(i => withState({ ...i, uses: [...i.uses], store: validStore(itemStoreMap[i.key]), aisle: aisleOf(i.name) })),
       ...staples.filter(s => s.active).map(s => ({ key: `staple:${s.id}`, kind: 'staple', stapleId: s.id, name: s.name, unit: '', amount: 0, hasAmount: false, uses: [],
         store: validStore(s.store), aisle: aisleOf(s.name, s.aisle), state: checks[`staple:${s.id}`] || null })),
       ...extraRows.map(r => ({ key: `extra:${r.id}`, kind: 'extra', extraId: r.id, name: r.name, unit: '', amount: 0, hasAmount: false, uses: [],
@@ -1410,7 +1431,7 @@ function App() {
       if (st === 'have' || st === 'hidden') delExtra(r.id); else putExtra({ ...r, checked: st === 'cart' });
       return;
     }
-    setCheck(item.key, st || null);
+    setCheck(item.key, st || null, st ? item.qty : null);
     // "🏠 Kast" in de boodschappenlijst = het staat in huis → ook in de Kast zetten
     if (st === 'have' && !pantryStock.some(p => p.inStock && normalize(p.name) === normalize(item.name))) addPantryStockItem(item.name.toLowerCase());
   }
@@ -2548,7 +2569,7 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
   const sub = (i) => {
     const s = i.kind === 'extra' ? 'zelf toegevoegd' : i.kind === 'staple' ? 'vast item' : fmtShopAmount(i);
     const uses = (i.kind === 'recipe' || i.kind === 'free') && i.uses && i.uses.length ? ` · ${i.uses.join(', ')}` : '';
-    return <>{i.inKast ? <b className="text-leaf">in kast · </b> : null}{s}{uses}</>;
+    return <>{i.isExtra ? <b className="text-amber-700">extra erbij · </b> : null}{i.inKast ? <b className="text-leaf">in kast · </b> : null}{s}{uses}</>;
   };
   const pill = 'h-10 px-3 rounded-xl text-[13px] font-black flex items-center gap-1 active:scale-95 transition shrink-0';
 
