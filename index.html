@@ -2334,26 +2334,46 @@ function DoubleCookBlock({ day, meal, slot, weekmenu, recipesById, onPick, onUnd
 // Tik op een recept = ingepland en klaar. Geen recept? "Noteer …" zet het als snelle notitie.
 function QuickPick({ recipes, meal, onPickRecipe, onSaveNote }) {
   const [text, setText] = useState('');
+  // groep kiezen: Ontbijt, Snack, Hoofdmaaltijd… (standaard volgens de maaltijd)
+  const [group, setGroup] = useState(meal === 'Ontbijt' ? 'Ontbijt' : 'Hoofdmaaltijd');
   const qn = normalize(text);
-  const prefer = meal === 'Ontbijt' ? ['Ontbijt'] : ['Hoofdmaaltijd', 'Salade'];
+  const groups = useMemo(() => {
+    const cnt = (f) => recipes.filter(f).length;
+    return [
+      { id: 'all', label: 'Alles', emoji: '📚', test: () => true },
+      ...(meal === 'Ontbijt' ? ['Ontbijt', 'Snack', ...DISH_CATEGORIES.filter(c => c !== 'Ontbijt' && c !== 'Snack')] : DISH_CATEGORIES).map(c => ({ id: c, label: catMeta(c).label, emoji: catMeta(c).emoji, test: (r) => (r.category || 'Extra') === c })),
+      { id: 'parts', label: 'Onderdelen', emoji: '🧩', test: (r) => isComponent(r.category) },
+    ].map(g => ({ ...g, n: cnt(g.test) })).filter(g => g.id === 'all' || g.n > 0);
+  }, [recipes, meal]);
+  const g = groups.find(x => x.id === group) || groups[0];
   const list = useMemo(() => {
-    let l = qn
-      ? recipes.filter(r => normalize(r.title).includes(qn) || (qn.length >= 3 && (r.ingredients || []).some(i => normalize(i.name).includes(qn))))
-      : recipes.filter(r => prefer.includes(r.category));
+    let l = recipes.filter(g.test);
+    if (qn) l = l.filter(r => normalize(r.title).includes(qn) || (qn.length >= 3 && (r.ingredients || []).some(i => normalize(i.name).includes(qn))));
     return [...l].sort((a, b) => (qn ? (normalize(b.title).startsWith(qn) - normalize(a.title).startsWith(qn)) : 0)
-      || (b.stars || 0) - (a.stars || 0) || a.title.localeCompare(b.title)).slice(0, qn ? 8 : 5);
-  }, [recipes, qn, meal]); // eslint-disable-line
+      || (b.stars || 0) - (a.stars || 0) || a.title.localeCompare(b.title)).slice(0, qn ? 12 : 40);
+  }, [recipes, qn, group]); // eslint-disable-line
+  const elsewhere = qn && !list.length ? recipes.filter(r => normalize(r.title).includes(qn)).length : 0;
   return (
     <div className="space-y-2 mb-5">
       <label htmlFor="quickpick" className="block text-base font-black text-deep">Wat eten jullie?</label>
+      <div className="flex gap-1.5 overflow-x-auto no-scrollbar -mx-5 px-5 pb-0.5">
+        {groups.map(x => (
+          <button key={x.id} onClick={() => setGroup(x.id)} aria-pressed={group === x.id}
+            className={cx('shrink-0 h-9 px-3 rounded-full border text-[13px] font-extrabold whitespace-nowrap active:scale-95 transition',
+              group === x.id ? 'bg-forest text-white border-forest' : 'bg-white text-deep border-line')}>
+            {x.emoji} {x.label}{x.id !== 'all' ? <span className={cx('ml-1 font-bold', group === x.id ? 'text-white/70' : 'text-stone-400')}>{x.n}</span> : null}
+          </button>
+        ))}
+      </div>
       <div className="relative">
         <Icon name="search" size={17} className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-400" />
         <input id="quickpick" value={text} onChange={(e) => setText(e.target.value)} enterKeyHint="done"
           onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); if (text.trim() && !list.length) onSaveNote(text); else e.target.blur(); } }}
           placeholder="Zoek een recept, of typ bv. hamburger, wortel" className={cx(inputCls, 'pl-9 py-3 text-base')} />
       </div>
-      <div className="rounded-2xl border border-line bg-white divide-y divide-line/70 overflow-hidden">
-        {!qn && list.length > 0 && <div className="px-3.5 pt-2.5 pb-1 text-[11px] font-extrabold uppercase tracking-wide text-stone-500">Vaak gekozen</div>}
+      <div className="rounded-2xl border border-line bg-white divide-y divide-line/70 overflow-hidden max-h-[46vh] overflow-y-auto">
+        {!qn && list.length > 0 && <div className="px-3.5 pt-2.5 pb-1 text-[11px] font-extrabold uppercase tracking-wide text-stone-500">{g.id === 'all' ? 'Alle recepten' : g.label} · beste eerst</div>}
+        {elsewhere > 0 && <button onClick={() => setGroup('all')} className="w-full px-3.5 py-3 text-left text-[13px] font-bold text-amber-800 active:bg-mist">Niets in {g.label} — {elsewhere} gevonden in andere groepen. Toon alles ›</button>}
         {list.map(r => (
           <button key={r.id} onClick={() => onPickRecipe(r)} className="w-full flex items-center gap-3 px-3.5 py-3 text-left active:bg-mist">
             <span className="text-lg w-6 text-center">{catMeta(r.category).emoji}</span>
