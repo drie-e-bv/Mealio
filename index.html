@@ -357,10 +357,66 @@ function guessAisle(name) {
   }
   return 'Overig';
 }
-// Afdelingsvolgorde van een winkel: eigen volgorde eerst, nieuwe afdelingen achteraan.
+// Afdelingen van een winkel: elke winkel heeft een eigen lijst (volgorde = looproute), die je kan
+// aanpassen: hernoemen, splitsen (bv. Colruyt: Frisdranken / Water / Alcohol) of toevoegen.
+// Geen eigen lijst → de standaardafdelingen. "Overig" bestaat altijd als vangnet.
 function aisleOrderFor(store, storeAisles) {
-  const saved = ((storeAisles && storeAisles[store]) || []).filter(a => AISLES.includes(a));
-  return [...saved, ...AISLES.filter(a => !saved.includes(a))];
+  const saved = store && storeAisles && Array.isArray(storeAisles[store])
+    ? storeAisles[store].filter(a => typeof a === 'string' && a.trim()) : [];
+  const list = saved.length ? [...new Set(saved)] : [...AISLES];
+  if (!list.includes('Overig')) list.push('Overig');
+  return list;
+}
+// Hulp om een product in een zelfgemaakte afdeling te plaatsen (op basis van de naam van die afdeling).
+const SUB_AISLE_HINTS = [
+  [['water'], ['water', 'spuitwater', 'bruiswater', 'plat water', 'mineraalwater']],
+  [['fris', 'soft', 'sap'], ['frisdrank', 'cola', 'limonade', 'fruitsap', 'sinaasappelsap', 'appelsap', 'sap', 'siroop', 'ice tea', 'icetea', 'tonic', 'energiedrank']],
+  [['alcohol', 'wijn', 'bier', 'sterke', 'aperitief', 'spirit'], ['wijn', 'rode wijn', 'witte wijn', 'rose', 'cava', 'champagne', 'prosecco', 'bier', 'porto', 'gin', 'whisky', 'vodka', 'rum', 'aperitief', 'likeur']],
+  [['koffie', 'thee'], ['koffie', 'thee', 'espresso', 'capsules', 'koffiebonen']],
+  [['snoep', 'chips', 'koek', 'snack', 'aperitiefhapjes'], ['chips', 'snoep', 'koekjes', 'koek', 'chocolade', 'nootjes', 'borrelnootjes']],
+  [['ontbijt', 'beleg', 'smeer'], ['confituur', 'choco', 'pindakaas', 'honing', 'granola', 'muesli', 'cornflakes', 'havermout']],
+  [['kruid', 'specerij'], ['kruiden', 'italiaanse kruiden', 'provencaalse kruiden', 'komijn', 'paprikapoeder', 'kerrie', 'curry', 'kurkuma', 'kaneel', 'oregano', 'tijm', 'nootmuskaat', 'chilipoeder', 'cayenne', 'peper', 'zout']],
+  [['bak'], ['bloem', 'meel', 'bakpoeder', 'gist', 'suiker', 'vanille', 'cacao', 'amandelmeel', 'kokosmeel']],
+  [['pasta', 'rijst', 'wereld'], ['pasta', 'spaghetti', 'rijst', 'noedels', 'couscous', 'quinoa', 'bulgur', 'tortilla', 'wraps']],
+  [['noot', 'noten', 'zaden'], ['noten', 'amandel', 'amandelen', 'walnoten', 'cashew', 'pecan', 'hazelnoot', 'pinda', 'zaden', 'lijnzaad', 'chiazaad', 'pompoenpitten']],
+  [['verzorging', 'drogist', 'hygien', 'parfum'], ['tandpasta', 'shampoo', 'douchegel', 'deodorant', 'zeep', 'luiers', 'scheermesjes', 'wattenschijfjes']],
+  [['vis'], ['zalm', 'makreel', 'kabeljauw', 'vis', 'witte vis', 'zeebaars', 'dorade', 'garnalen', 'gamba', 'scampi', 'mosselen', 'inktvis', 'tonijn']],
+  [['vlees', 'slager', 'beenhouw'], ['kip', 'kipfilet', 'gehakt', 'rund', 'varken', 'kalkoen', 'lam', 'steak', 'biefstuk', 'worst', 'hamburger', 'burger']],
+  [['fruit'], ['appel', 'peer', 'banaan', 'aardbei', 'bessen', 'frambozen', 'druiven', 'kiwi', 'mango', 'ananas', 'sinaasappel', 'citroen', 'limoen', 'fruit']],
+  [['eieren', 'ei'], ['ei', 'eieren']],
+  [['kaas'], ['kaas', 'mozzarella', 'feta', 'parmezaan', 'geitenkaas', 'halloumi', 'gruyere', 'cheddar', 'brie']],
+  [['charcuterie', 'vleeswaren'], ['ham', 'hesp', 'bacon', 'spek', 'salami', 'chorizo', 'prosciutto', 'serrano']],
+  [['diepvries', 'vries'], ['diepvries', 'bevroren', 'ijs', 'frietjes']],
+  [['bio', 'vegan', 'veggie', 'vegetar'], ['tofu', 'tempeh', 'seitan', 'quorn', 'vleesvervanger', 'sojamelk', 'amandelmelk']],
+];
+// In welke afdeling van deze winkel ligt dit product?
+// 1. zelf gekozen voor deze winkel  2. dezelfde (standaard)afdeling bestaat in deze winkel
+// 3. zelfgemaakte afdeling waarvan de naam past (bv. "Water" voor spuitwater)  4. afdeling die op de standaardafdeling lijkt  5. Overig
+function resolveAisle(name, baseAisle, store, storeAisles, itemStoreAisleMap, aliasMap) {
+  const list = aisleOrderFor(store, storeAisles);
+  const own = store && itemStoreAisleMap && itemStoreAisleMap[store] && itemStoreAisleMap[store][normalize(name)];
+  if (own && list.includes(own)) return own;
+  if (list.includes(baseAisle)) return baseAisle;
+  // hernoemde standaardafdeling (bv. "Droge voeding" → "Droog & bakken")
+  const alias = (aliasMap && store && aliasMap[store]) || {};
+  const renamed = list.find(a => alias[a] === baseAisle);
+  if (renamed) return renamed;
+  const n = normalize(name);
+  const hit = (w) => new RegExp(`(^|[^a-z0-9])${escapeRe(normalize(w))}($|[^a-z0-9])`).test(n);
+  const custom = list.filter(a => !AISLES.includes(a) && a !== 'Overig');
+  for (const a of custom) {
+    const toks = normalize(a).split(/[^a-z0-9]+/).filter(Boolean);
+    for (const [keys, words] of SUB_AISLE_HINTS) if (keys.some(k => toks.some(t => t.startsWith(k))) && words.some(hit)) return a;
+  }
+  for (const a of custom) {
+    if (normalize(a).split(/[^a-z0-9]+/).filter(t => t.length >= 4).some(t => n.includes(t))) return a;
+  }
+  const baseToks = normalize(baseAisle || '').split(/[^a-z0-9]+/).filter(t => t.length >= 4);
+  for (const a of custom) {
+    const an = normalize(a);
+    if (baseToks.some(t => an.includes(t) || (an.length >= 4 && t.includes(an)))) return a;
+  }
+  return 'Overig';
 }
 function newId() {
   try { if (crypto && crypto.randomUUID) return crypto.randomUUID(); } catch (e) {}
@@ -731,7 +787,7 @@ function Sheet({ title, subtitle, onClose, children, footer, z = 40, full }) {
 // 5. App (data + navigatie)
 // =================================================================
 const DEFAULT_STORES = ['Colruyt', 'Okay', 'Slager', 'Bakker'];
-const SETTINGS_DB_KEYS = { shoppingEnabled: 'shopping_enabled', stores: 'stores', itemStoreMap: 'item_store_map', householdSize: 'household_size', storeAisles: 'store_aisles', itemAisleMap: 'item_aisle_map' };
+const SETTINGS_DB_KEYS = { shoppingEnabled: 'shopping_enabled', stores: 'stores', itemStoreMap: 'item_store_map', householdSize: 'household_size', storeAisles: 'store_aisles', itemAisleMap: 'item_aisle_map', itemStoreAisleMap: 'item_store_aisle_map', storeAisleAlias: 'store_aisle_alias' };
 // Als de database nog niet bijgewerkt is (migratie-mealio-v2.sql), werkt de planner
 // gewoon verder zonder de "kook dubbel"-kolommen.
 let HAS_V2_COLUMNS = true;
@@ -764,6 +820,8 @@ function App() {
   const [itemStoreMap, setItemStoreMap] = useState({});
   const [storeAisles, setStoreAisles] = useState({});
   const [itemAisleMap, setItemAisleMap] = useState({});
+  const [itemStoreAisleMap, setItemStoreAisleMap] = useState({});
+  const [storeAisleAlias, setStoreAisleAlias] = useState({});       // { winkel: { eigenNaam: standaardafdeling } }   // { winkel: { product: afdeling } }
   const [checks, setChecks] = useState({});          // item_key -> 'cart' | 'have' (huidige week)
   const [extraRows, setExtraRows] = useState([]);    // losse items
   const [staples, setStaples] = useState([]);        // vaste items
@@ -868,6 +926,8 @@ function App() {
     setItemStoreMap(byKey.item_store_map || {});
     setStoreAisles(byKey.store_aisles || {});
     setItemAisleMap(byKey.item_aisle_map || {});
+    setItemStoreAisleMap(byKey.item_store_aisle_map || {});
+    setStoreAisleAlias(byKey.store_aisle_alias || {});
     setShoppingEnabled(byKey.shopping_enabled !== false);
     HOUSEHOLD_SIZE = Number(byKey.household_size) || 5;
     setHouseholdSize(HOUSEHOLD_SIZE);
@@ -1333,9 +1393,12 @@ function App() {
       ...extraRows.map(r => ({ key: `extra:${r.id}`, kind: 'extra', extraId: r.id, name: r.name, unit: '', amount: 0, hasAmount: false, uses: [],
         store: validStore(r.store), aisle: aisleOf(r.name, r.aisle), state: r.checked ? 'cart' : null })),
     ];
-    return list.map(i => ({ ...i, basic: isBasicIngredient(i), inKast: i.kind !== 'extra' && stockNorm.length > 0 && ingredientMatches(i.name, stockNorm) }))
-      .sort((a, b) => a.name.localeCompare(b.name));
-  }, [weekmenu, recipesById, staples, extraRows, checks, itemStoreMap, itemAisleMap, pantryStock, stores]);
+    return list.map(i => {
+      const baseAisle = i.aisle;
+      const aisleFor = (st) => (st ? resolveAisle(i.name, baseAisle, st, storeAisles, itemStoreAisleMap, storeAisleAlias) : baseAisle);
+      return { ...i, baseAisle, aisle: aisleFor(i.store), aisleFor, basic: isBasicIngredient(i), inKast: i.kind !== 'extra' && stockNorm.length > 0 && ingredientMatches(i.name, stockNorm) };
+    }).sort((a, b) => a.name.localeCompare(b.name));
+  }, [weekmenu, recipesById, staples, extraRows, checks, itemStoreMap, itemAisleMap, itemStoreAisleMap, storeAisleAlias, storeAisles, pantryStock, stores]);
 
   function toggleCart(item) {
     if (item.kind === 'extra') { const r = extraRows.find(x => x.id === item.extraId); if (r) putExtra({ ...r, checked: !r.checked }); return; }
@@ -1348,10 +1411,39 @@ function App() {
     else persistSetting('itemStoreMap', setItemStoreMap, { ...itemStoreMap, [item.key]: store || undefined });
   }
   function assignAisle(item, aisle) {
+    const norm = normalize(item.name);
+    // in een winkel met eigen afdelingen: per winkel onthouden
+    if (item.store) persistSetting('itemStoreAisleMap', setItemStoreAisleMap, { ...itemStoreAisleMap, [item.store]: { ...(itemStoreAisleMap[item.store] || {}), [norm]: aisle } });
+    if (!AISLES.includes(aisle)) return;
     if (item.kind === 'extra') { const r = extraRows.find(x => x.id === item.extraId); if (r) putExtra({ ...r, aisle }); }
     else if (item.kind === 'staple') updateStaple(item.stapleId, { aisle });
-    // altijd onthouden voor dit ingrediënt, ook voor volgende weken
-    persistSetting('itemAisleMap', setItemAisleMap, { ...itemAisleMap, [normalize(item.name)]: aisle });
+    // standaardafdeling: onthouden voor dit ingrediënt, ook voor volgende weken en andere winkels
+    persistSetting('itemAisleMap', setItemAisleMap, { ...itemAisleMap, [norm]: aisle });
+  }
+  function setStoreAisleList(store, list) { persistSetting('storeAisles', setStoreAisles, { ...storeAisles, [store]: list }); }
+  function renameStoreAisle(store, oldName, newName) {
+    newName = (newName || '').trim();
+    const list = aisleOrderFor(store, storeAisles);
+    if (!newName || newName === oldName || oldName === 'Overig') return;
+    if (list.includes(newName)) { showToast('Die afdeling bestaat al in deze winkel'); return; }
+    setStoreAisleList(store, list.map(a => a === oldName ? newName : a));
+    const al = { ...(storeAisleAlias[store] || {}) };
+    const base = al[oldName] || (AISLES.includes(oldName) ? oldName : null);
+    delete al[oldName]; if (base) al[newName] = base;
+    persistSetting('storeAisleAlias', setStoreAisleAlias, { ...storeAisleAlias, [store]: al });
+    const m = itemStoreAisleMap[store];
+    if (m) persistSetting('itemStoreAisleMap', setItemStoreAisleMap, { ...itemStoreAisleMap, [store]: Object.fromEntries(Object.entries(m).map(([k, v]) => [k, v === oldName ? newName : v])) });
+  }
+  function removeStoreAisle(store, name) {
+    if (name === 'Overig') return;
+    setStoreAisleList(store, aisleOrderFor(store, storeAisles).filter(a => a !== name));
+    const m = itemStoreAisleMap[store];
+    if (m) persistSetting('itemStoreAisleMap', setItemStoreAisleMap, { ...itemStoreAisleMap, [store]: Object.fromEntries(Object.entries(m).filter(([, v]) => v !== name)) });
+  }
+  function resetStoreAisles(store) {
+    const na = { ...storeAisles }; delete na[store]; persistSetting('storeAisles', setStoreAisles, na);
+    const nm = { ...itemStoreAisleMap }; delete nm[store]; persistSetting('itemStoreAisleMap', setItemStoreAisleMap, nm);
+    if (storeAisleAlias[store]) { const nal = { ...storeAisleAlias }; delete nal[store]; persistSetting('storeAisleAlias', setStoreAisleAlias, nal); }
   }
   function removeItem(item) {
     if (item.kind === 'extra') delExtra(item.extraId);
@@ -1388,6 +1480,8 @@ function App() {
     persistSetting('stores', setStores, stores.map(s => s === oldName ? newName : s));
     persistSetting('itemStoreMap', setItemStoreMap, nextMap);
     if (storeAisles[oldName]) { const na = { ...storeAisles, [newName]: storeAisles[oldName] }; delete na[oldName]; persistSetting('storeAisles', setStoreAisles, na); }
+    if (itemStoreAisleMap[oldName]) { const nm = { ...itemStoreAisleMap, [newName]: itemStoreAisleMap[oldName] }; delete nm[oldName]; persistSetting('itemStoreAisleMap', setItemStoreAisleMap, nm); }
+    if (storeAisleAlias[oldName]) { const nal = { ...storeAisleAlias, [newName]: storeAisleAlias[oldName] }; delete nal[oldName]; persistSetting('storeAisleAlias', setStoreAisleAlias, nal); }
     extraRows.filter(r => r.store === oldName).forEach(r => putExtra({ ...r, store: newName }));
     staples.filter(s => s.store === oldName).forEach(s => updateStaple(s.id, { store: newName }));
   }
@@ -1396,6 +1490,7 @@ function App() {
     persistSetting('stores', setStores, stores.filter(s => s !== name));
     persistSetting('itemStoreMap', setItemStoreMap, nextMap);
     if (storeAisles[name]) { const na = { ...storeAisles }; delete na[name]; persistSetting('storeAisles', setStoreAisles, na); }
+    if (itemStoreAisleMap[name]) { const nm = { ...itemStoreAisleMap }; delete nm[name]; persistSetting('itemStoreAisleMap', setItemStoreAisleMap, nm); }
     extraRows.filter(r => r.store === name).forEach(r => putExtra({ ...r, store: null }));
     staples.filter(s => s.store === name).forEach(s => updateStaple(s.id, { store: null }));
   }
@@ -1539,7 +1634,7 @@ function App() {
             onToggle={toggleCart} onSetHave={setHave} onAssignStore={assignStore} onAssignAisle={assignAisle} onRemoveItem={removeItem}
             onAddExtra={addExtraItem} onStoreMode={(s) => setStoreMode(s)} onNewRound={newShoppingRound} onMarkAllBought={markAllBought}
             onAddStore={(name) => persistSetting('stores', setStores, [...stores, name])} onRenameStore={renameStore} onRemoveStore={removeStore}
-            onSetAisleOrder={(store, order) => persistSetting('storeAisles', setStoreAisles, { ...storeAisles, [store]: order })}
+            onSetAisleOrder={setStoreAisleList} onRenameAisle={renameStoreAisle} onRemoveAisle={removeStoreAisle} onResetAisles={resetStoreAisles}
             onAddStaple={addStaple} onUpdateStaple={updateStaple} onDeleteStaple={deleteStaple} showToast={showToast} />
         )}
         {tab === 'recipes' && (
@@ -2378,17 +2473,17 @@ function PlanSheet({ recipe, nav, weekmenu, recipesById, onPick, onClose }) {
 // 7. Boodschappen
 // =================================================================
 // Items per afdeling groeperen in de volgorde van de winkel.
-function groupByAisle(items, order) {
+function groupByAisle(items, order, aisleOf = (i) => i.aisle) {
   const groups = order.map(a => ({ aisle: a, items: [] }));
   const idx = {}; order.forEach((a, i) => { idx[a] = i; });
-  items.forEach(i => { const g = groups[idx[i.aisle] != null ? idx[i.aisle] : idx['Overig']]; g.items.push(i); });
+  items.forEach(i => { const a = aisleOf(i); const g = groups[idx[a] != null ? idx[a] : idx['Overig']]; g.items.push(i); });
   return groups.filter(g => g.items.length);
 }
 
 // Boodschappen — thuis: tik aan wat je al in huis hebt, de rest koop je.
 // In de winkel: "Ik ben in de winkel" (afvinken = in de kar). Winkel/afdeling aanpassen zit achter één knop.
 function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendingOps, onToggle, onSetHave, onAssignStore, onAssignAisle, onRemoveItem,
-  onAddExtra, onStoreMode, onNewRound, onMarkAllBought, onAddStore, onRenameStore, onRemoveStore, onSetAisleOrder, onAddStaple, onUpdateStaple, onDeleteStaple, showToast }) {
+  onAddExtra, onStoreMode, onNewRound, onMarkAllBought, onAddStore, onRenameStore, onRemoveStore, onSetAisleOrder, onRenameAisle, onRemoveAisle, onResetAisles, onAddStaple, onUpdateStaple, onDeleteStaple, showToast }) {
   const [extraName, setExtraName] = useState('');
   const [showStores, setShowStores] = useState(false);
   const [showStaples, setShowStaples] = useState(false);
@@ -2429,7 +2524,7 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
     const lines = [`🛒 Boodschappen — week ${isoWeekNumber(nav.weekStart)}`];
     storeKeys.forEach(s => {
       lines.push('', `*${s === '__none__' ? (onlyNone ? 'Te kopen' : 'Zonder winkel') : s}*`);
-      groupByAisle(byStore[s], aisleOrderFor(s === '__none__' ? '' : s, storeAisles)).forEach(g => {
+      groupByAisle(byStore[s], aisleOrderFor(s === '__none__' ? '' : s, storeAisles), i => (s === '__none__' ? i.baseAisle : i.aisleFor(s))).forEach(g => {
         g.items.forEach(i => lines.push(`☐ ${i.name}${i.kind === 'recipe' || i.kind === 'free' ? ' — ' + fmtShopAmount(i) : ''}`));
       });
     });
@@ -2512,7 +2607,7 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
                 <span className="text-[12px] font-bold text-stone-600">{byStore[s].length}</span>
               </div>
             )}
-            {groupByAisle(byStore[s], aisleOrderFor(s === '__none__' ? '' : s, storeAisles)).map(g => (
+            {groupByAisle(byStore[s], aisleOrderFor(s === '__none__' ? '' : s, storeAisles), i => (s === '__none__' ? i.baseAisle : i.aisleFor(s))).map(g => (
               <div key={g.aisle}>
                 <div className="px-4 pt-2.5 pb-1 text-[11px] font-black uppercase tracking-wider text-stone-500">{g.aisle}</div>
                 <div className="divide-y divide-line/70">
@@ -2563,13 +2658,13 @@ function ShoppingPage({ nav, items, stores, storeAisles, staples, online, pendin
         </Sheet>
       )}
       {editItem && (
-        <ItemEditSheet item={items.find(i => i.key === editItem.key) || editItem} stores={stores}
+        <ItemEditSheet item={items.find(i => i.key === editItem.key) || editItem} stores={stores} storeAisles={storeAisles}
           onAssignStore={(st) => onAssignStore(editItem, st)} onAssignAisle={(a) => onAssignAisle(editItem, a)}
           onRemove={(editItem.kind === 'extra' || editItem.kind === 'staple') ? () => { onRemoveItem(editItem); setEditItem(null); } : null}
           onClose={() => setEditItem(null)} />
       )}
       {showStores && <StoresSheet stores={stores} storeAisles={storeAisles} onAdd={onAddStore} onRename={onRenameStore} onRemove={onRemoveStore}
-        onSetAisleOrder={onSetAisleOrder} onClose={() => setShowStores(false)} />}
+        onSetAisleOrder={onSetAisleOrder} onRenameAisle={onRenameAisle} onRemoveAisle={onRemoveAisle} onResetAisles={onResetAisles} onClose={() => setShowStores(false)} />}
       {showStaples && <StaplesSheet staples={staples} stores={stores} onAdd={onAddStaple} onUpdate={onUpdateStaple} onDelete={onDeleteStaple} onClose={() => setShowStaples(false)} />}
     </div>
   );
@@ -2600,7 +2695,8 @@ function ShoppingRow({ item, arrange, onTap, onRemove, onHave }) {
   );
 }
 
-function ItemEditSheet({ item, stores, onAssignStore, onAssignAisle, onRemove, onClose }) {
+function ItemEditSheet({ item, stores, storeAisles, onAssignStore, onAssignAisle, onRemove, onClose }) {
+  const aisles = aisleOrderFor(item.store || '', storeAisles);
   return (
     <Sheet title={item.name} subtitle={item.kind === 'recipe' ? 'Wordt onthouden voor volgende weken' : item.kind === 'staple' ? 'Vast item' : 'Los item'} onClose={onClose} z={60}>
       <div className="space-y-4">
@@ -2610,9 +2706,9 @@ function ItemEditSheet({ item, stores, onAssignStore, onAssignAisle, onRemove, o
             {stores.map(s => <option key={s} value={s}>{s}</option>)}
           </select>
         </Field>
-        <Field label="Afdeling">
+        <Field label={item.store ? `Afdeling in ${item.store}` : 'Afdeling'}>
           <div className="grid grid-cols-2 gap-1.5">
-            {AISLES.map(a => (
+            {aisles.map(a => (
               <button key={a} onClick={() => onAssignAisle(a)}
                 className={cx('rounded-xl border px-2.5 py-2 text-xs font-extrabold text-left', item.aisle === a ? 'bg-forest text-white border-forest' : 'bg-white text-deep border-line')}>{a}</button>
             ))}
@@ -2625,30 +2721,52 @@ function ItemEditSheet({ item, stores, onAssignStore, onAssignAisle, onRemove, o
   );
 }
 
-function AisleOrderEditor({ order, onChange }) {
+function AisleEditor({ store, order, isCustom, onChange, onRename, onRemove, onReset }) {
+  const [names, setNames] = useState({});
+  const [newAisle, setNewAisle] = useState('');
   const move = (i, d) => { const n = [...order]; const j = i + d; if (j < 0 || j >= n.length) return; [n[i], n[j]] = [n[j], n[i]]; onChange(n); };
+  const commit = (old) => { const v = names[old]; if (v !== undefined) { if (v.trim() && v.trim() !== old) onRename(old, v.trim()); setNames(({ [old]: _, ...rest }) => rest); } };
+  const add = () => {
+    const v = newAisle.trim(); if (!v) return;
+    if (order.includes(v)) { setNewAisle(''); return; }
+    const n = [...order]; const o = n.indexOf('Overig'); n.splice(o >= 0 ? o : n.length, 0, v); onChange(n); setNewAisle('');
+  };
   return (
-    <div className="space-y-1">
+    <div className="space-y-1.5">
+      <p className="text-[11px] text-stone-500 px-0.5">Volgorde = hoe je door {store} loopt. Tik op een naam om ze te wijzigen. Splits bv. "Dranken &amp; wijn" in Frisdranken, Water en Alcohol.</p>
       {order.map((a, i) => (
-        <div key={a} className="flex items-center gap-2 bg-cream rounded-xl px-2.5 py-1.5">
-          <span className="w-5 text-[11px] font-black text-stone-400">{i + 1}</span>
-          <span className="flex-1 text-xs font-bold text-deep">{a}</span>
-          <IconBtn name="up2" size={14} title="Hoger" onClick={() => move(i, -1)} className="w-8 h-8" />
-          <IconBtn name="down" size={14} title="Lager" onClick={() => move(i, 1)} className="w-8 h-8" />
+        <div key={a} className="flex items-center gap-1.5 bg-cream rounded-xl pl-2.5 pr-1 py-1">
+          <span className="w-5 text-[11px] font-black text-stone-400 shrink-0">{i + 1}</span>
+          {a === 'Overig' ? <span className="flex-1 text-xs font-bold text-stone-500 py-2">Overig <span className="font-normal">(vangnet)</span></span> : (
+            <input value={names[a] !== undefined ? names[a] : a} onChange={(e) => setNames({ ...names, [a]: e.target.value })} aria-label={`Afdeling ${a}`}
+              onBlur={() => commit(a)} onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }}
+              className="flex-1 min-w-0 bg-transparent text-xs font-bold text-deep py-2 border-0 focus:shadow-none" />
+          )}
+          <IconBtn name="up2" size={14} title="Hoger" onClick={() => move(i, -1)} className="w-8 h-8 shrink-0" />
+          <IconBtn name="down" size={14} title="Lager" onClick={() => move(i, 1)} className="w-8 h-8 shrink-0" />
+          {a !== 'Overig' && <IconBtn name="trash" size={13} title={`${a} verwijderen`} className="w-8 h-8 shrink-0 text-stone-400"
+            onClick={() => { if (window.confirm(`Afdeling "${a}" verwijderen uit ${store}? Producten daaruit komen in een andere afdeling.`)) onRemove(a); }} />}
         </div>
       ))}
+      <div className="flex gap-1.5 pt-1">
+        <input value={newAisle} onChange={(e) => setNewAisle(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') add(); }}
+          placeholder="Nieuwe afdeling, bv. Water" aria-label={`Nieuwe afdeling voor ${store}`} className={inputCls} />
+        <Btn onClick={add} className="shrink-0 whitespace-nowrap">Voeg toe</Btn>
+      </div>
+      {isCustom && <button onClick={() => { if (window.confirm(`Afdelingen van ${store} terugzetten naar de standaard?`)) onReset(); }}
+        className="text-[11px] font-extrabold text-stone-500 underline px-0.5 py-1">Standaardafdelingen herstellen</button>}
     </div>
   );
 }
 
-function StoresSheet({ stores, storeAisles, onAdd, onRename, onRemove, onSetAisleOrder, onClose }) {
+function StoresSheet({ stores, storeAisles, onAdd, onRename, onRemove, onSetAisleOrder, onRenameAisle, onRemoveAisle, onResetAisles, onClose }) {
   const [names, setNames] = useState({});
   const [newStore, setNewStore] = useState('');
   const [openAisles, setOpenAisles] = useState(null);
   const commit = (old) => { const v = names[old]; if (v !== undefined && v.trim() && v.trim() !== old) onRename(old, v.trim()); };
   const add = () => { if (newStore.trim() && !stores.includes(newStore.trim())) { onAdd(newStore.trim()); setNewStore(''); } };
   return (
-    <Sheet title="Winkels & afdelingen" subtitle="Zet de afdelingen in de volgorde waarin je door de winkel loopt" onClose={onClose}>
+    <Sheet title="Winkels & afdelingen" subtitle="Per winkel: eigen afdelingen, in de volgorde waarin je door de winkel loopt" onClose={onClose}>
       <div className="space-y-2.5">
         {stores.map(s => (
           <Card key={s} className="p-2.5">
@@ -2658,9 +2776,10 @@ function StoresSheet({ stores, storeAisles, onAdd, onRename, onRemove, onSetAisl
               <IconBtn name="trash" title="Verwijderen" onClick={() => { if (window.confirm(`Winkel "${s}" verwijderen?`)) onRemove(s); }} />
             </div>
             <button onClick={() => setOpenAisles(openAisles === s ? null : s)} className="mt-2 w-full flex items-center justify-between px-1 text-xs font-extrabold text-forest">
-              <span>Volgorde afdelingen</span><Icon name="down" size={14} className={openAisles === s ? 'rotate-180' : ''} />
+              <span>Afdelingen ({aisleOrderFor(s, storeAisles).length}){storeAisles[s] && storeAisles[s].some(a => !AISLES.includes(a)) ? ' · eigen indeling' : ''}</span><Icon name="down" size={14} className={openAisles === s ? 'rotate-180' : ''} />
             </button>
-            {openAisles === s && <div className="mt-2"><AisleOrderEditor order={aisleOrderFor(s, storeAisles)} onChange={(o) => onSetAisleOrder(s, o)} /></div>}
+            {openAisles === s && <div className="mt-2"><AisleEditor store={s} order={aisleOrderFor(s, storeAisles)} isCustom={!!storeAisles[s]}
+              onChange={(o) => onSetAisleOrder(s, o)} onRename={(o, n) => onRenameAisle(s, o, n)} onRemove={(a) => onRemoveAisle(s, a)} onReset={() => onResetAisles(s)} /></div>}
           </Card>
         ))}
         <div className="flex gap-2 pt-2">
@@ -2752,7 +2871,7 @@ function StoreMode({ storeKey, weekLabel, items, storeAisles, online, pendingOps
             </div>
             {todo.length === 0 && mine.length > 0 && <div className="text-center py-8"><div className="text-4xl">🎉</div><div className="font-black text-deep mt-2">Alles in de kar!</div></div>}
             {mine.length === 0 && <div className="text-center text-stone-400 py-8 font-bold">Niets te halen in deze winkel.</div>}
-            {groupByAisle(todo, order).map(g => (
+            {groupByAisle(todo, order, i => (all ? i.baseAisle : i.aisleFor(storeKey))).map(g => (
               <div key={g.aisle} className="mb-3">
                 <div className="px-2 pb-1 text-[11px] font-black uppercase tracking-wider text-sage">{g.aisle}</div>
                 <div className="bg-white rounded-2xl border border-line divide-y divide-line/70 overflow-hidden">
