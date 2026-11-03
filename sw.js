@@ -6,7 +6,8 @@
 // Cache-versie ophogen (v1 -> v2 -> ...) forceert bij elke deploy een
 // schone cache; dat gebeurde niet vanzelf zolang dit bestand zelf niet
 // wijzigde, waardoor een oude/kapotte index.html kon "vastzitten".
-const CACHE_NAME = 'mealio-shell-v30';
+const CACHE_NAME = 'mealio-shell-v32';
+const SHARE_CACHE = 'mealio-share';
 const SHELL_FILES = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (event) => {
@@ -17,13 +18,35 @@ self.addEventListener('install', (event) => {
 
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k))))
+    caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== CACHE_NAME && k !== SHARE_CACHE).map((k) => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
 
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
+
+  // "Delen → Mealio" (Android): gedeelde screenshots/PDF's/links tijdelijk bewaren en de app openen.
+  if (event.request.method === 'POST' && url.pathname.endsWith('/share-target')) {
+    event.respondWith((async () => {
+      try {
+        const fd = await event.request.formData();
+        const cache = await caches.open(SHARE_CACHE);
+        for (const k of await cache.keys()) await cache.delete(k);
+        const files = fd.getAll('files').filter((f) => f && typeof f === 'object' && f.size);
+        const names = [];
+        for (let i = 0; i < Math.min(files.length, 5); i++) {
+          const f = files[i];
+          await cache.put(`./shared/${i}`, new Response(f, { headers: { 'Content-Type': f.type || 'application/octet-stream', 'X-Name': encodeURIComponent(f.name || `bestand-${i}`) } }));
+          names.push(i);
+        }
+        const meta = { files: names, title: fd.get('title') || '', text: fd.get('text') || '', url: fd.get('url') || '', at: Date.now() };
+        await cache.put('./shared/meta', new Response(JSON.stringify(meta), { headers: { 'Content-Type': 'application/json' } }));
+      } catch (e) { /* niets bruikbaars gedeeld */ }
+      return Response.redirect('./?share=1', 303);
+    })());
+    return;
+  }
 
   // Nooit cachen: Supabase (data moet altijd vers zijn) en niet-GET requests.
   if (event.request.method !== 'GET' || url.hostname.endsWith('supabase.co')) return;

@@ -961,6 +961,31 @@ function App() {
   const tabRef = useRef(tab); tabRef.current = tab;
   const scrollRestored = useRef(false);
 
+  // ---------- Delen → Mealio (Android share target, zie sw.js) ----------
+  useEffect(() => {
+    if (!session || !/[?&]share=1/.test(window.location.search)) return;
+    (async () => {
+      try {
+        const cache = await caches.open('mealio-share');
+        const metaRes = await cache.match('./shared/meta');
+        if (!metaRes) return;
+        const meta = await metaRes.json();
+        const files = [];
+        for (const i of meta.files || []) {
+          const r = await cache.match(`./shared/${i}`); if (!r) continue;
+          const blob = await r.blob();
+          files.push(new File([blob], decodeURIComponent(r.headers.get('X-Name') || `bestand-${i}`), { type: blob.type || r.headers.get('Content-Type') || '' }));
+        }
+        for (const k of await cache.keys()) await cache.delete(k);
+        const link = (meta.url || '').trim() || (((meta.text || '').match(/https?:\/\/\S+/) || [])[0] || '');
+        if (files.length) { setTab('keuken'); setKeukenView('recepten'); setAddSheet({ sharedFiles: files }); }
+        else if (link) { setTab('keuken'); setKeukenView('recepten'); setAddSheet({ sharedUrl: link }); }
+        else showToast('Niets bruikbaars ontvangen — deel een screenshot, PDF of link naar een recept');
+      } catch (e) { console.error(e); }
+      finally { try { window.history.replaceState(null, '', window.location.pathname); } catch (e) {} }
+    })();
+  }, [session]); // eslint-disable-line
+
   // ---------- auth ----------
   useEffect(() => {
     sb.auth.getSession().then(({ data }) => setSession(data.session));
@@ -1280,12 +1305,13 @@ function App() {
     const todo = prev.filter(e => !slotIsPlanned(wm[e.day][e.meal]));   // enkel lege maaltijden invullen
     const kept = prev.length - todo.length;
     if (!todo.length) { showToast('Deze week is al volledig gepland — niets gekopieerd'); return; }
-    if (!window.confirm(`${todo.length} lege maaltijd(en) invullen met vorige week?${kept ? `\n${kept} maaltijd(en) die je al koos, blijven staan.` : ''}`)) return;
     for (const e of todo) {
       await updateMealSlot(e.day, e.meal, { persons: e.persons, category: e.type, recipeId: e.recipeId, componentIds: e.componentIds, notes: e.notes,
         locked: true, aiGenerated: false, feedback: null, doubleFor: e.doubleFor || null, leftoverFrom: e.leftoverFrom || null });
     }
-    showToast(`📋 ${todo.length} maaltijd(en) overgenomen van vorige week`);
+    showToast(`📋 ${todo.length} lege maaltijd(en) ingevuld met vorige week${kept ? ` · ${kept} bleven staan` : ''}`, { label: 'Ongedaan', onClick: async () => {
+      for (const e of todo) await updateMealSlot(e.day, e.meal, { category: '', recipeId: '', componentIds: [], notes: '', locked: false, aiGenerated: false, feedback: null, doubleFor: null, leftoverFrom: null });
+    } });
   }
 
   // ---------- AI-planner ----------
@@ -1550,9 +1576,17 @@ function App() {
   async function finishShopping() {
     const done = shoppingItems.filter(i => i.state === 'cart');
     if (!done.length) return 0;
+    const before = pantryRef.current.map(p => ({ ...p }));
     await addManyToPantry(done.map(i => ({ name: i.name.toLowerCase(), ...shopQty(i) })));
     done.forEach(i => setItemState(i, 'hidden'));
-    showToast(`🏠 ${done.length} items in de kast gezet`);
+    showToast(`🏠 ${done.length} items in de voorraad gezet`, { label: 'Ongedaan', onClick: () => {
+      done.forEach(i => setItemState(i, 'cart'));
+      pantryRef.current.forEach(p => {
+        const b = before.find(x => x.id === p.id);
+        if (!b) removePantryStockItem(p.id);
+        else if (b.inStock !== p.inStock || b.qty !== p.qty || b.unit !== p.unit) updatePantryItem(p.id, { inStock: b.inStock, qty: b.qty, unit: b.unit });
+      });
+    } });
     return done.length;
   }
   // Gegeten: wat de maaltijd gebruikte gaat uit de kast (nog eens tikken = terugzetten)
@@ -1628,6 +1662,11 @@ function App() {
   }
   function removeStoreAisle(store, name) {
     if (name === 'Overig') return;
+    const prevList = storeAisles[store] ? [...storeAisles[store]] : null, prevMap = itemStoreAisleMap[store] ? { ...itemStoreAisleMap[store] } : null;
+    showToast(`Afdeling "${name}" verwijderd`, { label: 'Ongedaan', onClick: () => {
+      persistSetting('storeAisles', setStoreAisles, prevList ? { ...storeAisles, [store]: prevList } : (() => { const n = { ...storeAisles }; delete n[store]; return n; })());
+      if (prevMap) persistSetting('itemStoreAisleMap', setItemStoreAisleMap, { ...itemStoreAisleMap, [store]: prevMap });
+    } });
     setStoreAisleList(store, aisleOrderFor(store, storeAisles).filter(a => a !== name));
     const m = itemStoreAisleMap[store];
     if (m) persistSetting('itemStoreAisleMap', setItemStoreAisleMap, { ...itemStoreAisleMap, [store]: Object.fromEntries(Object.entries(m).filter(([, v]) => v !== name)) });
@@ -1722,6 +1761,17 @@ function App() {
     const item = pantryStock.find(p => p.id === id);
     // op → in huis: hoeveelheid vergeten (onbekend); in huis → op: hoeveelheid 0
     return updatePantryItem(id, item && item.inStock ? { inStock: false, qty: null } : { inStock: true });
+  }
+  // meerdere tegelijk verwijderen (Opkuisen), met Ongedaan
+  function removeManyPantry(list) {
+    const rows = list.map(p => ({ ...p }));
+    rows.forEach(p => removePantryStockItem(p.id));
+    showToast(`🗑 ${rows.length} items uit de voorraad`, { label: 'Ongedaan', onClick: async () => {
+      try {
+        const back = throwIfError(await sb.from('pantry_stock').upsert(rows.map(p => ({ ingredient_name: p.name, in_stock: p.inStock, qty: p.qty, unit: p.unit || null })), { onConflict: 'ingredient_name' }).select()) || [];
+        setPantryStock(prev => [...prev.filter(x => !back.some(r => r.id === x.id)), ...back.map(pantryOut)]);
+      } catch (e) { showToast('Terugzetten mislukt — probeer opnieuw'); }
+    } });
   }
   async function removePantryStockItem(id) {
     setPantryStock(prev => prev.filter(p => p.id !== id));
@@ -1859,7 +1909,7 @@ function App() {
             onOpenRecipe={(id) => setRecipeSheet({ id })} onAdd={() => openAdd({})} />
         )}
         {tab === 'keuken' && keukenView === 'voorraad' && (
-          <KastPage pantryStock={pantryStock} recipes={recipes} onAdd={addPantryStockItem} onToggle={togglePantryStockItem} onUpdate={updatePantryItem}
+          <KastPage pantryStock={pantryStock} recipes={recipes} onAdd={addPantryStockItem} onToggle={togglePantryStockItem} onUpdate={updatePantryItem} onRemoveMany={removeManyPantry}
             onRemove={removePantryStockItem} onAddToShopping={shoppingEnabled ? (name) => { if (addExtraItem(name)) showToast(`🛒 "${name}" op je boodschappenlijst`); } : null}
             onOpenRecipe={(id) => setRecipeSheet({ id })} onAiSuggest={aiSuggestFromPantry} aiSuggesting={aiSuggesting} showToast={showToast} />
         )}
@@ -3018,7 +3068,7 @@ function AisleEditor({ store, order, isCustom, onChange, onRename, onRemove, onR
           <IconBtn name="up2" size={14} title="Hoger" onClick={() => move(i, -1)} className="w-8 h-8 shrink-0" />
           <IconBtn name="down" size={14} title="Lager" onClick={() => move(i, 1)} className="w-8 h-8 shrink-0" />
           {a !== 'Overig' && <IconBtn name="trash" size={13} title={`${a} verwijderen`} className="w-8 h-8 shrink-0 text-stone-400"
-            onClick={() => { if (window.confirm(`Afdeling "${a}" verwijderen uit ${store}? Producten daaruit komen in een andere afdeling.`)) onRemove(a); }} />}
+            onClick={() => onRemove(a)} />}
         </div>
       ))}
       <div className="flex gap-1.5 pt-1">
@@ -3153,7 +3203,6 @@ function StoreMode({ storeKey, weekLabel, items, storeAisles, online, pendingOps
   const [finishing, setFinishing] = useState(false);
   async function finish() {
     if (!cart.length) { onClose(); return; }
-    if (!window.confirm(`Winkelen afronden? ${cart.length} afgevinkte items gaan naar je kast en verdwijnen van de lijst.${todo.length ? ` ${todo.length} niet-afgevinkte items blijven in je winkelmandje.` : ''}`)) return;
     setFinishing(true);
     try { await onFinish(); onClose(); } finally { setFinishing(false); }
   }
@@ -3554,7 +3603,7 @@ function RecipeSheet({ recipe, startInEdit, householdSize, onUpdate, onDelete, o
 }
 
 function AddRecipeSheet({ preset, onSave, onClose }) {
-  const [mode, setMode] = useState(preset.category || preset.title ? 'manual' : 'url');
+  const [mode, setMode] = useState(preset.sharedFiles ? 'photo' : preset.sharedUrl ? 'url' : preset.category || preset.title ? 'manual' : 'url');
   const [draft, setDraft] = useState({ ...recipeToDraft({ title: preset.title || '', category: preset.category || '', basePortions: 1, ingredients: preset.ingredients || [] }) });
   const [url, setUrl] = useState('');
   const [busy, setBusy] = useState(false);
@@ -3576,11 +3625,12 @@ function AddRecipeSheet({ preset, onSave, onClose }) {
     }));
     setFilled(true);
   }
-  async function importUrl() {
-    if (!url.trim()) return;
+  async function importUrl(given) {
+    const u = (typeof given === 'string' ? given : url).trim();
+    if (!u) return;
     setBusy(true); setError('');
     try {
-      const data = await invokeAi({ task: 'import_url', url: url.trim() });
+      const data = await invokeAi({ task: 'import_url', url: u });
       applyImport({ title: data.title, category: data.category, ingredients: data.ingredients, steps: data.steps, portions: data.basePortions || 2 });
     } catch (e) { setError(e.message + ' — probeer eventueel "Plak tekst".'); }
     finally { setBusy(false); }
@@ -3624,6 +3674,11 @@ function AddRecipeSheet({ preset, onSave, onClose }) {
     } catch (e) { setError(e.message + ' — vul de rest eventueel zelf aan.'); }
     finally { setBusy(false); }
   }
+  // gedeeld vanuit een andere app (Delen → Mealio): meteen inlezen
+  useEffect(() => {
+    if (preset.sharedFiles && preset.sharedFiles.length) importFiles(preset.sharedFiles, false);
+    else if (preset.sharedUrl) { setUrl(preset.sharedUrl); importUrl(preset.sharedUrl); }
+  }, []); // eslint-disable-line
   function importPhoto(e) { const fl = Array.from(e.target.files || []); e.target.value = ''; importFiles(fl, true); }
   function importPicked(e) { const fl = Array.from(e.target.files || []); e.target.value = ''; importFiles(fl, false); }
   async function save() {
@@ -3694,7 +3749,7 @@ function AddRecipeSheet({ preset, onSave, onClose }) {
 // =================================================================
 // 9. Kast
 // =================================================================
-function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onUpdate, onAddToShopping, onOpenRecipe, onAiSuggest, aiSuggesting, showToast }) {
+function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onRemoveMany, onUpdate, onAddToShopping, onOpenRecipe, onAiSuggest, aiSuggesting, showToast }) {
   const scanRef = useRef(null);
   const [scanning, setScanning] = useState(false);
   const [scanItems, setScanItems] = useState(null);
@@ -3860,7 +3915,7 @@ function KastPage({ pantryStock, recipes, onAdd, onToggle, onRemove, onUpdate, o
             <div>
               <div className="flex items-center justify-between mb-1.5 px-1">
                 <span className="text-[11px] font-extrabold uppercase tracking-wide text-stone-400">Op / aan te vullen ({outStock.length})</span>
-                <button onClick={() => { if (window.confirm(`Alle ${outStock.length} items die op zijn uit de kast verwijderen?`)) outStock.forEach(p => onRemove(p.id)); }}
+                <button onClick={() => onRemoveMany(outStock)}
                   className="text-[12px] font-extrabold text-stone-500">🗑 Opkuisen</button>
               </div>
               <Card className="divide-y divide-line/70 overflow-hidden">
