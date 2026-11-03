@@ -162,7 +162,34 @@ const UNIT_ALIASES = {
   stuk: 'stuks', stuks: 'stuks', teentje: 'teentje', teentjes: 'teentje', snufje: 'snufje', snuifje: 'snufje',
   kopje: 'kopje', blik: 'blik', blikje: 'blikje', bosje: 'bosje', plakje: 'plakje', plakjes: 'plakje', handje: 'handje',
   thl: 'tl', kl: 'tl', koffielepel: 'tl', blikken: 'blik', potten: 'pot', kilo: 'kg',
+  teen: 'teentje', tenen: 'teentje', kleine: 'stuks', grote: 'stuks', middelgrote: 'stuks', 'stuks (150 g)': 'stuks',
+  zakken: 'zak', hand: 'handje', handjes: 'handje', handvol: 'handje', 'enkele handenvol': 'handje', 'naar wens': 'naar smaak',
+  blaadjes: 'blaadje', bladeren: 'blaadje', 'grote bladeren': 'blaadje', takjes: 'takje', dl: 'dl', deciliter: 'dl',
 };
+// Zelfde product, andere schrijfwijze → één regel op de lijst ("Look", "tenen knoflook", "geperste knoflook" = knoflook)
+const ING_PLURALS = { wortelen: 'wortel', wortels: 'wortel', uien: 'ui', uitjes: 'ui', 'lente-uitjes': 'lente-ui', eieren: 'ei', eitje: 'ei', eitjes: 'ei',
+  champignons: 'champignon', courgettes: 'courgette', tomaten: 'tomaat', tomaatjes: 'tomaat', kerstomaatjes: 'kerstomaat', cherrytomaatjes: 'cherrytomaat', cherrytomaten: 'cherrytomaat',
+  kipfilets: 'kipfilet', aardappelen: 'aardappel', aardappels: 'aardappel', citroenen: 'citroen', limoenen: 'limoen', appels: 'appel', bananen: 'banaan',
+  kroppen: 'krop', avocados: 'avocado', paprikas: 'paprika', komkommers: 'komkommer', sjalotten: 'sjalot', prei: 'prei', preien: 'prei', aubergines: 'aubergine',
+  spruitjes: 'spruitje', olijven: 'olijf', 'zoete aardappelen': 'zoete aardappel', eierdooiers: 'eidooier', eierdooier: 'eidooier' };
+const ING_DROP = ['vers', 'verse', 'versgemalen', 'geperste', 'gehakte', 'fijngehakte', 'fijngesneden', 'gesneden', 'gesnipperde', 'grote', 'kleine', 'middelgrote',
+  'rijpe', 'flinke', 'biologische', 'bio', 'een', 'aantal', 'paar', 'handvol', 'handje', 'handjes', 'enkele'];
+function canonIngredient(name) {
+  let n = normalize(name).replace(/\([^)]*\)/g, ' ').replace(/['’`]/g, '');
+  n = n.replace(/\b(naar|volgens) (eigen )?(smaak|keuze|wens)\b.*$/, '').replace(/\bzoveel als je wilt\b/, '');
+  const sap = n.match(/^(het )?sap( en [a-z ]+)? van (een |1\/2 |1 |2 |een halve |een kleine )?(citroen|limoen|sinaasappel)/);
+  if (sap) return sap[4];
+  if (/^\s*(zout en peper|peper en zout|peper, zout|zout, peper)\s*$/.test(n)) return 'peper en zout';
+  let w = n.replace(/,/g, ' ').split(/\s+/).filter(Boolean).filter(x => !ING_DROP.includes(x));
+  n = w.join(' ').replace(/,$/, '').trim();
+  if (/^(tenen|teentjes|teentje|teen) knoflook$/.test(n) || n === 'look' || n === 'knoflookteentjes') return 'knoflook';
+  if (/^(zout en peper|peper en zout|peper, zout|zout, peper)$/.test(n)) return 'peper en zout';
+  if (ING_PLURALS[n]) return ING_PLURALS[n];
+  const parts = n.split(' ');
+  const last = parts[parts.length - 1];
+  if (ING_PLURALS[last]) { parts[parts.length - 1] = ING_PLURALS[last]; n = parts.join(' '); }
+  return n || normalize(name);
+}
 const UNICODE_FRACTIONS = { '½': 0.5, '⅓': 0.333, '⅔': 0.667, '¼': 0.25, '¾': 0.75, '⅛': 0.125 };
 function parseIngredientLine(raw) {
   let line = (raw || '').trim();
@@ -544,7 +571,7 @@ function shopQty(item) {
 function convertQty(qty, from, to) {
   const f = normUnit(from || ''), t = normUnit(to || '');
   if (f === t) return qty;
-  const base = { g: ['g', 1], gr: ['g', 1], gram: ['g', 1], kg: ['g', 1000], ml: ['ml', 1], cl: ['ml', 10], l: ['ml', 1000] };
+  const base = { g: ['g', 1], gr: ['g', 1], gram: ['g', 1], kg: ['g', 1000], ml: ['ml', 1], cl: ['ml', 10], dl: ['ml', 100], l: ['ml', 1000] };
   const a = base[f], b = base[t];
   if (a && b && a[0] === b[0]) return qty * a[1] / b[1];
   return null;
@@ -1480,9 +1507,10 @@ function App() {
         const ratio = recipe.basePortions ? persons / recipe.basePortions : 1;
         (recipe.ingredients || []).forEach(ing => {
           if (!ing.name) return;
-          const name = ing.name.trim();
-          const unit = normUnit(ing.unit) || (ing.amount == null ? 'naar smaak' : '');
-          const k = `${name.toLowerCase()}|${unit}`;
+          const name = canonIngredient(ing.name);
+          let unit = normUnit(ing.unit) || (ing.amount == null ? 'naar smaak' : '');
+          if (name === 'knoflook' && (unit === 'stuks' || unit === '')) unit = 'teentje';
+          const k = `${name}|${unit}`;
           if (!map[k]) map[k] = { key: k, kind: 'recipe', name, unit, amount: 0, hasAmount: ing.amount != null, uses: new Set(), slots: 0 };
           if (ing.amount != null) { map[k].amount += Number(ing.amount) * ratio; map[k].hasAmount = true; }
           map[k].slots += 1;
@@ -1523,7 +1551,7 @@ function App() {
     // Automatisch invullen vanuit de voorraad (enkel als je zelf nog niets koos):
     //   genoeg in voorraad of aantal onbekend → in huis · te weinig → kopen · basis (zout, olie…) → in huis tenzij op
     //   twijfel (gelijkaardige naam, andere eenheid) → "controleer even"
-    const byName = {}; pantryStock.forEach(p => { byName[normalize(p.name)] = p; });
+    const byName = {}; pantryStock.forEach(p => { byName[canonIngredient(p.name)] = byName[canonIngredient(p.name)] && byName[canonIngredient(p.name)].inStock ? byName[canonIngredient(p.name)] : p; byName[normalize(p.name)] = p; });
     const inStockList = pantryStock.filter(p => p.inStock);
     const main = validStore(mainStore) || stores[0] || '';
     function auto(i) {
@@ -1607,7 +1635,8 @@ function App() {
       const ratio = recipe.basePortions ? persons / recipe.basePortions : 1;
       (recipe.ingredients || []).forEach(ing => {
         if (!ing.name) return;
-        const p = work.find(x => x.inStock && normalize(x.name) === normalize(ing.name)) || work.find(x => x.inStock && ingredientMatches(ing.name, [normalize(x.name)]));
+        const cn = canonIngredient(ing.name);
+        const p = work.find(x => x.inStock && (normalize(x.name) === normalize(ing.name) || canonIngredient(x.name) === cn)) || work.find(x => x.inStock && ingredientMatches(cn, [normalize(x.name)]));
         if (!p) return;
         if (!used.some(u => u.id === p.id)) used.push({ id: p.id, prevIn: p.inStock, prevQty: p.qty });
         const basic = isBasicIngredient({ kind: 'recipe', name: ing.name, unit: normUnit(ing.unit), hasAmount: ing.amount != null });
