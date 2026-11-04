@@ -2518,8 +2518,9 @@ function DoubleCookBlock({ day, meal, slot, weekmenu, recipesById, onPick, onUnd
 
 // Lege maaltijd: één veld om een recept te zoeken óf gewoon te noteren wat jullie eten.
 // Tik op een recept = ingepland en klaar. Geen recept? "Noteer …" zet het als snelle notitie.
-function QuickPick({ recipes, meal, onPickRecipe, onSaveNote }) {
+function QuickPick({ recipes, meal, persons, members, onPickRecipe, onSaveNote, onOpenRecipe }) {
   const [text, setText] = useState('');
+  const [peek, setPeek] = useState(null);   // recept waarvan je de inhoud bekijkt
   // groep kiezen: Ontbijt, Snack, Hoofdmaaltijd… (standaard volgens de maaltijd)
   const [group, setGroup] = useState(meal === 'Ontbijt' ? 'Ontbijt' : 'Hoofdmaaltijd');
   const qn = normalize(text);
@@ -2560,16 +2561,43 @@ function QuickPick({ recipes, meal, onPickRecipe, onSaveNote }) {
       <div className="rounded-2xl border border-line bg-white divide-y divide-line/70 overflow-hidden max-h-[46vh] overflow-y-auto">
         {!qn && list.length > 0 && <div className="px-3.5 pt-2.5 pb-1 text-[11px] font-extrabold uppercase tracking-wide text-stone-500">{g.id === 'all' ? 'Alle recepten' : g.label} · beste eerst</div>}
         {elsewhere > 0 && <button onClick={() => setGroup('all')} className="w-full px-3.5 py-3 text-left text-[13px] font-bold text-amber-800 active:bg-mist">Niets in {g.label} — {elsewhere} gevonden in andere groepen. Toon alles ›</button>}
-        {list.map(r => (
-          <button key={r.id} onClick={() => onPickRecipe(r)} className="w-full flex items-center gap-3 px-3.5 py-3 text-left active:bg-mist">
-            <span className="text-lg w-6 text-center">{catMeta(r.category).emoji}</span>
-            <span className="flex-1 min-w-0">
-              <span className="block text-[15px] font-bold text-ink truncate">{r.title}</span>
-              <span className="block text-[11px] text-stone-500">{catShort(r.category)}{r.stars ? ' · ' + '★'.repeat(r.stars) : ''}</span>
-            </span>
-            <span className="text-xs font-black text-forest bg-mint rounded-full px-3 py-1.5">Kies</span>
-          </button>
-        ))}
+        {list.map(r => {
+          const open = peek === r.id;
+          const ratio = (persons || 1) / (r.basePortions || 1);
+          const hits = members ? restrictionHits([r], members) : [];
+          return (
+            <div key={r.id} className={cx(open && 'bg-cream/60')}>
+              <div className="flex items-center gap-2 px-3.5 py-2.5">
+                <button onClick={() => setPeek(open ? null : r.id)} aria-expanded={open} aria-label={`Bekijk wat er in ${r.title} zit`} className="flex-1 min-w-0 flex items-center gap-3 text-left">
+                  <span className="text-lg w-6 text-center">{catMeta(r.category).emoji}</span>
+                  <span className="flex-1 min-w-0">
+                    <span className="block text-[15px] font-bold text-ink truncate">{r.title}</span>
+                    <span className="block text-[11px] text-stone-500">{catShort(r.category)}{r.stars ? ' · ' + '★'.repeat(r.stars) : ''} · <span className="text-forest font-extrabold">{open ? 'verberg ▴' : 'wat zit erin? ▾'}</span></span>
+                  </span>
+                </button>
+                <button onClick={() => onPickRecipe(r)} className="shrink-0 text-xs font-black text-forest bg-mint rounded-full px-3 py-1.5">Kies</button>
+              </div>
+              {open && (
+                <div className="px-4 pb-3 pl-[3.25rem] space-y-2">
+                  {hits.length > 0 && <div className="text-[12px] font-bold text-amber-800">{hits.map((h, i) => <div key={i}>{h.kind === 'allergie' ? '⚠️ Allergie' : '🙅 Lust niet'} — {h.who}: {h.term}</div>)}</div>}
+                  <div className="text-[11px] font-extrabold uppercase tracking-wide text-stone-500">Voor {persons || 1} pers.</div>
+                  {(r.ingredients || []).length ? (
+                    <ul className="text-[13px] text-ink space-y-0.5">
+                      {r.ingredients.filter(i => i.name).map((i, k) => (
+                        <li key={k} className="flex justify-between gap-3"><span className="min-w-0">{i.name}</span><span className="shrink-0 text-stone-500 font-bold">{i.amount != null ? `${fmtAmount(Math.round(i.amount * ratio * 100) / 100)} ${i.unit || ''}`.trim() : (i.unit || '')}</span></li>
+                      ))}
+                    </ul>
+                  ) : <div className="text-[13px] text-stone-500">Nog geen ingrediënten.</div>}
+                  {(r.steps || []).length > 0 && <div className="text-[12px] text-stone-500">{r.steps.length} stappen · {r.steps[0].slice(0, 90)}{r.steps[0].length > 90 ? '…' : ''}</div>}
+                  <div className="flex gap-2 pt-1">
+                    <Btn size="sm" icon="check" onClick={() => onPickRecipe(r)}>Kies dit</Btn>
+                    {onOpenRecipe && <Btn size="sm" variant="soft" icon="book" onClick={() => onOpenRecipe(r.id)}>Volledig recept</Btn>}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
         {qn && (
           <button onClick={() => onSaveNote(text)} className="w-full flex items-center gap-3 px-3.5 py-3 text-left active:bg-mist">
             <span className="text-lg w-6 text-center">✏️</span>
@@ -2675,7 +2703,7 @@ function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, 
 
       {(mode === 'empty' || changing) ? (
         <>
-          <QuickPick recipes={recipes} meal={meal} onPickRecipe={pickRecipe} onSaveNote={(t) => { saveNote(t); setChanging(false); onClose(); }} />
+          <QuickPick recipes={recipes} meal={meal} persons={slot.persons} members={members} onOpenRecipe={onOpenRecipe} onPickRecipe={pickRecipe} onSaveNote={(t) => { saveNote(t); setChanging(false); onClose(); }} />
           <div className="text-[11px] font-extrabold uppercase tracking-wide text-stone-500 mb-1.5">Of</div>
           <div className="flex flex-wrap gap-1.5 mb-4">
             {[
