@@ -1500,6 +1500,7 @@ function App() {
     const map = {};
     DAYS.forEach(day => MEALS.forEach(({ key }) => {
       const slot = weekmenu[day][key];
+      if (slot.eatenAt) return;   // al gegeten: niets meer voor te kopen
       let persons = slot.persons || 1;
       const dbl = parseSlotKey(slot.doubleFor);
       if (dbl) { const t = weekmenu[dbl.day][dbl.meal]; if (t.leftoverFrom === slotKeyOf(day, key)) persons += t.persons || 0; }
@@ -1571,7 +1572,8 @@ function App() {
       // twijfel enkel als de voorraadnaam als volledig woord in de productnaam staat ("paprika" ↔ "rode paprika", niet "olijfolie" ↔ "olijf")
       const fuzzy = !exact && inStockList.find(x => { const k = canonIngredient(x.name); return k.length >= 3 && new RegExp(`(^|[^a-z])${escapeRe(k)}($|[^a-z])`).test(i.name); });
       if (fuzzy) return { state: null, note: `misschien in voorraad: ${fuzzy.name}` };
-      return { state: 'buy' };
+      if (exact && !exact.inStock) return { state: 'buy', note: 'op in de voorraad' };
+      return { state: null };   // onbekend in de voorraad → even vragen: kast of kopen?
     }
     return list.map(i => {
       const basic = isBasicIngredient(i);
@@ -1587,7 +1589,7 @@ function App() {
   }, [weekmenu, recipesById, staples, extraRows, checks, itemStoreMap, itemAisleMap, itemStoreAisleMap, storeAisleAlias, storeAisles, pantryStock, stores, mainStore]);
 
   // toestanden: null = nog kiezen · 'have' = in kast · 'buy' = winkelmandje · 'cart' = gekocht
-  function setItemState(item, st) {
+  function setItemState(item, st, opts = {}) {
     if (item.kind === 'extra') {
       const r = extraRows.find(x => x.id === item.extraId); if (!r) return;
       if (st === 'have' || st === 'hidden') delExtra(r.id); else putExtra({ ...r, checked: st === 'cart' });
@@ -1595,10 +1597,12 @@ function App() {
     }
     setCheck(item.key, st || null, st ? item.qty : null);
     // "🏠 Kast" in de boodschappenlijst = het staat in huis → ook in de Kast zetten
-    if (st === 'have' && !pantryStock.some(p => p.inStock && normalize(p.name) === normalize(item.name))) addManyToPantry([{ name: item.name.toLowerCase(), ...shopQty(item) }]);
+    if (st === 'have' && !opts.skipPantry && !pantryStock.some(p => p.inStock && normalize(p.name) === normalize(item.name))) addManyToPantry([{ name: item.name.toLowerCase(), ...shopQty(item) }]);
   }
   function bulkState(list, st) {
-    list.forEach(i => setItemState(i, st));
+    list.forEach(i => setItemState(i, st, { skipPantry: true }));
+    // in één keer in de voorraad zetten (anders overschrijven de aanroepen elkaar)
+    if (st === 'have') addManyToPantry(list.filter(i => i.kind !== 'extra' && !pantryStock.some(p => p.inStock && normalize(p.name) === normalize(i.name))).map(i => ({ name: i.name.toLowerCase(), ...shopQty(i) })));
     showToast(`${list.length} items ${st === 'buy' ? 'in het winkelmandje' : st === 'hidden' || st === 'cart' ? 'van de lijst gehaald' : 'in de kast'}`, { label: 'Ongedaan', onClick: () => list.forEach(i => setItemState(i, i.auto ? null : i.state)) });
   }
   // Winkelen afronden: alles wat afgevinkt is gaat (met hoeveelheid) naar de kast en verdwijnt van de lijst
@@ -2882,7 +2886,7 @@ function groupByAisle(items, order, aisleOf = (i) => i.aisle) {
 }
 
 // Lijst — vult zichzelf in vanuit de voorraad:
-//   "Controleer even" = enkel twijfelgevallen · "Te kopen" per winkel (hoofdwinkel als standaard) · "In huis" ingeklapt
+//   "Kast of kopen?" = wat de voorraad niet kent of twijfel · "Te kopen" per winkel (hoofdwinkel als standaard) · "In huis" ingeklapt
 // Afvinken gebeurt in Winkelen.
 function ShoppingPage({ nav, items, stores, storeAisles, online, pendingOps, onSetState, onBulkState, onAssignStore, onAssignAisle, onRemoveItem,
   onAddExtra, onNewRound, onGoShop, showToast }) {
@@ -2960,13 +2964,19 @@ function ShoppingPage({ nav, items, stores, storeAisles, online, pendingOps, onS
 
       {(!online || pendingOps > 0) && <div className="text-[12px] font-bold text-amber-800 mb-3 px-1">{online ? '⏳ Wijzigingen worden verstuurd…' : '📴 Offline — wordt later gesynchroniseerd'}</div>}
       {visibleAll.length === 0 && <EmptyState emoji="🧺" title="Je lijst is leeg" text="Plan maaltijden in de week — wat je nodig hebt en niet in de voorraad staat, komt hier vanzelf." />}
+      {check.length > 0 && <p className="text-[13px] text-stone-600 px-1 mb-3">Heb je het al in huis? Tik <b>🏠 Kast</b>. De app onthoudt het in de voorraad en vraagt het de volgende keer niet meer.</p>}
 
       <div className="space-y-3">
         {check.length > 0 && (
           <Card className="overflow-hidden border-amber-300">
             <div className="px-4 py-3 bg-amber-50 flex items-center justify-between gap-2">
-              <span className="text-[15px] font-black text-amber-900">Controleer even ({check.length})</span>
-              {check.length > 1 && <button onClick={() => onBulkState(check, 'buy')} className="text-[12px] font-extrabold text-forest bg-white rounded-full px-3 py-1.5 border border-line">Alles kopen</button>}
+              <span className="text-[15px] font-black text-amber-900">Kast of kopen? ({check.length})</span>
+              {check.length > 1 && (
+                <span className="flex gap-1.5">
+                  <button onClick={() => onBulkState(check, 'have')} className="text-[12px] font-extrabold text-stone-600 bg-white rounded-full px-3 py-1.5 border border-line">Alles in kast</button>
+                  <button onClick={() => onBulkState(check, 'buy')} className="text-[12px] font-extrabold text-forest bg-white rounded-full px-3 py-1.5 border border-line">Alles kopen</button>
+                </span>
+              )}
             </div>
             <div className="divide-y divide-line/70">
               {check.map(i => (
@@ -2975,7 +2985,7 @@ function ShoppingPage({ nav, items, stores, storeAisles, online, pendingOps, onS
                     <div className="text-[15px] font-bold text-ink truncate">{i.name}</div>
                     <div className="text-[12px] text-stone-500 truncate">{sub(i)}</div>
                   </div>
-                  <button onClick={() => choose(i, 'have')} aria-label={`${i.name}: heb ik`} className={cx(pill, 'bg-cream border border-line text-stone-600')}>🏠 Heb ik</button>
+                  <button onClick={() => choose(i, 'have')} aria-label={`${i.name}: heb ik`} className={cx(pill, 'bg-cream border border-line text-stone-600')}>🏠 Kast</button>
                   <button onClick={() => choose(i, 'buy')} aria-label={`${i.name}: kopen`} className={cx(pill, 'bg-forest text-white')}>🛒 Kopen</button>
                 </div>
               ))}
