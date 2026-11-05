@@ -885,7 +885,7 @@ function Sheet({ title, subtitle, onClose, children, footer, z = 40, full }) {
 // 5. App (data + navigatie)
 // =================================================================
 const DEFAULT_STORES = ['Colruyt', 'Okay', 'Slager', 'Bakker'];
-const SETTINGS_DB_KEYS = { shoppingEnabled: 'shopping_enabled', stores: 'stores', itemStoreMap: 'item_store_map', householdSize: 'household_size', storeAisles: 'store_aisles', itemAisleMap: 'item_aisle_map', itemStoreAisleMap: 'item_store_aisle_map', storeAisleAlias: 'store_aisle_alias', mainStore: 'main_store' };
+const SETTINGS_DB_KEYS = { shoppingEnabled: 'shopping_enabled', stores: 'stores', itemStoreMap: 'item_store_map', householdSize: 'household_size', storeAisles: 'store_aisles', itemAisleMap: 'item_aisle_map', itemStoreAisleMap: 'item_store_aisle_map', storeAisleAlias: 'store_aisle_alias', mainStore: 'main_store', recentNotes: 'recent_notes' };
 // Als de database nog niet bijgewerkt is (migratie-mealio-v2.sql), werkt de planner
 // gewoon verder zonder de "kook dubbel"-kolommen.
 let HAS_V2_COLUMNS = true;
@@ -919,6 +919,7 @@ function App() {
   const [storeAisles, setStoreAisles] = useState({});
   const [itemAisleMap, setItemAisleMap] = useState({});
   const [itemStoreAisleMap, setItemStoreAisleMap] = useState({});
+  const [recentNotes, setRecentNotes] = useState([]);              // laatst snel genoteerde maaltijden (gedeeld)
   const [mainStore, setMainStore] = useState('');                  // hoofdwinkel: standaard voor producten zonder winkel
   const [storeAisleAlias, setStoreAisleAlias] = useState({});       // { winkel: { eigenNaam: standaardafdeling } }   // { winkel: { product: afdeling } }
   const [checks, setChecks] = useState({});          // item_key -> 'cart' | 'have' (huidige week)
@@ -1064,6 +1065,7 @@ function App() {
     setItemStoreAisleMap(byKey.item_store_aisle_map || {});
     setStoreAisleAlias(byKey.store_aisle_alias || {});
     setMainStore(typeof byKey.main_store === 'string' ? byKey.main_store : '');
+    setRecentNotes(Array.isArray(byKey.recent_notes) ? byKey.recent_notes : []);
     setShoppingEnabled(byKey.shopping_enabled !== false);
     HOUSEHOLD_SIZE = Number(byKey.household_size) || 5;
     setHouseholdSize(HOUSEHOLD_SIZE);
@@ -1680,6 +1682,11 @@ function App() {
     // standaardafdeling: onthouden voor dit ingrediënt, ook voor volgende weken en andere winkels
     persistSetting('itemAisleMap', setItemAisleMap, { ...itemAisleMap, [norm]: aisle });
   }
+  function rememberNote(text, meal) {
+    const t = capFirst(text.trim()); if (!t) return;
+    const next = [{ text: t, meal }, ...recentNotes.filter(n => normalize(n.text) !== normalize(t))].slice(0, 12);
+    persistSetting('recentNotes', setRecentNotes, next);
+  }
   function setStoreAisleList(store, list) { persistSetting('storeAisles', setStoreAisles, { ...storeAisles, [store]: list }); }
   function renameStoreAisle(store, oldName, newName) {
     newName = (newName || '').trim();
@@ -1975,6 +1982,7 @@ function App() {
         <MealSheet key={`${weekStart}-${mealSheet.day}-${mealSheet.meal}`} day={mealSheet.day} meal={mealSheet.meal}
           dayLabel={fmtDayLong(weekStart, DAYS.indexOf(mealSheet.day))} slot={openMealSlot} weekmenu={weekmenu}
           recipes={recipes} recipesById={recipesById} aiBusy={aiBusy} members={members}
+          recentNotes={recentNotes} onNoteUsed={rememberNote}
           onChange={(patch) => updateMealSlot(mealSheet.day, mealSheet.meal, patch)}
           onClear={() => { clearMealSlot(mealSheet.day, mealSheet.meal); setMealSheet(null); }}
           onCookDouble={(tDay, tMeal) => cookDouble(mealSheet.day, mealSheet.meal, tDay, tMeal)}
@@ -2522,7 +2530,7 @@ function DoubleCookBlock({ day, meal, slot, weekmenu, recipesById, onPick, onUnd
 
 // Lege maaltijd: één veld om een recept te zoeken óf gewoon te noteren wat jullie eten.
 // Tik op een recept = ingepland en klaar. Geen recept? "Noteer …" zet het als snelle notitie.
-function QuickPick({ recipes, meal, persons, members, onPickRecipe, onSaveNote, onOpenRecipe }) {
+function QuickPick({ recipes, meal, persons, members, recentNotes = [], onPickRecipe, onSaveNote, onOpenRecipe }) {
   const [text, setText] = useState('');
   const [peek, setPeek] = useState(null);   // recept waarvan je de inhoud bekijkt
   // groep kiezen: Ontbijt, Snack, Hoofdmaaltijd… (standaard volgens de maaltijd)
@@ -2547,6 +2555,23 @@ function QuickPick({ recipes, meal, persons, members, onPickRecipe, onSaveNote, 
   return (
     <div className="space-y-2 mb-5">
       <label htmlFor="quickpick" className="block text-base font-black text-deep">Wat eten jullie?</label>
+      {!qn && (() => {
+        // snel noteren zonder recept: wat jullie eerder noteerden + een paar eenvoudige voorbeelden
+        const defaults = meal === 'Ontbijt' ? ['Boterham met choco', 'Boterham met kaas', 'Yoghurt met granola', 'Eitje met toast']
+          : meal === 'Middag' ? ['Boterhammen', 'Soep met brood', 'Wraps', 'Restjes opwarmen'] : ['Frietjes', 'Pizza', 'Spaghetti bolognese', 'Soep met brood'];
+        const own = [...(recentNotes || []).filter(n => (n.meal || meal) === meal), ...(recentNotes || []).filter(n => n.meal && n.meal !== meal)].map(n => n.text);
+        const chips = [...new Set([...own, ...defaults].map(capFirst))].slice(0, 6);
+        return (
+          <div>
+            <div className="text-[11px] font-extrabold uppercase tracking-wide text-stone-500 mb-1">✏️ Snel noteren, zonder recept</div>
+            <div className="flex gap-1.5 overflow-x-auto no-scrollbar -mx-5 px-5 pb-1">
+              {chips.map(c => (
+                <button key={c} onClick={() => onSaveNote(c)} className="shrink-0 h-9 px-3 rounded-full bg-amber-50 border border-amber-200 text-[13px] font-extrabold text-amber-900 whitespace-nowrap active:scale-95 transition">{c}</button>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
       <div className="flex gap-1.5 overflow-x-auto no-scrollbar -mx-5 px-5 pb-0.5">
         {groups.map(x => (
           <button key={x.id} onClick={() => setGroup(x.id)} aria-pressed={group === x.id}
@@ -2559,11 +2584,20 @@ function QuickPick({ recipes, meal, persons, members, onPickRecipe, onSaveNote, 
       <div className="relative">
         <Icon name="search" size={17} className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-400" />
         <input id="quickpick" value={text} onChange={(e) => setText(e.target.value)} enterKeyHint="done"
-          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); if (text.trim() && !list.length) onSaveNote(text); else e.target.blur(); } }}
-          placeholder="Zoek een recept, of typ bv. hamburger, wortel" className={cx(inputCls, 'pl-9 py-3 text-base')} />
+          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); const exact = list.find(r => normalize(r.title) === qn); if (exact) onPickRecipe(exact); else if (text.trim()) onSaveNote(text); } }}
+          placeholder="Zoek een recept, of typ bv. boterham met choco" className={cx(inputCls, 'pl-9 py-3 text-base')} />
       </div>
       <div className="rounded-2xl border border-line bg-white divide-y divide-line/70 overflow-hidden max-h-[46vh] overflow-y-auto">
         {!qn && list.length > 0 && <div className="px-3.5 pt-2.5 pb-1 text-[11px] font-extrabold uppercase tracking-wide text-stone-500">{g.id === 'all' ? 'Alle recepten' : g.label} · beste eerst</div>}
+        {qn && (
+          <button onClick={() => onSaveNote(text)} className="w-full flex items-center gap-3 px-3.5 py-3 text-left bg-amber-50/60 active:bg-mist">
+            <span className="text-lg w-6 text-center">✏️</span>
+            <span className="flex-1 min-w-0">
+              <span className="block text-[15px] font-bold text-ink truncate">Noteer "{text.trim()}"</span>
+              <span className="block text-[11px] text-stone-500">Zonder recept · elk deel komt op de boodschappenlijst</span>
+            </span>
+          </button>
+        )}
         {elsewhere > 0 && <button onClick={() => setGroup('all')} className="w-full px-3.5 py-3 text-left text-[13px] font-bold text-amber-800 active:bg-mist">Niets in {g.label} — {elsewhere} gevonden in andere groepen. Toon alles ›</button>}
         {list.map(r => {
           const open = peek === r.id;
@@ -2602,15 +2636,6 @@ function QuickPick({ recipes, meal, persons, members, onPickRecipe, onSaveNote, 
             </div>
           );
         })}
-        {qn && (
-          <button onClick={() => onSaveNote(text)} className="w-full flex items-center gap-3 px-3.5 py-3 text-left active:bg-mist">
-            <span className="text-lg w-6 text-center">✏️</span>
-            <span className="flex-1 min-w-0">
-              <span className="block text-[15px] font-bold text-ink truncate">Noteer "{text.trim()}"</span>
-              <span className="block text-[11px] text-stone-500">Zonder recept · elk deel komt op de boodschappenlijst</span>
-            </span>
-          </button>
-        )}
       </div>
     </div>
   );
@@ -2635,7 +2660,7 @@ function QuickNote({ value, onSave }) {
   );
 }
 
-function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, aiBusy, members, onChange, onClear, onCookDouble, onUndoDouble, onAiFill, onOpenRecipe, onCreateRecipe, onClose }) {
+function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, aiBusy, members, onChange, onClear, onCookDouble, onUndoDouble, onAiFill, onOpenRecipe, onCreateRecipe, onClose , recentNotes, onNoteUsed}) {
   const mealDef = MEALS.find(m => m.key === meal);
   const mode = slotMode(slot);
   const [openRow, setOpenRow] = useState(null);
@@ -2659,6 +2684,7 @@ function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, 
     const v = (text || '').trim();
     if (!v && mode !== 'free') return;
     onChange({ ...reset, category: TYPE_FREE, recipeId: '', componentIds: [], notes: v, locked: true });
+    if (v && onNoteUsed) onNoteUsed(v, meal);
   }
   function pickRecipe(r) {
     if (isComponent(r.category)) onChange({ ...reset, category: TYPE_COMPOSE, recipeId: '', componentIds: [r.id], notes: '', locked: true });
@@ -2707,7 +2733,7 @@ function MealSheet({ day, meal, dayLabel, slot, weekmenu, recipes, recipesById, 
 
       {(mode === 'empty' || changing) ? (
         <>
-          <QuickPick recipes={recipes} meal={meal} persons={slot.persons} members={members} onOpenRecipe={onOpenRecipe} onPickRecipe={pickRecipe} onSaveNote={(t) => { saveNote(t); setChanging(false); onClose(); }} />
+          <QuickPick recipes={recipes} meal={meal} persons={slot.persons} recentNotes={recentNotes} members={members} onOpenRecipe={onOpenRecipe} onPickRecipe={pickRecipe} onSaveNote={(t) => { saveNote(t); setChanging(false); onClose(); }} />
           <div className="text-[11px] font-extrabold uppercase tracking-wide text-stone-500 mb-1.5">Of</div>
           <div className="flex flex-wrap gap-1.5 mb-4">
             {[
